@@ -6,6 +6,8 @@ import (
 	"sort"
 	"sync"
 	"time"
+
+	"github.com/kidcarmi/anchorix/backend/internal/httpapi/envelope"
 )
 
 // Probe is a readiness check. It MUST be cheap, side-effect free, and
@@ -84,6 +86,6 @@ func (r *Readiness) handler() http.HandlerFunc {
 			status = http.StatusServiceUnavailable
 			body["status"] = "unready"
 		}
-		writeJSON(w, status, body)
+		envelope.WriteJSON(w, status, body)
 	}
 }
