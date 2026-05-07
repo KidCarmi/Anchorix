@@ -1,0 +1,68 @@
+# Anchorix v0.1 — local development stack.
+#
+# This compose file is for development and demos only. Production deployments
+# should sit behind a reverse proxy that terminates TLS (see
+# deploy/compose/README.md for guidance).
+#
+# Per CLAUDE.md, the control plane is a single Go binary; the frontend is a
+# static SPA. PostgreSQL holds all durable state.
+
+name: anchorix
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-anchorix}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me-locally}
+      POSTGRES_DB: ${POSTGRES_DB:-anchorix}
+    volumes:
+      - anchorix_pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-anchorix} -d ${POSTGRES_DB:-anchorix}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ANCHORIX_ENV: ${ANCHORIX_ENV:-development}
+      ANCHORIX_LOG_LEVEL: ${ANCHORIX_LOG_LEVEL:-info}
+      ANCHORIX_HTTP_ADDR: 0.0.0.0:8080
+      ANCHORIX_PUBLIC_BASE_URL: ${ANCHORIX_PUBLIC_BASE_URL:-http://localhost:8080}
+      ANCHORIX_SESSION_KEY: ${ANCHORIX_SESSION_KEY}
+      DATABASE_URL: ${DATABASE_URL:-postgres://anchorix:change-me-locally@postgres:5432/anchorix?sslmode=disable}
+      ANCHORIX_ENROLLMENT_TOKEN_TTL: ${ANCHORIX_ENROLLMENT_TOKEN_TTL:-15m}
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "/anchorix", "healthcheck"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  web:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - api
+    environment:
+      VITE_API_BASE_URL: ${VITE_API_BASE_URL:-http://localhost:8080/api/v1}
+    ports:
+      - "5173:5173"
+
+volumes:
+  anchorix_pg_data:
+    driver: local

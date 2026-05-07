@@ -1,0 +1,64 @@
+# --- General ---
+.DS_Store
+*.swp
+*.swo
+*.log
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# --- Editors / IDEs ---
+.idea/
+.vscode/
+*.iml
+
+# --- Build artifacts ---
+/dist/
+/build/
+/bin/
+/out/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# --- Go ---
+backend/bin/
+backend/tmp/
+agent/windows/bin/
+agent/windows/tmp/
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# --- Node / Frontend ---
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/coverage/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# --- Docker ---
+docker-compose.override.yml
+
+# --- Local data ---
+data/
+*.sqlite
+*.db
+
+# --- Secrets / Keys (never commit) ---
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+*.jks
+secrets/
+
+# --- Temp ---
+tmp/
+.tmp/
