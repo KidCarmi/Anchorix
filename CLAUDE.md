@@ -277,14 +277,68 @@ what get revised.
 
 ## 11. CI/CD Security Requirements
 
-- All merges to `main` require:
-  - `go vet`, `golangci-lint`, `go test ./...` passing
-  - `npm run lint`, `npm run typecheck`, `npm test` passing
-  - SBOM generated for every release artifact
-  - Container images scanned for CVEs (`trivy` or equivalent)
-- Secret scanning runs on every PR (e.g., `gitleaks`).
-- Dependency updates are reviewed; no auto-merge of dependency PRs.
-- Release artifacts will be signed (cosign or equivalent) by v1.0.
+Every merge into `main` is gated by automated CI. The following checks
+are **mandatory and blocking** — a PR cannot be merged while any of them
+is failing:
+
+**Code quality**
+
+- `gofmt` (no unformatted files) — backend and `agent/windows`
+- `go vet ./...` — backend and `agent/windows`
+- `go test ./...` — backend and `agent/windows`
+- `go build ./...` — backend and `agent/windows` (the agent additionally
+  cross-compiles for `GOOS=windows GOARCH=amd64`)
+- `npm run lint` — frontend
+- `npm run typecheck` — frontend
+- `npm test` — frontend
+- `npm run build` — frontend
+
+**Static analysis**
+
+- CodeQL (Go)
+- CodeQL (JavaScript/TypeScript)
+
+**Vulnerability scanning**
+
+- `govulncheck` — backend Go module
+- `govulncheck` — `agent/windows` Go module
+- `npm audit --audit-level=high` — frontend
+- Trivy filesystem scan — fails on HIGH/CRITICAL
+
+**Secrets and dependency health**
+
+- Gitleaks — secret scan over the diff and history
+- Dependency Obituary — fails when dependency health drops below the
+  configured threshold (currently 60). Complements CVE scanners by
+  catching abandoned, archived, or deprecated upstream packages.
+
+**Build and runtime smoke**
+
+- `docker compose config -q` — compose configuration validates
+- `docker compose build` — backend and frontend images build cleanly
+- Runtime smoke — the stack starts and `/healthz` and `/readyz` return
+  the expected envelopes
+
+**Release-time additions (not blocking on every PR)**
+
+- SBOM generated for every release artifact
+- Release artifacts will be signed (cosign or equivalent) by v1.0
+- Dependency updates are reviewed; no auto-merge of dependency PRs
+
+The blocking set above is required to be **deterministic, reliable, and
+reproducible**. Flaky or environment-dependent checks are not added to
+the blocking set; if a blocking check becomes flaky, the right answer is
+to fix the check, not to relax the gate.
+
+The exact wiring lives in `.github/workflows/`:
+
+- `ci.yml` — quality + Docker + smoke
+- `codeql.yml` — CodeQL (Go + JS/TS)
+- `security.yml` — govulncheck, npm audit, Trivy, Gitleaks
+- `dependency-obituary.yml` — Dependency Obituary
+
+Branch protection on `main` enforces the above. See
+[`docs/BRANCHING.md`](./docs/BRANCHING.md) for the full PR policy.
 
 ## 12. Trust Model Assumptions (v0.1)
 

@@ -1,0 +1,42 @@
+# Dependency Obituary — dependency health and abandonment gate.
+#
+# This is NOT SAST and NOT a CVE scanner. It complements the security
+# workflow by surfacing:
+#
+#   - abandoned upstream packages
+#   - archived repositories
+#   - deprecated packages
+#   - stale maintenance posture
+#   - low maintainer activity
+#
+# Threshold of 60 means CI fails when overall dependency health drops below
+# that score. Adjusting the threshold is a CLAUDE.md-level decision, not a
+# convenience tweak.
+
+name: dependency-obituary
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+concurrency:
+  group: obituary-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  obituary:
+    name: dependency obituary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependency Obituary
+        uses: KidCarmi/Dependency-Obituary@main
+        with:
+          threshold: "60"

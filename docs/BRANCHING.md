@@ -1,7 +1,8 @@
 # Branching & Pull Request Policy
 
 This document is binding for every contributor — human or AI. It covers
-how branches are created, named, and merged into Anchorix.
+how branches are created, named, merged into Anchorix, and which CI gates
+must pass before a merge.
 
 > If this policy conflicts with [`CLAUDE.md`](../CLAUDE.md), CLAUDE.md
 > wins. Where they overlap, both apply.
@@ -14,14 +15,50 @@ how branches are created, named, and merged into Anchorix.
   - force pushes are forbidden
   - merges to `main` only happen via pull request
   - merges to `main` require:
-    - all required CI checks green
+    - all required CI checks green (see §2)
     - at least one approving review
     - a linked issue or rationale in the PR body
   - the merge strategy is squash-merge (one commit per PR on `main`)
 
 `main` is the source of truth. Releases are cut from `main` only.
 
-## 2. Feature Branches
+## 2. CI Is Mandatory Before Merge
+
+Every PR — human-authored or Claude-authored — runs the same CI suite.
+**Failed quality, build, or security checks block the merge.** The full
+authoritative list lives in [`CLAUDE.md`](../CLAUDE.md) §11 and the
+workflow files under [`.github/workflows/`](../.github/workflows/).
+
+Mandatory blocking gates:
+
+- `gofmt`, `go vet`, `go test`, `go build` (backend and `agent/windows`,
+  including a `GOOS=windows` cross-compile for the agent)
+- `npm ci`, `npm run lint`, `npm run typecheck`, `npm test`,
+  `npm run build` (frontend)
+- CodeQL (Go and JavaScript/TypeScript)
+- `govulncheck` for both Go modules
+- `npm audit --audit-level=high`
+- Trivy filesystem scan (HIGH/CRITICAL fail)
+- Gitleaks secret scan
+- Dependency Obituary (health threshold 60)
+- `docker compose config` validation
+- Backend and frontend Docker image builds
+- Runtime smoke (`/healthz` + `/readyz`)
+
+Branch protection on `main` is configured to require every check above.
+None of these checks are advisory.
+
+A failing security check (CodeQL, govulncheck, npm audit, Trivy,
+Gitleaks, Dependency Obituary) must **not** be worked around by lowering
+the threshold or skipping the job. The fix is to address the underlying
+finding, or — if it is genuinely a false positive — to suppress it via
+the tool's documented suppression mechanism with rationale in the PR
+body.
+
+Blocking checks must remain **deterministic, reliable, and
+reproducible**. If a blocking check becomes flaky, fix the check.
+
+## 3. Feature Branches
 
 All work happens on a feature branch off the latest `main`.
 
@@ -48,7 +85,7 @@ Rules:
 - A branch that has been abandoned for more than 30 days without an open
   PR may be deleted by maintainers.
 
-## 3. Claude Branches Are PR-Only
+## 4. Claude Branches Are PR-Only
 
 Claude (the AI assistant) is constrained to the same rules as any other
 contributor, with two additional requirements:
@@ -59,6 +96,10 @@ contributor, with two additional requirements:
    Treat the feature branch as a single-purpose work area. When the PR
    merges, the branch is gone; new work needs a new branch off `main`.
 
+Claude branches are subject to **every** CI gate listed in §2. A red
+gate blocks merge regardless of who authored the PR. Claude does not
+bypass branch protection or self-approve a review.
+
 A session prompt that tells Claude to "develop on `claude/<branch>`" is
 authorization to commit and push to **that branch only**. It is **not**
 authorization to:
@@ -67,8 +108,9 @@ authorization to:
 - delete or force-push someone else's branch
 - merge a PR
 - self-approve a review
+- weaken or disable any CI gate to make a PR pass
 
-## 4. Pull Requests
+## 5. Pull Requests
 
 A pull request must include:
 
@@ -85,14 +127,15 @@ PR-time review checklist (binding):
 - Are docs updated (`ARCHITECTURE.md`, `docs/api/REST_API.md`,
   `docs/security/...`) when the public surface or trust boundary moves?
 - Is anything in the diff a "convenience" violation of a CLAUDE.md rule?
+- Did all CI gates pass on the latest commit?
 
-## 5. Releases
+## 6. Releases
 
 Releases are tagged `vX.Y.Z` from `main`. Tags are immutable. Release
 notes live under `docs/releases/` (path reserved; created with first
 release).
 
-## 6. Hotfixes
+## 7. Hotfixes
 
 If a fix is needed against an already-tagged release:
 
@@ -101,10 +144,11 @@ If a fix is needed against an already-tagged release:
    the affected version is still the latest).
 3. After merge, cherry-pick into `main` if it has diverged.
 
-## 7. What This Means in Practice
+## 8. What This Means in Practice
 
 - Don't `git push origin main`. Open a PR.
 - Don't keep working on a branch that has already merged. Start a new one.
 - Don't ask Claude to bypass these rules; the rules apply to Claude.
 - Don't approve your own PR.
 - Don't merge a PR with red CI.
+- Don't disable a CI gate to land a PR.

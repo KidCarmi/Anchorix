@@ -1,0 +1,202 @@
+# Anchorix CI — code quality, smoke validation, and Docker build gates.
+#
+# This file is one of four CI workflows. The others handle CodeQL, vulnerability
+# scanning + secrets, and Dependency Obituary. Splitting them keeps each file
+# small and lets failures be diagnosed without scrolling.
+#
+# Every job here is BLOCKING — failures must prevent merge.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.22"
+  NODE_VERSION: "20"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Backend Go quality
+  # ---------------------------------------------------------------------------
+  backend:
+    name: backend (go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # No go.sum yet (stdlib only). setup-go falls back to toolchain
+          # caching, which is enough at this stage.
+          cache: false
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -count=1 ./...
+
+      - name: go build
+        run: go build ./...
+
+  # ---------------------------------------------------------------------------
+  # Agent Go quality. Includes a Windows cross-compile to verify build tags.
+  # ---------------------------------------------------------------------------
+  agent:
+    name: agent/windows (go)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: agent/windows
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt found unformatted files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -count=1 ./...
+
+      - name: go build (linux dev stub)
+        run: go build ./...
+
+      - name: go build (windows/amd64)
+        env:
+          GOOS: windows
+          GOARCH: amd64
+        run: go build ./...
+
+  # ---------------------------------------------------------------------------
+  # Frontend quality
+  # ---------------------------------------------------------------------------
+  frontend:
+    name: frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: npm ci
+        run: npm ci
+
+      - name: npm run lint
+        run: npm run lint
+
+      - name: npm run typecheck
+        run: npm run typecheck
+
+      - name: npm test
+        run: npm test -- --run
+
+      - name: npm run build
+        run: npm run build
+
+  # ---------------------------------------------------------------------------
+  # Docker: compose config validation, image builds, and a runtime smoke test
+  # against /healthz and /readyz.
+  # ---------------------------------------------------------------------------
+  docker:
+    name: docker (config + build + smoke)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate dev .env
+        run: ./scripts/dev-env.sh
+
+      - name: docker compose config (validate)
+        run: docker compose config -q
+
+      - name: Build api image
+        run: docker compose build api
+
+      - name: Build web image
+        run: docker compose build web
+
+      - name: Bring up api + postgres
+        run: docker compose up -d --wait postgres api
+        timeout-minutes: 3
+
+      - name: Smoke /healthz
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /tmp/healthz.json -w "%{http_code}" http://localhost:8080/healthz || true)
+            if [ "$code" = "200" ]; then
+              echo "healthz returned 200"
+              cat /tmp/healthz.json
+              echo
+              break
+            fi
+            sleep 2
+          done
+          if [ "$code" != "200" ]; then
+            echo "::error::/healthz never returned 200"
+            exit 1
+          fi
+          grep -q '"status":"ok"' /tmp/healthz.json
+
+      - name: Smoke /readyz
+        run: |
+          set -euo pipefail
+          code=$(curl -s -o /tmp/readyz.json -w "%{http_code}" http://localhost:8080/readyz)
+          echo "readyz HTTP $code:"
+          cat /tmp/readyz.json
+          echo
+          if [ "$code" != "200" ]; then
+            echo "::error::/readyz returned $code, expected 200 (no probes registered yet)"
+            exit 1
+          fi
+          grep -q '"status":"ready"' /tmp/readyz.json
+
+      - name: Stack logs (on failure)
+        if: failure()
+        run: docker compose logs --no-color
+
+      - name: Tear down
+        if: always()
+        run: docker compose down --remove-orphans -v

@@ -1,0 +1,57 @@
+# CodeQL static analysis for Go and JavaScript/TypeScript.
+#
+# Findings are uploaded to the GitHub Security tab; the job exits non-zero
+# only if CodeQL itself errors. Severity-based gating happens in the
+# branch-protection settings (the workflow result is the gate).
+
+name: codeql
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: codeql (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - language: go
+            build-mode: autobuild
+          - language: javascript-typescript
+            build-mode: none
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # Default + security-extended; security-and-quality is broader but
+          # noisier — start tight, expand if signal-to-noise is high.
+          queries: security-extended
+
+      - name: Set up Go (for autobuild)
+        if: matrix.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:${{ matrix.language }}
