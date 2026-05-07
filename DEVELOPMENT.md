@@ -141,9 +141,11 @@ See [`CLAUDE.md` §8](./CLAUDE.md). Highlights:
 
 ## Branching
 
-- Feature branches: `claude/<short-topic>` or `<author>/<short-topic>`
-- The current foundation branch is **`claude/anchorix-foundation-hN43r`**
-- All changes go through pull request review against `main`
+- The default branch is **`main`** and is protected.
+- Feature branches: `<author>/<short-topic>` or `claude/<short-topic>-<suffix>`.
+- All changes — including Claude-authored ones — land on `main` via
+  pull request only. Direct pushes to `main` are forbidden.
+- Full policy: [`docs/BRANCHING.md`](./docs/BRANCHING.md).
 
 ## Reporting Security Issues
 

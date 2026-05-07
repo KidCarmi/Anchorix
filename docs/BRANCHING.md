@@ -10,17 +10,33 @@ must pass before a merge.
 ## 1. Default Branch
 
 - The default branch is **`main`**.
-- `main` is **protected**:
-  - direct pushes are forbidden
+- `main` is **protected** and the long-term source of truth.
+- A Claude-generated feature branch is **never** the default branch and
+  is **never** the source of truth, even temporarily.
+- Required protections on `main`:
+  - direct pushes are forbidden (humans and Claude)
   - force pushes are forbidden
+  - branch deletion is forbidden
   - merges to `main` only happen via pull request
   - merges to `main` require:
     - all required CI checks green (see §2)
-    - at least one approving review
+    - at least one approving review (no self-approval)
     - a linked issue or rationale in the PR body
   - the merge strategy is squash-merge (one commit per PR on `main`)
+  - `main` is read-only outside of PR merges; even maintainers go
+    through a PR
 
-`main` is the source of truth. Releases are cut from `main` only.
+Releases are cut from `main` only.
+
+### One-time bootstrap exception
+
+Anchorix was incubated on the Claude session branch
+`claude/anchorix-foundation-hN43r`. The very first push of `main` —
+seeded from that branch's tip — is the **single** authorized direct
+push to `main` in the project's history. Every subsequent change to
+`main` must go through a pull request. The session branch becomes a
+normal feature branch from that point forward and may be deleted once
+GitHub default-branch and protection settings are in place (§9).
 
 ## 2. CI Is Mandatory Before Merge
 
@@ -152,3 +168,61 @@ If a fix is needed against an already-tagged release:
 - Don't approve your own PR.
 - Don't merge a PR with red CI.
 - Don't disable a CI gate to land a PR.
+
+## 9. Repository Setup Status (manual GitHub steps)
+
+The Git side of branch normalization is automated by this PR / commit:
+
+- [x] `main` branch exists at the foundation tip.
+- [x] `main` contains the v0.1 foundation, naming cleanup, envelope
+      consolidation, and CI workflows.
+- [x] `docs/BRANCHING.md` and `CLAUDE.md` §11 document the policy.
+- [x] CI workflows under `.github/workflows/` enforce every required
+      gate on PRs targeting `main`.
+
+The following items can only be set from the GitHub UI / API and are
+therefore the **repository owner's responsibility** to apply once `main`
+exists on the remote:
+
+1. **Set default branch to `main`.**
+   `Settings → General → Default branch → switch to main`.
+2. **Add a branch protection rule for `main`** (`Settings → Branches →
+   Add rule → Branch name pattern: main`):
+   - [x] Require a pull request before merging
+     - [x] Require approvals: **1**
+     - [x] Dismiss stale approvals on new commits
+     - [x] Require review from Code Owners (when CODEOWNERS lands)
+   - [x] Require status checks to pass before merging
+     - [x] Require branches to be up to date before merging
+     - [x] Required status checks (paste the exact job names CI emits):
+       - `backend (go)`
+       - `agent/windows (go)`
+       - `frontend`
+       - `docker (config + build + smoke)`
+       - `codeql (go)`
+       - `codeql (javascript-typescript)`
+       - `govulncheck (backend)`
+       - `govulncheck (agent/windows)`
+       - `npm audit (frontend)`
+       - `trivy (filesystem)`
+       - `gitleaks`
+       - `dependency obituary`
+   - [x] Require conversation resolution before merging
+   - [x] Require linear history
+   - [x] Do not allow bypassing the above settings (apply to admins)
+   - [x] Restrict who can push to matching branches: nobody (PR-only)
+   - [ ] Require signed commits (recommended; enable when contributors
+         have signing keys configured)
+3. **Disable force pushes and branch deletion** for `main`
+   (covered by the protection rule above; double-check the toggles).
+4. **Delete the bootstrap feature branch** (`claude/anchorix-foundation-hN43r`)
+   once `main` is the default and contains the same content. This is
+   not strictly required, but keeping a stale Claude branch around
+   invites confusion about the source of truth.
+5. **(Optional) Configure auto-merge** on PRs that pass CI and have an
+   approving review.
+
+If any of the items above are not applied, the policy in this document
+is documentation-only and not enforced. The combination of `main`
+existing + branch protection rules being applied is what makes the
+policy real.
