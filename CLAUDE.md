@@ -189,7 +189,57 @@ A change that adds anything from the "out of scope" list to v0.1
 - No global state libraries beyond what's needed (start with React Query
   for server state, Context for auth). Add Redux only with strong cause.
 
-### 8.4 Anti-patterns (Forbidden)
+### 8.4 Naming Rule
+
+Do not create variables, functions, files, packages, or types with vague,
+generic, or AI-generated names. Names must clearly express domain purpose
+and ownership.
+
+**Forbidden examples:**
+
+- `data`
+- `payload`
+- `temp`
+- `misc`
+- `helper`
+- `util`
+- `thing`
+- `manager`
+- `processor`
+- `handler2`, `ctx2`, etc.
+- `claude*` (anything that names the assistant or session)
+- generic dumping-ground "service" abstractions
+
+**Use explicit domain-oriented names instead:**
+
+- `certificateInventory`
+- `enrollmentToken`
+- `certificateObservation`
+- `riskFinding`
+- `inventoryBatch`
+- `heartbeatRequest`
+- `providerConfig`
+- `auditEvent`
+- `agentIdentity`
+
+**Accepted short Go conventions** (do **not** rename these):
+
+- `ctx` (context.Context)
+- `err` (error)
+- `cfg` (config)
+- `tx` (transaction)
+- `id` (identifier)
+- `srv` (server)
+- `req` / `resp` (request/response)
+
+If a name feels generic, AI-generated, or unclear: rename it. A name that
+needs a comment to explain its purpose is the wrong name.
+
+This rule is binding on contributors and on AI assistants. If a PR
+introduces names that violate this rule, the names — not the rule — are
+what get revised.
+
+### 8.5 Anti-patterns (Forbidden)
 
 - Giant files (>500 LOC by default — split or justify in PR).
 - God objects, "manager" classes that own everything.

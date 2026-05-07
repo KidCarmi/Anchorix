@@ -31,9 +31,9 @@ type Certificate struct {
 	LastSeenAt        time.Time `json:"last_seen_at"`
 }
 
-// Observation is a single (host, store) sighting of a certificate. A single
-// Certificate may have many Observations across an estate.
-type Observation struct {
+// CertificateObservation is a single (host, store) sighting of a certificate.
+// A single Certificate may have many CertificateObservations across an estate.
+type CertificateObservation struct {
 	ID            string    `json:"id"`
 	CertificateID string    `json:"certificate_id"`
 	AgentID       string    `json:"agent_id"`
@@ -43,18 +43,21 @@ type Observation struct {
 	ObservedAt    time.Time `json:"observed_at"`
 }
 
-// IngestPayload is the agent → control-plane payload for a single inventory
-// upload. The control plane MUST reject any payload that includes a private
-// key field, even one that is empty (CLAUDE.md §6.2).
-type IngestPayload struct {
-	AgentID      string                 `json:"agent_id"`
-	Hostname     string                 `json:"hostname"`
-	CollectedAt  time.Time              `json:"collected_at"`
-	Certificates []IngestedCertificate  `json:"certificates"`
+// InventoryBatch is the agent → control-plane upload for a single inventory
+// run. The control plane MUST reject any batch that includes a private key
+// field, even one that is empty (CLAUDE.md §6.2).
+type InventoryBatch struct {
+	AgentID      string                  `json:"agent_id"`
+	Hostname     string                  `json:"hostname"`
+	CollectedAt  time.Time               `json:"collected_at"`
+	Certificates []DiscoveredCertificate `json:"certificates"`
 }
 
-// IngestedCertificate is the wire format for a single discovered certificate.
-type IngestedCertificate struct {
+// DiscoveredCertificate is the wire format for a single certificate as
+// reported by an agent. It is named for the agent's perspective — the agent
+// discovered it in a certificate store — and carries only non-secret metadata
+// plus the public certificate PEM.
+type DiscoveredCertificate struct {
 	StoreLocation     string    `json:"store_location"`
 	FriendlyName      string    `json:"friendly_name,omitempty"`
 	FingerprintSHA256 string    `json:"fingerprint_sha256"`

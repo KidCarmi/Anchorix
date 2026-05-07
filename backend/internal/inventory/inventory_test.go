@@ -19,8 +19,8 @@ func TestRejectPrivateKeyMaterial(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := rejectPrivateKeyMaterial(IngestPayload{
-				Certificates: []IngestedCertificate{{CertificatePEM: tc.pem}},
+			err := rejectPrivateKeyMaterial(InventoryBatch{
+				Certificates: []DiscoveredCertificate{{CertificatePEM: tc.pem}},
 			})
 			if tc.wantErr && !errors.Is(err, ErrPrivateKeyMaterial) {
 				t.Fatalf("want ErrPrivateKeyMaterial, got %v", err)

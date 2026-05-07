@@ -16,16 +16,16 @@ import "context"
 type Capability string
 
 const (
-	CapDiscovery     Capability = "discovery"      // can enumerate certs from the CA
-	CapIssue         Capability = "issue"          // can issue (out of v0.1 scope)
-	CapRevoke        Capability = "revoke"         // can revoke (out of v0.1 scope)
-	CapStatusLookup  Capability = "status_lookup"  // can resolve cert status
+	CapDiscovery    Capability = "discovery"     // can enumerate certs from the CA
+	CapIssue        Capability = "issue"         // can issue (out of v0.1 scope)
+	CapRevoke       Capability = "revoke"        // can revoke (out of v0.1 scope)
+	CapStatusLookup Capability = "status_lookup" // can resolve cert status
 )
 
 // Descriptor is the static identity of a registered provider.
 type Descriptor struct {
 	ID           string       `json:"id"`
-	Kind         string       `json:"kind"`         // e.g. "adcs", "vault", "smallstep"
+	Kind         string       `json:"kind"` // e.g. "adcs", "vault", "smallstep"
 	DisplayName  string       `json:"display_name"`
 	Capabilities []Capability `json:"capabilities"`
 }

@@ -5,13 +5,16 @@ package clock
 
 import "time"
 
-// Clock returns the current time. Production code uses Real; tests use Fake.
+// Clock returns the current time. Production code uses System; tests use
+// a fake clock provided by the test package that needs deterministic time.
 type Clock interface {
 	Now() time.Time
 }
 
-// Real is the production clock backed by time.Now().
-type Real struct{}
+// System is the production clock backed by the OS wall clock. It returns
+// UTC times so persisted timestamps are consistent regardless of the host
+// timezone.
+type System struct{}
 
-// Now returns the current wall-clock time.
-func (Real) Now() time.Time { return time.Now().UTC() }
+// Now returns the current wall-clock time in UTC.
+func (System) Now() time.Time { return time.Now().UTC() }

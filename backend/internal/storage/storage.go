@@ -13,10 +13,14 @@ import (
 	"github.com/kidcarmi/anchorix/backend/internal/inventory"
 )
 
-// Stores groups all repository interfaces. The composition root constructs
-// one Stores value at startup and passes the relevant fields to each domain
-// service.
-type Stores struct {
+// Repositories groups every domain repository the control plane needs.
+// The composition root constructs one Repositories value at startup and
+// passes the relevant fields to each domain service.
+//
+// The type is named Repositories rather than Stores to avoid colliding
+// with the platform's domain term "certificate store" (Windows store
+// locations such as LocalMachine\My).
+type Repositories struct {
 	Auth      auth.Repository
 	Agents    agents.Repository
 	Inventory inventory.Repository

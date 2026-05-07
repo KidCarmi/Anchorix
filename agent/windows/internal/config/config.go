@@ -11,13 +11,13 @@ import (
 
 // Config is the validated agent configuration.
 type Config struct {
-	LogLevel              string
-	ControlPlaneURL       string
-	HeartbeatInterval     time.Duration
-	InventoryInterval     time.Duration
-	IdentityFile          string
-	DiscoveryMode         string // "windows" (default) or "stub" for dev
-	EnrollmentToken       string // optional; only used on first run
+	LogLevel          string
+	ControlPlaneURL   string
+	HeartbeatInterval time.Duration
+	InventoryInterval time.Duration
+	IdentityFile      string
+	DiscoveryMode     string // "windows" (default) or "stub" for dev
+	EnrollmentToken   string // optional; only used on first run
 }
 
 // Load reads configuration from the environment and validates it.

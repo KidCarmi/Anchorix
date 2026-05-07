@@ -32,10 +32,10 @@ type Agent struct {
 // EnrollmentToken is a single-use token an operator issues to bootstrap a
 // new agent. Tokens are short-lived and never logged (CLAUDE.md §6.5, §6.9).
 type EnrollmentToken struct {
-	ID             string    `json:"id"`
-	OrganizationID string    `json:"organization_id"`
-	IssuedBy       string    `json:"issued_by"` // user id
-	IssuedAt       time.Time `json:"issued_at"`
-	ExpiresAt      time.Time `json:"expires_at"`
+	ID             string     `json:"id"`
+	OrganizationID string     `json:"organization_id"`
+	IssuedBy       string     `json:"issued_by"` // user id
+	IssuedAt       time.Time  `json:"issued_at"`
+	ExpiresAt      time.Time  `json:"expires_at"`
 	ConsumedAt     *time.Time `json:"consumed_at,omitempty"`
 }

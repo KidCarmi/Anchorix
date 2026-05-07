@@ -70,8 +70,8 @@ control plane returns 400 `enrollment_invalid` and audits the failure.
 - Default interval: `ANCHORIX_AGENT_INVENTORY_INTERVAL` (15m).
 - Agent enumerates configured certificate stores (default:
   `LocalMachine\My`, `LocalMachine\WebHosting`, `CurrentUser\My`).
-- Agent uploads a list of `IngestedCertificate` objects via
-  `POST /agents/{id}/inventory`.
+- Agent uploads an `InventoryBatch` (a list of `DiscoveredCertificate`
+  records) via `POST /agents/{id}/inventory`.
 - Agent must collect **only public certificate metadata + PEM**. Reading
   private key material is explicitly forbidden by the agent's design.
 - Server validates, parses, dedupes by fingerprint, and records

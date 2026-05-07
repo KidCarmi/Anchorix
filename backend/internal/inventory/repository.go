@@ -6,7 +6,7 @@ import "context"
 // implementation lives in internal/storage/postgres.
 type Repository interface {
 	UpsertCertificate(ctx context.Context, c *Certificate) (*Certificate, error)
-	RecordObservation(ctx context.Context, o *Observation) error
+	RecordObservation(ctx context.Context, o *CertificateObservation) error
 	GetCertificate(ctx context.Context, orgID, id string) (*Certificate, error)
 	ListCertificates(ctx context.Context, q ListQuery) ([]*Certificate, error)
 }

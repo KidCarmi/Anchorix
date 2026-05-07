@@ -11,13 +11,13 @@ import (
 
 // User is an operator account.
 type User struct {
-	ID             string    `json:"id"`
-	OrganizationID string    `json:"organization_id"`
-	Email          string    `json:"email"`
-	DisplayName    string    `json:"display_name"`
-	Role           Role      `json:"role"`
-	Disabled       bool      `json:"disabled"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID             string     `json:"id"`
+	OrganizationID string     `json:"organization_id"`
+	Email          string     `json:"email"`
+	DisplayName    string     `json:"display_name"`
+	Role           Role       `json:"role"`
+	Disabled       bool       `json:"disabled"`
+	CreatedAt      time.Time  `json:"created_at"`
 	LastLoginAt    *time.Time `json:"last_login_at,omitempty"`
 }
 
