@@ -23,6 +23,22 @@ const (
 	EnvProduction  Env = "production"
 )
 
+// TLSTermination tells the control plane how TLS is handled in front of it.
+// The empty value is invalid in production; in development it falls back to
+// TLSDisabledDev with a startup warning.
+type TLSTermination string
+
+const (
+	// TLSProcess: the control plane process terminates TLS itself using
+	// ANCHORIX_TLS_CERT_FILE / ANCHORIX_TLS_KEY_FILE.
+	TLSProcess TLSTermination = "process"
+	// TLSReverseProxy: a TLS-terminating reverse proxy sits in front of
+	// the control plane. The process speaks plain HTTP on its bind address.
+	TLSReverseProxy TLSTermination = "reverse_proxy"
+	// TLSDisabledDev: plain HTTP, never allowed in production.
+	TLSDisabledDev TLSTermination = "disabled_dev"
+)
+
 // Config is the immutable, validated configuration for the control plane.
 // Fields are populated once at startup and must not be mutated afterwards.
 type Config struct {
@@ -37,12 +53,13 @@ type Config struct {
 
 	DatabaseURL string
 
-	EnrollmentTokenTTL      time.Duration
-	AgentHeartbeatInterval  time.Duration
-	AgentInventoryInterval  time.Duration
+	EnrollmentTokenTTL     time.Duration
+	AgentHeartbeatInterval time.Duration
+	AgentInventoryInterval time.Duration
 
-	TLSCertFile string
-	TLSKeyFile  string
+	TLSTermination TLSTermination
+	TLSCertFile    string
+	TLSKeyFile     string
 }
 
 // Load reads configuration from the process environment, applies defaults,
@@ -52,13 +69,14 @@ type Config struct {
 // Per CLAUDE.md §6.1 / §6.9, this is the only place that calls os.Getenv.
 func Load() (*Config, error) {
 	cfg := &Config{
-		Env:           Env(envDefault("ANCHORIX_ENV", string(EnvDevelopment))),
-		LogLevel:      envDefault("ANCHORIX_LOG_LEVEL", "info"),
-		HTTPAddr:      envDefault("ANCHORIX_HTTP_ADDR", "0.0.0.0:8080"),
-		PublicBaseURL: envDefault("ANCHORIX_PUBLIC_BASE_URL", "http://localhost:8080"),
-		DatabaseURL:   os.Getenv("DATABASE_URL"),
-		TLSCertFile:   os.Getenv("ANCHORIX_TLS_CERT_FILE"),
-		TLSKeyFile:    os.Getenv("ANCHORIX_TLS_KEY_FILE"),
+		Env:            Env(envDefault("ANCHORIX_ENV", string(EnvDevelopment))),
+		LogLevel:       envDefault("ANCHORIX_LOG_LEVEL", "info"),
+		HTTPAddr:       envDefault("ANCHORIX_HTTP_ADDR", "0.0.0.0:8080"),
+		PublicBaseURL:  envDefault("ANCHORIX_PUBLIC_BASE_URL", "http://localhost:8080"),
+		DatabaseURL:    os.Getenv("DATABASE_URL"),
+		TLSTermination: TLSTermination(strings.TrimSpace(os.Getenv("ANCHORIX_TLS_TERMINATION"))),
+		TLSCertFile:    os.Getenv("ANCHORIX_TLS_CERT_FILE"),
+		TLSKeyFile:     os.Getenv("ANCHORIX_TLS_KEY_FILE"),
 	}
 
 	var err error
@@ -93,15 +111,40 @@ func (c *Config) validate() error {
 	if len(c.SessionKey) < 32 {
 		return errors.New("ANCHORIX_SESSION_KEY must decode to at least 32 bytes")
 	}
-	if c.Env == EnvProduction {
-		if strings.Contains(c.DatabaseURL, "sslmode=disable") {
-			return errors.New("DATABASE_URL must not use sslmode=disable in production")
-		}
+	if err := c.validateTLS(); err != nil {
+		return err
+	}
+	if c.IsProduction() && strings.Contains(c.DatabaseURL, "sslmode=disable") {
+		return errors.New("DATABASE_URL must not use sslmode=disable in production")
+	}
+	return nil
+}
+
+// validateTLS enforces the TLS posture rules.
+//
+// Production must be explicit (process or reverse_proxy). Development
+// defaults to disabled_dev for ergonomics, but a misconfigured production
+// deployment must fail closed at startup (CLAUDE.md §6.12).
+func (c *Config) validateTLS() error {
+	switch c.TLSTermination {
+	case TLSProcess:
 		if c.TLSCertFile == "" || c.TLSKeyFile == "" {
-			// In production we expect TLS to be terminated either at the
-			// process or at a fronting proxy; we surface a warning either
-			// way during startup. Hard-failing here is too aggressive.
+			return errors.New("ANCHORIX_TLS_TERMINATION=process requires ANCHORIX_TLS_CERT_FILE and ANCHORIX_TLS_KEY_FILE")
 		}
+	case TLSReverseProxy:
+		// Operator's reverse proxy is responsible for TLS. Nothing else
+		// to validate here. Defining this mode explicitly is the point.
+	case TLSDisabledDev:
+		if c.IsProduction() {
+			return errors.New("ANCHORIX_TLS_TERMINATION=disabled_dev is forbidden in production")
+		}
+	case "":
+		if c.IsProduction() {
+			return errors.New("ANCHORIX_TLS_TERMINATION must be set in production (process|reverse_proxy)")
+		}
+		c.TLSTermination = TLSDisabledDev
+	default:
+		return fmt.Errorf("invalid ANCHORIX_TLS_TERMINATION: %q (allowed: process|reverse_proxy|disabled_dev)", c.TLSTermination)
 	}
 	return nil
 }

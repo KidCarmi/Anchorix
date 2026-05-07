@@ -10,13 +10,17 @@ import (
 
 // newRouter assembles the API surface. Routes are grouped by resource and
 // kept stable under /api/v1; breaking changes require /api/v2.
-func newRouter(cfg *config.Config, log *logger.Logger) http.Handler {
+func newRouter(cfg *config.Config, log *logger.Logger, readiness *Readiness) http.Handler {
 	mux := http.NewServeMux()
 
 	// Health endpoints sit outside /api/v1 — they are infrastructure, not
 	// part of the public REST surface. They must remain unauthenticated.
+	//
+	// /healthz is a process-only liveness probe and never depends on
+	// external resources. /readyz is dependency-aware and fails closed
+	// if any registered probe is unhealthy.
 	mux.HandleFunc("GET /healthz", handlers.Health)
-	mux.HandleFunc("GET /readyz", handlers.Ready)
+	mux.Handle("GET /readyz", readiness.handler())
 
 	// /api/v1 — versioned, authenticated REST surface.
 	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", apiV1Router()))

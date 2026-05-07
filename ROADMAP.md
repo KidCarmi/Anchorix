@@ -30,16 +30,19 @@ healthy state with placeholder endpoints.
 
 **Goal:** smallest end-to-end flow that proves the architecture.
 
-- [ ] Configuration loader with required-secret validation
-- [ ] Structured logger with redaction allow-list
+- [x] Configuration loader with required-secret validation
+- [x] Structured logger with redaction allow-list
+- [x] HTTP server with `/healthz` (process-only) and `/readyz` (probe-based)
 - [ ] Database connection pool (pgx)
 - [ ] Migration runner wired into `cmd/anchorix migrate up`
-- [ ] HTTP server with `/healthz` and `/readyz`
+- [ ] Postgres ping registered as a `/readyz` probe (fails closed when DB down)
+- [ ] `anchorix admin create` implementation (no default admin / password)
 - [ ] `/api/v1/auth/login` (local password, bcrypt) + session cookies
 - [ ] `/api/v1/auth/me`, `/api/v1/auth/logout`
-- [ ] Audit event recording for login / logout
+- [ ] CSRF protection for state-changing endpoints
+- [ ] Audit event recording for login / logout / admin_created
 - [ ] React login page hitting the API
-- [ ] CI: lint, vet, unit tests, container build
+- [ ] CI: lint, vet, unit tests, container build, gitleaks
 
 **Exit criteria:** an operator can log in to the UI in dev.
 

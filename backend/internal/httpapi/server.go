@@ -18,12 +18,18 @@ import (
 
 // Server owns the HTTP listener and graceful shutdown lifecycle.
 type Server struct {
-	cfg *config.Config
-	log *logger.Logger
-	srv *http.Server
+	cfg       *config.Config
+	log       *logger.Logger
+	srv       *http.Server
+	readiness *Readiness
 }
 
 // NewServer wires the router and middleware. It does not start listening.
+//
+// Callers (the composition root) may register readiness probes on the
+// returned server's Readiness() before invoking Run, so that probes
+// reflecting real runtime dependencies (e.g. a database ping) are in
+// place from the first request /readyz serves.
 func NewServer(cfg *config.Config, log *logger.Logger) (*Server, error) {
 	if cfg == nil {
 		return nil, errors.New("nil config")
@@ -31,7 +37,8 @@ func NewServer(cfg *config.Config, log *logger.Logger) (*Server, error) {
 	if log == nil {
 		return nil, errors.New("nil logger")
 	}
-	router := newRouter(cfg, log)
+	readiness := NewReadiness()
+	router := newRouter(cfg, log, readiness)
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           router,
@@ -40,8 +47,12 @@ func NewServer(cfg *config.Config, log *logger.Logger) (*Server, error) {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	return &Server{cfg: cfg, log: log, srv: srv}, nil
+	return &Server{cfg: cfg, log: log, srv: srv, readiness: readiness}, nil
 }
+
+// Readiness exposes the server's probe registry so the composition root
+// can register dependency probes before Run is called.
+func (s *Server) Readiness() *Readiness { return s.readiness }
 
 // Run starts listening and blocks until the context is cancelled.
 // On cancellation it performs a graceful shutdown with a fixed timeout.

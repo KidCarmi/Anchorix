@@ -8,14 +8,12 @@ import (
 	"net/http"
 )
 
-// Health is the liveness probe. It must never depend on external resources.
+// Health is the process liveness probe. It MUST NOT depend on external
+// resources — it answers "is this process running and able to serve HTTP?"
+// only. Readiness (dependency health) is served by /readyz, which is
+// wired in internal/httpapi to the Readiness probe registry.
 func Health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-// Ready is the readiness probe. It will gain a DB ping in Phase 1.
-func Ready(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ready"})
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
@@ -24,6 +22,10 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+// writeError emits the canonical error envelope. Every API error MUST go
+// through this helper so clients can rely on a stable shape:
+//
+//	{ "error": { "code": "...", "message": "..." } }
 func writeError(w http.ResponseWriter, status int, code, message string) {
 	writeJSON(w, status, map[string]any{
 		"error": map[string]string{

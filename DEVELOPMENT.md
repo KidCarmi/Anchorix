@@ -19,9 +19,21 @@ The Windows agent is built with Go. Cross-compilation from Linux is supported.
 ```bash
 git clone https://github.com/kidcarmi/anchorix.git
 cd anchorix
-cp .env.example .env
+
+# Generates .env with a real ANCHORIX_SESSION_KEY.
+# Refuses to overwrite an existing .env (use --force if you really mean it).
+./scripts/dev-env.sh
+
 docker compose up --build
 ```
+
+> The control plane refuses to start with the placeholder
+> `ANCHORIX_SESSION_KEY` from `.env.example`, so you must run the
+> bootstrap script (or generate a key by hand) before `docker compose up`.
+> By hand: `openssl rand -base64 32` and paste into `.env`.
+
+After the database is up, create the first operator account — Anchorix
+ships **no default admin**. See [`docs/BOOTSTRAP.md`](./docs/BOOTSTRAP.md).
 
 Services exposed by Compose:
 

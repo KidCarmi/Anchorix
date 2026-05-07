@@ -1,8 +1,23 @@
 # Anchorix v0.1 — local development stack.
 #
-# This compose file is for development and demos only. Production deployments
-# should sit behind a reverse proxy that terminates TLS (see
-# deploy/compose/README.md for guidance).
+# !!! DEVELOPMENT AND DEMO USE ONLY !!!
+#
+# This compose file is NOT a production deployment template. In particular:
+#
+#   * It binds PostgreSQL on 0.0.0.0:5432 for developer convenience.
+#     NEVER expose this port on a non-trusted network. Production
+#     deployments must keep PostgreSQL on a private network and reachable
+#     only from the control plane.
+#   * It binds the control plane on 0.0.0.0:8080 over plain HTTP. Production
+#     deployments must front the API with a TLS-terminating reverse proxy
+#     (or set ANCHORIX_TLS_TERMINATION=process with cert/key files).
+#   * It binds the Vite/Nginx UI on 0.0.0.0:5173 over plain HTTP.
+#   * The example credentials in .env are placeholders. Use real secrets
+#     in any environment that is not your laptop.
+#
+# Production deployments should derive a separate compose file (see
+# deploy/compose/README.md) that disables the Postgres port mapping,
+# adds a reverse proxy, and sources secrets from a real secret store.
 #
 # Per CLAUDE.md, the control plane is a single Go binary; the frontend is a
 # static SPA. PostgreSQL holds all durable state.
@@ -19,8 +34,11 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-anchorix}
     volumes:
       - anchorix_pg_data:/var/lib/postgresql/data
+    # WARNING: dev-only port mapping. See top-of-file note. Production
+    # compose files MUST omit this `ports:` block so PostgreSQL stays on
+    # the internal Docker network only.
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-anchorix} -d ${POSTGRES_DB:-anchorix}"]
       interval: 5s
@@ -41,6 +59,7 @@ services:
       ANCHORIX_HTTP_ADDR: 0.0.0.0:8080
       ANCHORIX_PUBLIC_BASE_URL: ${ANCHORIX_PUBLIC_BASE_URL:-http://localhost:8080}
       ANCHORIX_SESSION_KEY: ${ANCHORIX_SESSION_KEY}
+      ANCHORIX_TLS_TERMINATION: ${ANCHORIX_TLS_TERMINATION:-disabled_dev}
       DATABASE_URL: ${DATABASE_URL:-postgres://anchorix:change-me-locally@postgres:5432/anchorix?sslmode=disable}
       ANCHORIX_ENROLLMENT_TOKEN_TTL: ${ANCHORIX_ENROLLMENT_TOKEN_TTL:-15m}
     ports:
@@ -48,7 +67,7 @@ services:
     healthcheck:
       test: ["CMD", "/anchorix", "healthcheck"]
       interval: 10s
-      timeout: 3s
+      timeout: 5s
       retries: 5
 
   web:
