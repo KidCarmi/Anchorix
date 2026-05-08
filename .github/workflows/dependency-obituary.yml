@@ -36,20 +36,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The action runs from the repository root by default. Anchorix
-      # has no root-level package.json — deps live under frontend/ —
-      # so the previous run errored with:
-      #   "No dependency file found. Provide a path or run from a
-      #    project root."
-      # The action's error wording exposes a `path` input. We point
-      # it at the frontend tree where package.json + package-lock.json
-      # actually live.
+      # The action's valid inputs are: file, threshold, api-url
+      # (per its own warning when an unknown input is given). It expects
+      # a single dependency manifest, not a directory. Anchorix has no
+      # root-level package.json — deps live under frontend/ — so we
+      # point it at the frontend lockfile, which lists the full
+      # transitive dependency tree.
       #
-      # v0.1 ships only the frontend npm tree under this gate;
+      # v0.1 only ships the frontend npm tree under this gate;
       # backend and agent/windows are stdlib-only Go modules with
       # nothing for the obituary action to evaluate yet.
       - name: Dependency Obituary
         uses: KidCarmi/Dependency-Obituary@main
         with:
           threshold: "60"
-          path: frontend
+          file: frontend/package-lock.json
