@@ -23,10 +23,13 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Bumped from 1.22 to pick up published stdlib security patches that
-  # govulncheck flags against older Go releases. Both Go modules declare
-  # `go 1.24` so GOTOOLCHAIN=auto won't downgrade us.
-  GO_VERSION: "1.24"
+  # We use "stable" so build, test, and govulncheck all run against the
+  # same patched stdlib. Pinning a fixed minor here while govulncheck
+  # ran on a different version would create a real coverage gap (the
+  # binary we test could carry CVEs the scanner would never see).
+  # Both Go modules declare `go 1.24`, which is the floor — the actual
+  # toolchain is whatever `stable` resolves to (>= 1.24).
+  GO_VERSION: "stable"
   NODE_VERSION: "20"
 
 jobs:
