@@ -23,7 +23,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: "1.22"
+  # Bumped from 1.22 to pick up published stdlib security patches that
+  # govulncheck flags against older Go releases. Both Go modules declare
+  # `go 1.24` so GOTOOLCHAIN=auto won't downgrade us.
+  GO_VERSION: "1.24"
   NODE_VERSION: "20"
 
 jobs:

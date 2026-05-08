@@ -1,3 +1,3 @@
 module github.com/kidcarmi/anchorix/agent/windows
 
-go 1.22
+go 1.24
