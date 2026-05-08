@@ -37,26 +37,12 @@ jobs:
       - uses: actions/checkout@v4
 
       # The action's valid inputs are: file, threshold, api-url
-      # (per its own warning when an unknown input is given).
-      #
-      # TEMPORARY PIN — revert to @main when upstream PR #63 merges:
-      #   https://github.com/KidCarmi/Dependency-Obituary/pull/63
-      # Maintainer confirmed (2026-05-08) the parser on `main` drops the
-      # first positional argument because `undefined?.startsWith("--")`
-      # evaluates falsy in the `args.find(...)` neighbor lookup, so the
-      # exact GitHub-Action shape (`<file> --threshold 60`) silently
-      # loses <file> and the action errors with
-      #   "No dependency file found. Provide a path or run from a
-      #    project root."
-      # PR #63 replaces the neighbor lookup with an index-based parser
-      # driven by a single FLAG_SCHEMA. Pinning to that PR's branch
-      # unblocks Anchorix CI without weakening the gate.
-      #
-      # Anchorix has no root-level package.json — deps live under
-      # frontend/. We point the action at the lockfile so it gets the
-      # full transitive dependency tree.
+      # (per its own warning when an unknown input is given). Anchorix
+      # has no root-level package.json — deps live under frontend/ —
+      # so we point the action at the lockfile, which lists the full
+      # transitive dependency tree.
       - name: Dependency Obituary
-        uses: KidCarmi/Dependency-Obituary@claude/fix-cli-argument-parsing-89Hxy
+        uses: KidCarmi/Dependency-Obituary@main
         with:
           threshold: "60"
           file: frontend/package-lock.json
