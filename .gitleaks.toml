@@ -1,0 +1,33 @@
+# Gitleaks configuration for Anchorix.
+#
+# Inherits the default ruleset and adds a narrow, justified allowlist.
+# We do NOT disable any built-in rule. Each path below documents *why*
+# the match is a known false positive.
+#
+# Per CLAUDE.md §6.1 / §6.9, real secrets do not live in this repo —
+# anything Gitleaks flags that is not allowlisted here is a real
+# finding and the PR loses.
+
+title = "Anchorix Gitleaks config"
+
+[extend]
+# Inherit Gitleaks' default ruleset wholesale.
+useDefault = true
+
+[allowlist]
+description = "Documented false positives — see comments in this file"
+paths = [
+    # backend/internal/inventory/inventory_test.go contains literal
+    # "-----BEGIN ... PRIVATE KEY-----" strings whose body is the placeholder
+    # "abc". They are inputs to TestRejectPrivateKeyMaterial, the test
+    # that proves the control plane rejects private-key uploads
+    # (CLAUDE.md §6.2). Gitleaks' "Private Key" rule matches the BEGIN
+    # line, but the strings carry no key material.
+    '''^backend/internal/inventory/inventory_test\.go$''',
+
+    # .env.example ships with obvious placeholder strings
+    # ("replace-me-with-random-base64-key", "change-me-locally"). These
+    # are replaced at runtime by scripts/dev-env.sh. Allowlisting the
+    # file by path avoids per-placeholder rules.
+    '''^\.env\.example$''',
+]

@@ -3,6 +3,11 @@
 # Findings are uploaded to the GitHub Security tab; the job exits non-zero
 # only if CodeQL itself errors. Severity-based gating happens in the
 # branch-protection settings (the workflow result is the gate).
+#
+# Anchorix is a multi-Go-module repository (backend and agent/windows).
+# autobuild does not handle that pattern reliably, so Go uses build-mode
+# 'manual' and we drive the compilation explicitly. The agent additionally
+# cross-compiles for GOOS=windows so its build-tagged code is analyzed.
 
 name: codeql
 
@@ -29,27 +34,44 @@ jobs:
       matrix:
         include:
           - language: go
-            build-mode: autobuild
+            build-mode: manual
           - language: javascript-typescript
             build-mode: none
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set up Go
+        if: matrix.language == 'go'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+          cache: false
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
           languages: ${{ matrix.language }}
           build-mode: ${{ matrix.build-mode }}
-          # Default + security-extended; security-and-quality is broader but
-          # noisier — start tight, expand if signal-to-noise is high.
+          # security-extended is tighter than default, less noisy than
+          # security-and-quality. Start tight; expand if signal is good.
           queries: security-extended
 
-      - name: Set up Go (for autobuild)
+      - name: Build Go modules (manual for CodeQL)
         if: matrix.language == 'go'
-        uses: actions/setup-go@v5
-        with:
-          go-version: "1.22"
-          cache: false
+        run: |
+          set -euo pipefail
+
+          echo "::group::backend (linux/amd64)"
+          (cd backend && go build ./...)
+          echo "::endgroup::"
+
+          echo "::group::agent/windows (linux/amd64)"
+          (cd agent/windows && go build ./...)
+          echo "::endgroup::"
+
+          echo "::group::agent/windows (windows/amd64 cross-compile)"
+          (cd agent/windows && GOOS=windows GOARCH=amd64 go build ./...)
+          echo "::endgroup::"
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@v3
