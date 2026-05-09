@@ -1,17 +1,17 @@
-# Dependency Obituary — dependency health and abandonment gate.
+# Dependency Obituary — direct-dependency health gate.
 #
-# This is NOT SAST and NOT a CVE scanner. It complements the security
-# workflow by surfacing:
+# Scope (binding, see CLAUDE.md §11 and docs/BRANCHING.md §2):
 #
-#   - abandoned upstream packages
-#   - archived repositories
-#   - deprecated packages
-#   - stale maintenance posture
-#   - low maintainer activity
+#   * BLOCKING: direct frontend dependencies (frontend/package.json),
+#     threshold 60.
+#   * NOT GATED HERE: transitive dependencies. Transitive CVE risk is
+#     already covered by `npm audit --audit-level=high` and the Trivy
+#     filesystem scan (both blocking).
 #
-# Threshold of 60 means CI fails when overall dependency health drops below
-# that score. Adjusting the threshold is a CLAUDE.md-level decision, not a
-# convenience tweak.
+# The choice to scan package.json instead of package-lock.json is a
+# policy choice — it intentionally narrows this gate to direct
+# dependencies. Anything that contradicts this scope (allowlists,
+# continue-on-error, lower threshold) is forbidden by CLAUDE.md.
 
 name: dependency-obituary
 
@@ -36,13 +36,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The action's valid inputs are: file, threshold, api-url
-      # (per its own warning when an unknown input is given). Anchorix
-      # has no root-level package.json — deps live under frontend/ —
-      # so we point the action at the lockfile, which lists the full
-      # transitive dependency tree.
-      - name: Dependency Obituary
+      # Direct deps only: package.json (NOT package-lock.json). The
+      # action's valid inputs are: file, threshold, api-url. Threshold
+      # stays at 60 — lowering or allowlisting is forbidden.
+      - name: Dependency Obituary (direct deps)
         uses: KidCarmi/Dependency-Obituary@main
         with:
           threshold: "60"
-          file: frontend/package-lock.json
+          file: frontend/package.json

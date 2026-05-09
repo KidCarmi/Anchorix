@@ -308,9 +308,17 @@ is failing:
 **Secrets and dependency health**
 
 - Gitleaks — secret scan over the diff and history
-- Dependency Obituary — fails when dependency health drops below the
-  configured threshold (currently 60). Complements CVE scanners by
-  catching abandoned, archived, or deprecated upstream packages.
+- Dependency Obituary — fails when **direct** dependency health drops
+  below the configured threshold (currently 60). Scope is intentionally
+  narrow: the action runs on `frontend/package.json`, not on the
+  lockfile, so the gate covers direct dependencies only. Complements
+  CVE scanners by catching abandoned, archived, or deprecated upstream
+  packages we have chosen to depend on directly.
+  Transitive dependency CVE risk is covered by `npm audit
+  --audit-level=high` and the Trivy filesystem scan; transitive
+  dependency *health* is intentionally not gated by Dependency Obituary
+  for v0.1, because gating on the full npm long tail produces too much
+  noise on healthy direct deps.
 
 **Build and runtime smoke**
 
