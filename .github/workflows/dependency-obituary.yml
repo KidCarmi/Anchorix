@@ -8,21 +8,27 @@
 #     already covered by `npm audit --audit-level=high` and the Trivy
 #     filesystem scan (both blocking).
 #
-# Exclusions (see CLAUDE.md §11):
+# Exclusions (binding, see CLAUDE.md §11):
 #
-#   * eslint-plugin-react — explicitly excluded by exact package name
-#     (NOT a pattern). The plugin currently scores 45 in the obituary
-#     DB, but it remains the de-facto React linting plugin and is
-#     useful for future frontend maturity. Excluding it lets v0.1
-#     ship without retiring the linter or downgrading the threshold.
-#     Reversible: delete the `exclude:` input below to re-arm the gate
-#     for this package. No other exclusions are permitted.
+#   The action loads exclusions from `.depobituaryignore` at the repo
+#   root (gitignore-style, one exact package name per line, comments
+#   prefixed with `#`). Excluded packages are still scored and shown
+#   in the report tagged IGNORED — they just do not count toward the
+#   threshold-fail decision.
+#
+#   The current allowed exclusion is exactly one package:
+#   - eslint-plugin-react
+#
+#   Wildcard / pattern entries are FORBIDDEN by Anchorix policy
+#   regardless of what the action accepts. Every entry must be an
+#   exact package name. See `.depobituaryignore` for the rationale.
 #
 # Forbidden (per CLAUDE.md):
 #   - threshold lowered
 #   - continue-on-error
 #   - wildcard / pattern exclusions
-#   - any allowlist beyond the single package above
+#   - any allowlist beyond the explicit named entries in
+#     .depobituaryignore
 
 name: dependency-obituary
 
@@ -50,16 +56,13 @@ jobs:
       # Direct deps only: package.json (NOT package-lock.json).
       # Threshold stays at 60.
       #
-      # `exclude` is a single explicit package name — eslint-plugin-react —
-      # not a pattern. Rationale and reversibility are documented in the
-      # top-of-file comment block and in CLAUDE.md §11. If the action's
-      # exclusion input is named differently than `exclude`, its own
-      # warning will report the correct key (the action surfaced that
-      # behaviour previously when `path` was given instead of `file`),
-      # and we will adjust to the canonical name on the next push.
+      # Exclusions are file-based at the repo root (.depobituaryignore).
+      # That file is the SOURCE OF TRUTH — do NOT add an `exclude:`
+      # input here, and do NOT pass package names through the workflow.
+      # Keeping the rule list in the file makes diff review obvious
+      # and lets bin/check.js's loadAllowlist() pick it up unchanged.
       - name: Dependency Obituary (direct deps)
         uses: KidCarmi/Dependency-Obituary@main
         with:
           threshold: "60"
           file: frontend/package.json
-          exclude: eslint-plugin-react

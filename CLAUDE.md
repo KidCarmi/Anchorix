@@ -322,16 +322,28 @@ is failing:
 
   **Exclusions (binding):**
 
-  Exactly one direct dependency is excluded from the Dependency Obituary
-  gate, by exact package name (no wildcards, no patterns):
+  Exclusions are managed in a single file at the repo root:
+  [`.depobituaryignore`](./.depobituaryignore). It is gitignore-style
+  (one exact package name per line, `#` comments). The action loads
+  it via `bin/check.js`'s `loadAllowlist()`. Excluded packages are
+  still scored and tagged `IGNORED` in the report so they remain
+  visible — they simply do not count toward the threshold-fail
+  decision.
+
+  The current allowed exclusion list is exactly **one** entry:
 
   - `eslint-plugin-react` — current obituary score 45 (below 60). The
     plugin is the de-facto React linting plugin in the ecosystem and is
     useful for future frontend maturity, but its current health score
     should not block the v0.1 foundation phase. The exclusion is
-    explicit, single-package, and **reversible**: delete the `exclude:`
-    input in `.github/workflows/dependency-obituary.yml` to re-arm the
+    explicit, single-package, and **reversible**: delete the
+    `eslint-plugin-react` line in `.depobituaryignore` to re-arm the
     gate for this package.
+
+  Wildcard / pattern entries (e.g. `@types/*`) are forbidden in
+  `.depobituaryignore` regardless of whether the action accepts them.
+  Every entry must be an exact package name with a comment immediately
+  above it explaining why and how to remove it.
 
   Adding additional exclusions, switching to wildcard patterns, lowering
   the threshold, or wrapping the job in `continue-on-error` are all

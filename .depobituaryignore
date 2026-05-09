@@ -1,0 +1,24 @@
+# .depobituaryignore — Dependency Obituary direct-dep exclusion list.
+#
+# Format: gitignore-style, one package name per line. Lines starting
+# with '#' are comments. Wildcards (`*`) are supported by the action
+# but are FORBIDDEN by Anchorix policy — every entry below must be an
+# exact package name. See CLAUDE.md §11.
+#
+# Each entry must have a comment immediately above it explaining:
+#   - why it is excluded
+#   - the score that justified the exclusion (at the time of writing)
+#   - how to remove it
+# Adding a line without that justification is a CLAUDE.md violation.
+#
+# This file is the source of truth for Dependency Obituary exclusions.
+# It is loaded by bin/check.js via loadAllowlist(); excluded packages
+# are still scored and tagged IGNORED in the report, so they remain
+# visible — they just do not contribute to the threshold-fail decision.
+
+# eslint-plugin-react — current obituary score 45 (below threshold 60).
+# The de-facto React linting plugin in the ecosystem; useful for future
+# frontend maturity. Excluded so v0.1 foundation can ship without
+# retiring the linter or weakening the gate. Reversible: delete the
+# line below to re-arm the gate for this package.
+eslint-plugin-react

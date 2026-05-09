@@ -42,16 +42,27 @@ dependencies only. This is a deliberate policy decision, documented in
 
 ### Sanctioned exclusions (single, named, reversible)
 
-The Dependency Obituary action's `exclude` input is used **only** for
-explicit, exact package names. No patterns. No wildcards. No
-ranges. The current exclusion list contains exactly one entry:
+Exclusions are file-based at the repo root in
+[`.depobituaryignore`](../../.depobituaryignore) — gitignore-style,
+one exact package name per line. The action's `bin/check.js` loads
+this file via `loadAllowlist()`. Excluded packages are still scored
+and tagged `IGNORED` in the report so they remain visible; they
+simply do not count toward the threshold-fail decision.
 
-| Package               | Score | Rationale                                                       | How to remove                          |
-| --------------------- | ----- | --------------------------------------------------------------- | -------------------------------------- |
-| `eslint-plugin-react` | 45    | De-facto React linting plugin; useful for future frontend work; current health below 60 should not block v0.1 foundation. | Delete the `exclude:` line in `dependency-obituary.yml`. |
+The current exclusion list contains exactly one entry:
+
+| Package               | Score | Rationale                                                       | How to remove                                                |
+| --------------------- | ----- | --------------------------------------------------------------- | ------------------------------------------------------------ |
+| `eslint-plugin-react` | 45    | De-facto React linting plugin; useful for future frontend work; current health below 60 should not block v0.1 foundation. | Delete the `eslint-plugin-react` line in `.depobituaryignore`. |
+
+Wildcard / pattern entries (e.g. `@types/*`) are forbidden in
+`.depobituaryignore` regardless of whether the action accepts them.
+Every entry must be an exact package name accompanied by a justifying
+comment in the file.
 
 CLAUDE.md §11 is the source of truth for this list. Adding to it
-requires a CLAUDE.md amendment, not a workflow tweak.
+requires a CLAUDE.md amendment, not a `.depobituaryignore` tweak in
+isolation.
 
 ### Forbidden mitigations
 
