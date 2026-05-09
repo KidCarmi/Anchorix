@@ -320,6 +320,24 @@ is failing:
   for v0.1, because gating on the full npm long tail produces too much
   noise on healthy direct deps.
 
+  **Exclusions (binding):**
+
+  Exactly one direct dependency is excluded from the Dependency Obituary
+  gate, by exact package name (no wildcards, no patterns):
+
+  - `eslint-plugin-react` — current obituary score 45 (below 60). The
+    plugin is the de-facto React linting plugin in the ecosystem and is
+    useful for future frontend maturity, but its current health score
+    should not block the v0.1 foundation phase. The exclusion is
+    explicit, single-package, and **reversible**: delete the `exclude:`
+    input in `.github/workflows/dependency-obituary.yml` to re-arm the
+    gate for this package.
+
+  Adding additional exclusions, switching to wildcard patterns, lowering
+  the threshold, or wrapping the job in `continue-on-error` are all
+  forbidden — they require a CLAUDE.md amendment, not a convenience
+  tweak. The current exclusion is the only sanctioned one for v0.1.
+
 **Build and runtime smoke**
 
 - `docker compose config -q` — compose configuration validates

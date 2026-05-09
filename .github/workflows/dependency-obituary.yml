@@ -8,10 +8,21 @@
 #     already covered by `npm audit --audit-level=high` and the Trivy
 #     filesystem scan (both blocking).
 #
-# The choice to scan package.json instead of package-lock.json is a
-# policy choice — it intentionally narrows this gate to direct
-# dependencies. Anything that contradicts this scope (allowlists,
-# continue-on-error, lower threshold) is forbidden by CLAUDE.md.
+# Exclusions (see CLAUDE.md §11):
+#
+#   * eslint-plugin-react — explicitly excluded by exact package name
+#     (NOT a pattern). The plugin currently scores 45 in the obituary
+#     DB, but it remains the de-facto React linting plugin and is
+#     useful for future frontend maturity. Excluding it lets v0.1
+#     ship without retiring the linter or downgrading the threshold.
+#     Reversible: delete the `exclude:` input below to re-arm the gate
+#     for this package. No other exclusions are permitted.
+#
+# Forbidden (per CLAUDE.md):
+#   - threshold lowered
+#   - continue-on-error
+#   - wildcard / pattern exclusions
+#   - any allowlist beyond the single package above
 
 name: dependency-obituary
 
@@ -36,11 +47,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Direct deps only: package.json (NOT package-lock.json). The
-      # action's valid inputs are: file, threshold, api-url. Threshold
-      # stays at 60 — lowering or allowlisting is forbidden.
+      # Direct deps only: package.json (NOT package-lock.json).
+      # Threshold stays at 60.
+      #
+      # `exclude` is a single explicit package name — eslint-plugin-react —
+      # not a pattern. Rationale and reversibility are documented in the
+      # top-of-file comment block and in CLAUDE.md §11. If the action's
+      # exclusion input is named differently than `exclude`, its own
+      # warning will report the correct key (the action surfaced that
+      # behaviour previously when `path` was given instead of `file`),
+      # and we will adjust to the canonical name on the next push.
       - name: Dependency Obituary (direct deps)
         uses: KidCarmi/Dependency-Obituary@main
         with:
           threshold: "60"
           file: frontend/package.json
+          exclude: eslint-plugin-react

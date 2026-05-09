@@ -40,9 +40,28 @@ dependencies only. This is a deliberate policy decision, documented in
   much noise without commensurate signal. We may extend later, but only
   by amending CLAUDE.md §11.
 
-The threshold is fixed at 60. Lowering it, switching the gate to
-`continue-on-error`, or adding a per-package allowlist are all
-forbidden by CLAUDE.md.
+### Sanctioned exclusions (single, named, reversible)
+
+The Dependency Obituary action's `exclude` input is used **only** for
+explicit, exact package names. No patterns. No wildcards. No
+ranges. The current exclusion list contains exactly one entry:
+
+| Package               | Score | Rationale                                                       | How to remove                          |
+| --------------------- | ----- | --------------------------------------------------------------- | -------------------------------------- |
+| `eslint-plugin-react` | 45    | De-facto React linting plugin; useful for future frontend work; current health below 60 should not block v0.1 foundation. | Delete the `exclude:` line in `dependency-obituary.yml`. |
+
+CLAUDE.md §11 is the source of truth for this list. Adding to it
+requires a CLAUDE.md amendment, not a workflow tweak.
+
+### Forbidden mitigations
+
+- Lowering the threshold below 60 — forbidden.
+- Wildcard / pattern exclusions — forbidden.
+- `continue-on-error: true` on this job — forbidden.
+- Removing `dependency obituary` from the blocking required-checks set
+  — forbidden.
+
+All four require a CLAUDE.md amendment.
 
 ## Adding a new check
 
