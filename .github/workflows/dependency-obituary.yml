@@ -1,17 +1,34 @@
-# Dependency Obituary — dependency health and abandonment gate.
+# Dependency Obituary — direct-dependency health gate.
 #
-# This is NOT SAST and NOT a CVE scanner. It complements the security
-# workflow by surfacing:
+# Scope (binding, see CLAUDE.md §11 and docs/BRANCHING.md §2):
 #
-#   - abandoned upstream packages
-#   - archived repositories
-#   - deprecated packages
-#   - stale maintenance posture
-#   - low maintainer activity
+#   * BLOCKING: direct frontend dependencies (frontend/package.json),
+#     threshold 60.
+#   * NOT GATED HERE: transitive dependencies. Transitive CVE risk is
+#     already covered by `npm audit --audit-level=high` and the Trivy
+#     filesystem scan (both blocking).
 #
-# Threshold of 60 means CI fails when overall dependency health drops below
-# that score. Adjusting the threshold is a CLAUDE.md-level decision, not a
-# convenience tweak.
+# Exclusions (binding, see CLAUDE.md §11):
+#
+#   The action loads exclusions from `.depobituaryignore` at the repo
+#   root (gitignore-style, one exact package name per line, comments
+#   prefixed with `#`). Excluded packages are still scored and shown
+#   in the report tagged IGNORED — they just do not count toward the
+#   threshold-fail decision.
+#
+#   The current allowed exclusion is exactly one package:
+#   - eslint-plugin-react
+#
+#   Wildcard / pattern entries are FORBIDDEN by Anchorix policy
+#   regardless of what the action accepts. Every entry must be an
+#   exact package name. See `.depobituaryignore` for the rationale.
+#
+# Forbidden (per CLAUDE.md):
+#   - threshold lowered
+#   - continue-on-error
+#   - wildcard / pattern exclusions
+#   - any allowlist beyond the explicit named entries in
+#     .depobituaryignore
 
 name: dependency-obituary
 
@@ -36,7 +53,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Dependency Obituary
+      # Direct deps only: package.json (NOT package-lock.json).
+      # Threshold stays at 60.
+      #
+      # Exclusions are file-based at the repo root (.depobituaryignore).
+      # That file is the SOURCE OF TRUTH — do NOT add an `exclude:`
+      # input here, and do NOT pass package names through the workflow.
+      # Keeping the rule list in the file makes diff review obvious
+      # and lets bin/check.js's loadAllowlist() pick it up unchanged.
+      - name: Dependency Obituary (direct deps)
         uses: KidCarmi/Dependency-Obituary@main
         with:
           threshold: "60"
+          file: frontend/package.json

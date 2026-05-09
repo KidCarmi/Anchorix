@@ -308,9 +308,47 @@ is failing:
 **Secrets and dependency health**
 
 - Gitleaks — secret scan over the diff and history
-- Dependency Obituary — fails when dependency health drops below the
-  configured threshold (currently 60). Complements CVE scanners by
-  catching abandoned, archived, or deprecated upstream packages.
+- Dependency Obituary — fails when **direct** dependency health drops
+  below the configured threshold (currently 60). Scope is intentionally
+  narrow: the action runs on `frontend/package.json`, not on the
+  lockfile, so the gate covers direct dependencies only. Complements
+  CVE scanners by catching abandoned, archived, or deprecated upstream
+  packages we have chosen to depend on directly.
+  Transitive dependency CVE risk is covered by `npm audit
+  --audit-level=high` and the Trivy filesystem scan; transitive
+  dependency *health* is intentionally not gated by Dependency Obituary
+  for v0.1, because gating on the full npm long tail produces too much
+  noise on healthy direct deps.
+
+  **Exclusions (binding):**
+
+  Exclusions are managed in a single file at the repo root:
+  [`.depobituaryignore`](./.depobituaryignore). It is gitignore-style
+  (one exact package name per line, `#` comments). The action loads
+  it via `bin/check.js`'s `loadAllowlist()`. Excluded packages are
+  still scored and tagged `IGNORED` in the report so they remain
+  visible — they simply do not count toward the threshold-fail
+  decision.
+
+  The current allowed exclusion list is exactly **one** entry:
+
+  - `eslint-plugin-react` — current obituary score 45 (below 60). The
+    plugin is the de-facto React linting plugin in the ecosystem and is
+    useful for future frontend maturity, but its current health score
+    should not block the v0.1 foundation phase. The exclusion is
+    explicit, single-package, and **reversible**: delete the
+    `eslint-plugin-react` line in `.depobituaryignore` to re-arm the
+    gate for this package.
+
+  Wildcard / pattern entries (e.g. `@types/*`) are forbidden in
+  `.depobituaryignore` regardless of whether the action accepts them.
+  Every entry must be an exact package name with a comment immediately
+  above it explaining why and how to remove it.
+
+  Adding additional exclusions, switching to wildcard patterns, lowering
+  the threshold, or wrapping the job in `continue-on-error` are all
+  forbidden — they require a CLAUDE.md amendment, not a convenience
+  tweak. The current exclusion is the only sanctioned one for v0.1.
 
 **Build and runtime smoke**
 

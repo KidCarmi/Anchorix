@@ -56,7 +56,10 @@ Mandatory blocking gates:
 - `npm audit --audit-level=high`
 - Trivy filesystem scan (HIGH/CRITICAL fail)
 - Gitleaks secret scan
-- Dependency Obituary (health threshold 60)
+- Dependency Obituary — direct deps only, threshold 60
+  (scans `frontend/package.json`, not the lockfile; transitive
+  health is not gated, transitive CVEs are covered by `npm audit`
+  and Trivy)
 - `docker compose config` validation
 - Backend and frontend Docker image builds
 - Runtime smoke (`/healthz` + `/readyz`)

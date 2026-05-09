@@ -1,5 +1,8 @@
 # --- Build stage ---
-FROM golang:1.22-alpine AS build
+# Floating major-version pin: tracks the latest patched 1.x release.
+# This matches the "stable" pin in our CI workflows so the binary we
+# ship is built against the same stdlib govulncheck blesses.
+FROM golang:1-alpine AS build
 WORKDIR /src
 
 # Cache deps first.
