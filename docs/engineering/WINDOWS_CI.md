@@ -74,27 +74,43 @@ transitions. Any `Start-Process` semantics relied upon are exercised.
 
 This is the meat of the job and the reason it exists.
 
-```
-+-----------------------------------+      HTTPS over loopback
-| Linux service container           |  <───────────────────────────┐
-|   anchorix-api  +  postgres       |                              │
-+-----------------------------------+                              │
-                                                                   │
-+-----------------------------------+                              │
-| windows-latest runner             |                              │
-|                                   |                              │
-|   anchorix-agent.exe (service)    |  ──── enroll ───────────────►│
-|                                   |  ──── heartbeat ────────────►│
-|                                   |  ──── inventory upload ─────►│
-+-----------------------------------+
-```
+The agent runs on the Windows runner; the control plane and its
+PostgreSQL must be reachable to it over real network sockets. The
+exact topology that delivers that is **not chosen here** — running
+Linux service containers on `windows-latest` is not a reliably
+supported pattern across GitHub-hosted runner images, so the
+implementing PR must pick and prove a topology before this job
+becomes blocking.
 
-GitHub Actions on `windows-latest` can run Linux containers via
-WSL2-backed Docker (`runs-on: windows-latest` with `services:` keyed
-to Linux images is supported on the GitHub-hosted images). The job
-spins postgres + the api binary (built fresh in the same workflow,
-copied as an artifact from the linux backend job, or built locally
-on the Windows runner).
+#### Topology decision (deferred to the implementing PR)
+
+The Windows E2E job must choose **one** validated topology:
+
+1. **Run the control plane directly on the Windows runner** with a
+   reachable PostgreSQL service (PostgreSQL launched as a Windows
+   service or as a `windows`-image container; the API binary built
+   for `GOOS=windows` and started as a background process).
+2. **Use a separate Linux job (or containerized backend) and expose
+   it to the Windows test job** through a supported GitHub Actions
+   topology — for example a job-to-job artifact handoff combined
+   with a tunnelled service exposed via a documented GitHub-hosted
+   network path, or a self-hosted runner pair joined by an
+   internal network.
+3. **Build a dedicated test harness** that starts the backend
+   binary on Windows for CI only — packaged minimally (no Docker
+   on the Windows runner), exercising exactly the agent ↔ control
+   plane surface this job needs. The harness lives under
+   `agent/windows/test/harness/` and is reviewed independently.
+
+The chosen topology must be **proven in the implementation PR**
+(stable runs across at least the documented green-streak window in
+[`CI_PLAN.md`](./CI_PLAN.md)) **before** the job becomes blocking.
+A topology that flakes is not a topology — see CLAUDE.md §11
+(deterministic / reliable / reproducible).
+
+Whichever topology is chosen, the rest of this document
+(assertions, fixtures, fail-closed behavior) applies unchanged —
+the agent's view of the wire is the same.
 
 Smoke assertions:
 

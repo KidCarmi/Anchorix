@@ -146,7 +146,7 @@ function < 80 LOC).
   entry point.
 - `docs/api/REST_API.md` — adds `/auth/login`, `/auth/logout`,
   `/auth/me` request/response shapes; appends new error codes.
-- `internal/config/config.go` — adds session cookie name, validates DB
+- `backend/internal/config/config.go` — adds session cookie name, validates DB
   SSL mode in production (already partially present; tightens), adds
   bcrypt cost validation if a non-default value is provided.
 
@@ -154,9 +154,11 @@ function < 80 LOC).
 
 - No agent code (`agent/windows/**`).
 - No frontend code (`frontend/src/**`). The login UI lands in PR-003.
-- No CI workflow logic — only an additive postgres service container
-  spec in `ci.yml backend (go)` job, which itself is a small targeted
-  change documented in [`CI_PLAN.md`](./CI_PLAN.md).
+- PR-002 may modify `ci.yml` only to add the PostgreSQL service
+  container and integration-test step to the existing
+  `backend (go)` job. No new workflow files or required-check
+  names are added. Design lives in
+  [`CI_PLAN.md`](./CI_PLAN.md).
 - No new dependencies beyond `github.com/jackc/pgx/v5`. Lockfile and
   obituary scope unchanged. (`pgx` is the only Go third-party dep
   the project will adopt in PR-002; the foundation has been stdlib-only

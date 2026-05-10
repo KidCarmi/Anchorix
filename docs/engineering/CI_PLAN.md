@@ -78,10 +78,15 @@ Notes:
   carry a `//go:build integration` tag so they don't run in the
   default `go test ./...` pass. The unit-test step keeps its current
   scope; the integration step runs after migrate.
-- `ci-password` is hard-coded to a clearly synthetic value
-  (Gitleaks already accepts strings of this shape; if a future
-  Gitleaks rule flags it, the right answer is to use a `repository
-  secret` rather than weakening the gate).
+- The CI database password is a synthetic test credential scoped
+  only to the ephemeral CI service container. It is not a secret
+  and must never be reused outside CI. Moving it to a repository
+  secret would imply it protects a real external resource, which
+  it does not — the postgres container is created and destroyed
+  inside this single CI job and is not reachable from outside the
+  runner. If a future Gitleaks rule flags the literal, the right
+  answer is to rename the literal (e.g. `ci-test-postgres`),
+  not to elevate it into the secrets store.
 - The job's wall-clock budget grows by ~30 seconds (postgres health
   + migrate + integration suite). Acceptable.
 
