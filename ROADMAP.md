@@ -114,6 +114,26 @@ interface and registering it, with no changes to core domain code.
 
 **Exit criteria:** v0.1 release candidate.
 
+## See Also
+
+Engineering plans referenced by phases above:
+
+- [`docs/engineering/PR_002_PLAN.md`](./docs/engineering/PR_002_PLAN.md)
+  — concrete plan for the next implementation PR (DB + migrations +
+  auth + sessions, no UI).
+- [`docs/engineering/CI_PLAN.md`](./docs/engineering/CI_PLAN.md) — how
+  CI grows phase by phase, including Windows CI activation.
+- [`docs/engineering/WINDOWS_CI.md`](./docs/engineering/WINDOWS_CI.md)
+  — detailed design for the Phase 6 `windows-latest` job.
+- [`docs/engineering/TESTING_STRATEGY.md`](./docs/engineering/TESTING_STRATEGY.md)
+  — unit / integration / smoke / Windows tier model.
+- [`docs/engineering/AGENT_HARDENING.md`](./docs/engineering/AGENT_HARDENING.md)
+  — sequenced agent hardening items (H1–H7).
+- [`docs/architecture/PACKAGE_BOUNDARIES.md`](./docs/architecture/PACKAGE_BOUNDARIES.md)
+  — per-package responsibility and forbidden imports.
+- [`docs/architecture/EVOLUTION.md`](./docs/architecture/EVOLUTION.md)
+  — sketches for v0.2 and v0.3 (directional, not commitments).
+
 ## Out of Scope (Tracked, Not Built)
 
 Captured here so they aren't lost, but **not** part of v0.1:

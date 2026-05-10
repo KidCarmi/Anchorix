@@ -105,6 +105,11 @@ cd frontend && npm test
 cd backend && go test ./test/integration/...
 ```
 
+The full tier model — unit / integration / frontend / smoke /
+Windows — is documented in
+[`docs/engineering/TESTING_STRATEGY.md`](./docs/engineering/TESTING_STRATEGY.md).
+Adding tests for a new behavior must reference that document.
+
 ## Database Migrations
 
 Migrations live in `backend/migrations/` as numbered SQL files
@@ -146,6 +151,8 @@ See [`CLAUDE.md` §8](./CLAUDE.md). Highlights:
 - All changes — including Claude-authored ones — land on `main` via
   pull request only. Direct pushes to `main` are forbidden.
 - Full policy: [`docs/BRANCHING.md`](./docs/BRANCHING.md).
+- Every PR must conform to [`CLAUDE.md`](./CLAUDE.md) §19
+  (Engineering Discipline).
 
 ## Reporting Security Issues
 

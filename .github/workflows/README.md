@@ -89,3 +89,14 @@ All four require a CLAUDE.md amendment.
 
 A blocking check can be removed only by amending CLAUDE.md §11 and
 documenting the rationale in the PR description.
+
+## See also
+
+- [`docs/engineering/CI_PLAN.md`](../../docs/engineering/CI_PLAN.md)
+  — phase-aligned roadmap for how the CI surface grows. The
+  required-checks table here stays in lockstep with that plan.
+- [`docs/engineering/WINDOWS_CI.md`](../../docs/engineering/WINDOWS_CI.md)
+  — design for the Phase 6 `windows-latest` job and its activation
+  criteria as a blocking gate.
+- [`docs/engineering/TESTING_STRATEGY.md`](../../docs/engineering/TESTING_STRATEGY.md)
+  — the testing tier model that the CI gates exercise.
