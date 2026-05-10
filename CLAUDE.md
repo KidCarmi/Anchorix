@@ -251,6 +251,116 @@ what get revised.
 - Hardcoded PKI vendor logic in core domain code.
 - Catch-all `try { } catch (_) {}` style error swallowing.
 
+### 8.6 Strict Decoupling Rules
+
+The forbidden import edges are restated here so violations surface at
+code review even if the per-package boundary doc isn't open:
+
+- `domain → httpapi` is forbidden (reverse layering).
+- `agent/windows/* → backend/*` is forbidden (split-binary leak).
+- `httpapi/handlers → storage/postgres` is forbidden — handlers must
+  go through the domain interface, never SQL directly.
+- `internal/* → cmd/*` is forbidden — composition flows the other way.
+- HTTP handlers MUST NOT contain business logic. They translate HTTP
+  into domain calls and back.
+- HTTP handlers MUST NOT access SQL directly. The storage layer owns
+  database access.
+- Frontend components MUST NOT build URLs by hand. Every API call
+  goes through the single typed API client.
+- No hidden global mutable state. No init-time side effects.
+
+### 8.7 File Structure Discipline
+
+- Soft caps: **500 LOC per file**, **80 LOC per function**. Anything
+  over splits or carries an explicit justification in the PR body.
+- If a file is becoming a dumping ground, refactor immediately — do
+  not postpone cleanup.
+- No commented-out code. No TODO-driven architecture (a TODO without a
+  tracking issue is a defect).
+- No giant switch statements; prefer table-driven dispatch or
+  polymorphism.
+- One responsibility per package; the package name reflects the
+  responsibility.
+- `cmd/anchorix/main.go` (and any other `main.go`) is the composition
+  root only. No business logic lives there.
+
+### 8.8 Dependency Injection Rules
+
+The dependency graph must be explicit and auditable. Reflection-based
+DI containers are deliberately rejected.
+
+- **Constructor-based DI only.** `NewX(deps...)` style; dependencies
+  are arguments.
+- No service-locator patterns.
+- No runtime dependency discovery (no reflection-based DI containers,
+  no autowiring).
+- No hidden dependency wiring (no global registries that callers
+  mutate after process start).
+- Dependencies must be explicit in constructors — no zero-value
+  fields silently filled later.
+- Interfaces are owned by the **consumer**, not the provider.
+  Dependency-inversion direction is enforced at code review.
+- DI containers / frameworks are not used. Plain Go composition in
+  `cmd/anchorix/main.go` is the canonical wiring point.
+
+### 8.9 Configuration Discipline
+
+Prevent configuration drift and hidden runtime behavior.
+
+- Configuration is **immutable after startup.** No hot-reload, no
+  live config swap.
+- All environment parsing is centralized in `internal/config`. No
+  direct `os.Getenv` outside that package — restated as a hard rule
+  on top of §8.1.
+- Startup must fail explicitly on invalid configuration. No silent
+  fallback for security-sensitive settings (TLS termination, DB SSL
+  mode, session-key length, enrollment-token TTL bounds).
+- Configuration validation is deterministic — same env in, same
+  `*Config` (or same explicit error) out.
+- Secrets are loaded only through explicit providers
+  (`internal/providers/secrets`); a feature handler never reads a
+  secret inline from environment.
+- Config structs are typed and validated at construction. No
+  `map[string]any`-style config shapes inside the application.
+
+### 8.10 Concurrency Discipline
+
+Prevent invisible runtime instability. Goroutine ownership is
+non-negotiable.
+
+- Every goroutine has a documented owner (a type or function), a
+  cancellation path (typically `context.Context`), and a bounded
+  lifetime.
+- No orphan goroutines. No fire-and-forget. No unbounded worker
+  spawning.
+- Goroutine leaks are treated as defects.
+- Shared mutable state requires explicit synchronization ownership —
+  one type owns the mutex; callers go through methods.
+- Background loops (heartbeats, scheduled scans, cache refresh) must:
+  - honor context cancellation,
+  - set explicit per-iteration timeouts,
+  - use a deterministic retry policy with a documented cap.
+
+### 8.11 Outbound Client Rules
+
+External dependency behavior must be predictable and auditable.
+
+- All outbound HTTP / gRPC clients accept `context.Context`.
+- Explicit per-call timeouts. `http.Client{}` defaults are not
+  acceptable — construct named clients with explicit configuration.
+- Bounded retries with explicit policy ownership. No implicit retry
+  libraries without a named owner.
+- Structured error wrapping (`fmt.Errorf("...: %w", err)`) so
+  callers can `errors.Is` / `errors.As`.
+- TLS validated properly: pinned where the trust boundary requires
+  pinning (agent → control plane, post-enrollment), CA-validated
+  otherwise. `InsecureSkipVerify` is forbidden in production code.
+- `http.DefaultClient` is **forbidden** in feature code.
+- Outbound authentication is deterministic — same identity in, same
+  authentication header out. No non-deterministic signing helpers.
+- External provider failures surface operationally: audit event +
+  structured log + observable failure mode. Never silent.
+
 ## 9. Logging & Audit
 
 - **Structured logs only** (JSON). No `fmt.Println`, no plain `log.Print`.
@@ -258,10 +368,28 @@ what get revised.
   `actor` (when applicable), `component`.
 - **Audit events are not logs.** Audit events are persisted in
   PostgreSQL, signed by event type, and never deleted within retention.
+  The `audit_events` table is append-only at the database level
+  (enforced by the trigger introduced in `migrations/0001_init.sql`);
+  this is a binding rule, not an implementation detail.
 - Log levels: `debug`, `info`, `warn`, `error`. `error` requires a
   remediation hint or a linked playbook.
 - Correlation IDs propagate across HTTP boundaries via
-  `X-Request-Id`, and across agent calls via the same header.
+  `X-Request-Id`, **and across agent ↔ control-plane boundaries via
+  the same header**. An agent call that does not carry a correlation
+  ID still receives one server-side; logs and audit events on both
+  sides reference the same ID.
+- One canonical logger per process; one audit recorder per
+  organization scope. Duplicate logging layers are forbidden.
+- Security events MUST be explicit, structured, and labelled
+  `severity: "security"` so downstream alerting can filter on them.
+  This applies to (at minimum): auth failures, session revocation,
+  enrollment-token issuance and consumption, finding overrides,
+  provider configuration changes, admin-account creation.
+- Errors must be diagnosable from the structured fields alone — no
+  debug-only conditionals in production code paths, no `panic` for
+  business flow.
+- No tokens, credentials, certificate private material, or session
+  identifiers in logs (cross-link: §6.9 redaction allow-list).
 
 ## 10. Provider Abstraction (Ops Freedom Rule)
 
@@ -363,6 +491,22 @@ is failing:
 - Release artifacts will be signed (cosign or equivalent) by v1.0
 - Dependency updates are reviewed; no auto-merge of dependency PRs
 
+**Planned: Windows CI (lands in Phase 6)**
+
+The current required-checks list does not include a Windows runner.
+By Phase 6 the blocking set will gain a `windows-latest` job that:
+
+- Builds the agent natively (a check the existing Linux
+  `GOOS=windows` cross-compile is necessary but not sufficient for).
+- Smoke-tests the Windows service install / uninstall flow.
+- Runs an end-to-end agent-to-control-plane integration over real
+  HTTPS: enrollment, heartbeat, inventory upload, TLS fingerprint
+  pinning. Critical security flows MUST run end-to-end, not mocked.
+
+Source of truth for the design: `docs/engineering/WINDOWS_CI.md`
+(forward reference — created in the deliverables PR that follows
+the rule-updates PR introducing this section).
+
 The blocking set above is required to be **deterministic, reliable, and
 reproducible**. Flaky or environment-dependent checks are not added to
 the blocking set; if a blocking check becomes flaky, the right answer is
@@ -437,3 +581,138 @@ CLAUDE.md may only be amended by:
 
 Implementation changes that conflict with CLAUDE.md must be reverted
 or must update CLAUDE.md first — not silently work around it.
+
+## 16. Database Rules
+
+The storage layer owns the database. The rest of the system consumes
+repository interfaces and never reaches around them.
+
+- Every schema change goes through an explicit, numbered, append-only
+  migration under `backend/migrations/NNNN_*.sql`. No exceptions.
+- No auto-create / auto-mutate at runtime in production. The control
+  plane refuses to start against a database whose `schema_migrations`
+  table does not match the binary's expected version.
+- Destructive migrations (column drop, type narrowing, NOT NULL on an
+  existing column) require the documented two-phase pattern: ship code
+  that handles both shapes, deploy, then drop in a follow-up migration
+  once the old shape is no longer reachable.
+- Storage / repository layer is the **only** place that knows SQL.
+  Domain modules consume repository interfaces; HTTP handlers do not
+  touch SQL; migrations contain DDL only, not business logic.
+- No business logic inside migrations. Migrations move schema, not
+  data semantics.
+- Indexes are intentional and documented in the migration that
+  introduces them — comment beside the `CREATE INDEX` explains the
+  query pattern it serves.
+- DB-engine-specific features (PostgreSQL extensions, JSONB-only
+  operators, partial indexes) require explicit rationale in the
+  migration. Default to portable SQL.
+- Migrations are deterministic and repeatable across fresh installs
+  and existing-database upgrades. A `migrate up` against a clean DB
+  must produce the same schema as `migrate up` against an
+  already-migrated DB.
+
+## 17. API Evolution Rules
+
+The HTTP surface is part of the product contract.
+
+- `/api/v1` is stable. Field semantics, names, and the canonical
+  error envelope shape `{ "error": { "code", "message" } }` (owned by
+  `internal/httpapi/envelope`) do not change without a new prefix.
+- Additive changes inside `/api/v1` are allowed: new endpoints, new
+  optional fields, new error codes. Each addition is documented in
+  `docs/api/REST_API.md` in the same PR that ships it.
+- Breaking changes require `/api/v2`. Both prefixes coexist for at
+  least one minor release before `/api/v1` is retired.
+- Deprecation markers go in `docs/api/REST_API.md` before any removal.
+  An endpoint cannot be removed in the same release it is deprecated.
+- No transport-specific business logic in handlers. Handlers translate
+  HTTP into domain calls and back; if a behavior changes, it changes
+  in the domain module, not in `httpapi`.
+- JSON shape is stable per resource. Field renames within `/api/v1`
+  are forbidden; add a new field and deprecate the old.
+
+## 18. Robustness Requirements
+
+The system behaves predictably or fails closed. There is no third
+state.
+
+- Every blocking call accepts `context.Context`. Functions that
+  cannot be cancelled are a defect.
+- Graceful shutdown drains in-flight work before exit, with an
+  explicit deadline. The control plane already does this in
+  `httpapi.Server.Run`; this is the binding rule, not just the
+  implementation.
+- Bounded retries with explicit caps. No fire-and-forget loops, no
+  hidden retries inside libraries (see §8.11).
+- Idempotency keys are required on inventory uploads and on any
+  non-idempotent agent → control-plane operation. The server treats
+  duplicate keys as no-ops, never as conflicts.
+- Readiness (`/readyz`) checks real dependencies (DB, registered
+  probes). Liveness (`/healthz`) stays process-only — it answers
+  "is the binary running?" with no external lookups.
+- State transitions on agents, findings, sessions, and enrollment
+  tokens are explicit enumerated state machines. No implicit string
+  comparison; no skipping intermediate states.
+- Forbidden patterns: panic-driven business flow; hidden retries;
+  hidden async; fire-and-forget goroutines; silent / swallowed
+  errors; unbounded goroutines; non-deterministic timing assertions
+  in business code.
+
+## 19. Engineering Discipline
+
+Engineering discipline is a product feature in a cybersecurity
+platform. The rules below are enforced at PR review.
+
+**Package-level discipline (`doc.go` rule):**
+
+Every package **exposing domain behavior** must contain a `doc.go`
+defining:
+
+- ownership boundaries (what this package owns, what it does not),
+- responsibilities (the single reason this package exists),
+- forbidden dependencies (which other packages this one must not
+  import — a per-package narrowing of §8.6),
+- architectural role (the layer this package sits in: `httpapi`,
+  domain, storage, provider, agent component).
+
+Trivial / internal utility packages (e.g. `clock`, `ids`) do not
+need a separate `doc.go` if their primary file's package comment is
+sufficient and their boundaries are unambiguous. The goal is
+architecture clarity where it matters, not boilerplate everywhere.
+
+**Per-feature discipline:**
+
+- Every retry, every async operation, every external dependency has
+  documented justification in the PR (and in the package's `doc.go`
+  where it is structural).
+- Every security-sensitive flow (auth, enrollment, token issuance,
+  finding state changes, provider config) has an explicit threat
+  model entry under `docs/security/` **before** merge — see §6.10.
+- Every new module requires unit tests at merge time. Integration
+  tests for behaviors that cross a process boundary (DB, agent,
+  provider) live under `backend/test/integration/`.
+- "When uncertain: simpler / explicit / lower coupling /
+  operationally clear" wins over cleverness. Reaffirms §14 at the
+  discipline level.
+
+**Forbidden behaviors (PRs introducing them are rejected):**
+
+- TODO-driven architecture (a TODO without a tracking issue).
+- Dead commented-out code.
+- Silent fallbacks (a code path that masks an upstream failure).
+- Temporary hacks without a tracking issue.
+- Hidden feature flags (env-driven behavior changes that are not
+  documented in `internal/config`).
+- Copy-paste implementations.
+- Unbounded goroutines (see §8.10).
+- Implicit retries.
+- Panic-driven business flow.
+- Hidden global state.
+- Speculative abstractions ("we might need this later").
+- Architecture-by-convenience that conflicts with CLAUDE.md.
+
+This section references §8.5 (Anti-patterns), §8.8–§8.11 (DI,
+Configuration, Concurrency, Outbound), §16 (Database), §17 (API
+Evolution), and §18 (Robustness) rather than duplicating their
+lists. A violation of any of those is also a violation of §19.
