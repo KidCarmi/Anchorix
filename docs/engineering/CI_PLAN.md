@@ -119,7 +119,7 @@ behavior end-to-end. Adds another ~10s to the job.
 | PR-003 (UI)    | `frontend` job extended with a Playwright (or `@testing-library/react`) auth round-trip against a containerized backend. | Inside the existing `frontend` job; no new required-check. |
 | PR-004 (agents)| Integration test that exercises `POST /agents/enrollment-tokens` → simulated agent enrollment → heartbeat. Uses an in-process fake "agent" client. | Lives under `backend/test/integration/`; same job. |
 | PR-005 (inv.)  | Inventory ingest integration test: post a 100-cert batch, assert dedup + observation rows. | Same job. |
-| PR-006 (Wi.)   | **Windows CI** — see [`WINDOWS_CI.md`](./WINDOWS_CI.md). New required job `agent (windows-latest)`. **First** new required-check since PR #1. |
+| PR-006 (Wi.)   | **Windows CI** — see [`WINDOWS_CI.md`](./WINDOWS_CI.md). New required job `agent (windows e2e)` (runs on `windows-latest`). **First** new required-check since PR #1. |
 | Phase 6        | SBOM generation on release tags (cyclonedx via Trivy). Cosign signing target. Not blocking on every PR; gates the release pipeline. |
 | Phase 6        | DAST smoke against the running stack (e.g. `zap-baseline`). Advisory at first; promoted to blocking once it produces zero false positives over a release window. |
 

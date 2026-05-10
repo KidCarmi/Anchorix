@@ -25,9 +25,10 @@ flows** (CLAUDE.md §11).
 
 ## Job Design
 
-**Workflow file:** new top-level `agent (windows-latest)` job inside
+**Workflow file:** new top-level `agent (windows e2e)` job inside
 `.github/workflows/ci.yml` (sibling to the existing `agent/windows
-(go)` job; the cross-compile job stays — both are useful).
+(go)` job; the cross-compile job stays — both are useful). The job
+runs on `runs-on: windows-latest`.
 
 **Runner:** `windows-latest`.
 
