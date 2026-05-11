@@ -3,7 +3,7 @@ module github.com/kidcarmi/anchorix/backend
 go 1.25.0
 
 require (
-	github.com/jackc/pgx/v5 v5.7.1
+	github.com/jackc/pgx/v5 v5.9.0
 	golang.org/x/crypto v0.51.0
 )
 

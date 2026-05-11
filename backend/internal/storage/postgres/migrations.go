@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,7 +50,9 @@ func loadFromFS(fsys fs.FS, dir string) ([]Migration, error) {
 		if err != nil {
 			return nil, fmt.Errorf("postgres: %s: %w", e.Name(), err)
 		}
-		body, err := fs.ReadFile(fsys, dir+"/"+e.Name())
+		// path.Join canonicalizes "./foo" to "foo"; io/fs rejects
+		// the unclean form (CI surfaced this on 0001_init.sql).
+		body, err := fs.ReadFile(fsys, path.Join(dir, e.Name()))
 		if err != nil {
 			return nil, fmt.Errorf("postgres: read %s: %w", e.Name(), err)
 		}

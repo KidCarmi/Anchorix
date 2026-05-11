@@ -196,8 +196,19 @@ jobs:
       - name: Build web image
         run: docker compose build web
 
-      - name: Bring up api + postgres
-        run: docker compose up -d --wait postgres api
+      # PR-002: `anchorix serve` now calls EnsureSchema and refuses to
+      # start when the DB is behind the binary (CLAUDE.md §16, §6.12).
+      # The smoke flow must therefore bring postgres up first, run the
+      # explicit migration step, and only then start the api.
+      - name: Bring up postgres
+        run: docker compose up -d --wait postgres
+        timeout-minutes: 2
+
+      - name: Run migrations
+        run: docker compose run --rm api /anchorix migrate up
+
+      - name: Bring up api
+        run: docker compose up -d --wait api
         timeout-minutes: 3
 
       - name: Smoke /healthz
@@ -227,10 +238,12 @@ jobs:
           cat /tmp/readyz.json
           echo
           if [ "$code" != "200" ]; then
-            echo "::error::/readyz returned $code, expected 200 (no probes registered yet)"
+            echo "::error::/readyz returned $code, expected 200"
             exit 1
           fi
           grep -q '"status":"ready"' /tmp/readyz.json
+          # Postgres probe is registered in PR-002 and must report ok.
+          grep -q '"postgres":"ok"' /tmp/readyz.json
 
       - name: Stack logs (on failure)
         if: failure()
