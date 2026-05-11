@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -51,6 +52,22 @@ type Config struct {
 	// It MUST be at least 32 bytes (base64-decoded). Never log this value.
 	SessionKey []byte
 
+	// SessionCookieName is the cookie name used for the session id.
+	// Defaults to "anchorix_session" — change with care because
+	// existing browsers will retain the old name's cookie.
+	SessionCookieName string
+
+	// SessionIdleLifetime — sliding window. Each authenticated
+	// request extends ExpiresAt to min(now + Idle, created + Absolute).
+	SessionIdleLifetime time.Duration
+
+	// SessionAbsoluteLifetime — hard cap from session creation.
+	SessionAbsoluteLifetime time.Duration
+
+	// BcryptCost is the cost factor used by the password policy.
+	// Bounds [10, 14] are enforced at config-load time.
+	BcryptCost int
+
 	DatabaseURL string
 
 	EnrollmentTokenTTL     time.Duration
@@ -69,14 +86,15 @@ type Config struct {
 // Per CLAUDE.md §6.1 / §6.9, this is the only place that calls os.Getenv.
 func Load() (*Config, error) {
 	cfg := &Config{
-		Env:            Env(envDefault("ANCHORIX_ENV", string(EnvDevelopment))),
-		LogLevel:       envDefault("ANCHORIX_LOG_LEVEL", "info"),
-		HTTPAddr:       envDefault("ANCHORIX_HTTP_ADDR", "0.0.0.0:8080"),
-		PublicBaseURL:  envDefault("ANCHORIX_PUBLIC_BASE_URL", "http://localhost:8080"),
-		DatabaseURL:    os.Getenv("DATABASE_URL"),
-		TLSTermination: TLSTermination(strings.TrimSpace(os.Getenv("ANCHORIX_TLS_TERMINATION"))),
-		TLSCertFile:    os.Getenv("ANCHORIX_TLS_CERT_FILE"),
-		TLSKeyFile:     os.Getenv("ANCHORIX_TLS_KEY_FILE"),
+		Env:               Env(envDefault("ANCHORIX_ENV", string(EnvDevelopment))),
+		LogLevel:          envDefault("ANCHORIX_LOG_LEVEL", "info"),
+		HTTPAddr:          envDefault("ANCHORIX_HTTP_ADDR", "0.0.0.0:8080"),
+		PublicBaseURL:     envDefault("ANCHORIX_PUBLIC_BASE_URL", "http://localhost:8080"),
+		DatabaseURL:       os.Getenv("DATABASE_URL"),
+		SessionCookieName: envDefault("ANCHORIX_SESSION_COOKIE_NAME", "anchorix_session"),
+		TLSTermination:    TLSTermination(strings.TrimSpace(os.Getenv("ANCHORIX_TLS_TERMINATION"))),
+		TLSCertFile:       os.Getenv("ANCHORIX_TLS_CERT_FILE"),
+		TLSKeyFile:        os.Getenv("ANCHORIX_TLS_KEY_FILE"),
 	}
 
 	var err error
@@ -90,6 +108,15 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if cfg.AgentInventoryInterval, err = parseDuration("ANCHORIX_AGENT_INVENTORY_INTERVAL", "15m"); err != nil {
+		return nil, err
+	}
+	if cfg.SessionIdleLifetime, err = parseDuration("ANCHORIX_SESSION_IDLE_LIFETIME", "8h"); err != nil {
+		return nil, err
+	}
+	if cfg.SessionAbsoluteLifetime, err = parseDuration("ANCHORIX_SESSION_ABSOLUTE_LIFETIME", "24h"); err != nil {
+		return nil, err
+	}
+	if cfg.BcryptCost, err = parseInt("ANCHORIX_BCRYPT_COST", 12); err != nil {
 		return nil, err
 	}
 
@@ -110,6 +137,22 @@ func (c *Config) validate() error {
 	}
 	if len(c.SessionKey) < 32 {
 		return errors.New("ANCHORIX_SESSION_KEY must decode to at least 32 bytes")
+	}
+	if c.SessionCookieName == "" {
+		return errors.New("ANCHORIX_SESSION_COOKIE_NAME must not be empty")
+	}
+	if c.SessionIdleLifetime <= 0 {
+		return errors.New("ANCHORIX_SESSION_IDLE_LIFETIME must be positive")
+	}
+	if c.SessionAbsoluteLifetime <= 0 {
+		return errors.New("ANCHORIX_SESSION_ABSOLUTE_LIFETIME must be positive")
+	}
+	if c.SessionAbsoluteLifetime < c.SessionIdleLifetime {
+		return fmt.Errorf("ANCHORIX_SESSION_ABSOLUTE_LIFETIME (%s) must be >= ANCHORIX_SESSION_IDLE_LIFETIME (%s)",
+			c.SessionAbsoluteLifetime, c.SessionIdleLifetime)
+	}
+	if c.BcryptCost < 10 || c.BcryptCost > 14 {
+		return fmt.Errorf("ANCHORIX_BCRYPT_COST=%d out of range [10, 14]", c.BcryptCost)
 	}
 	if err := c.validateTLS(); err != nil {
 		return err
@@ -166,4 +209,16 @@ func parseDuration(key, fallback string) (time.Duration, error) {
 		return 0, fmt.Errorf("%s: invalid duration %q: %w", key, raw, err)
 	}
 	return d, nil
+}
+
+func parseInt(key string, fallback int) (int, error) {
+	raw := envDefault(key, "")
+	if raw == "" {
+		return fallback, nil
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s: invalid integer %q: %w", key, raw, err)
+	}
+	return v, nil
 }

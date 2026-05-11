@@ -1,30 +1,133 @@
-// Package postgres is the concrete storage implementation backed by
-// PostgreSQL. The pgx driver is the chosen client (added in Phase 1).
-//
-// All SQL lives here. Domain modules MUST NOT contain SQL. Queries use
-// parameter binding only; never string concatenation (CLAUDE.md §6.7).
 package postgres
 
 import (
 	"context"
 	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// DB is the placeholder for the pgx connection pool. Phase 1 replaces this
-// with a real *pgxpool.Pool. We keep the type defined now so dependent
-// packages can compile against the intended shape.
-type DB struct{}
-
-// Open returns an initialized DB. The signature is stable; the body lands
-// in Phase 1 with pgx wiring and migration runner integration.
-func Open(_ context.Context, _ string) (*DB, error) {
-	return nil, errors.New("postgres.Open not yet implemented (Phase 1)")
+// DB owns the pgx connection pool. Construct exactly one per process
+// in the composition root (cmd/anchorix). Repository types hold a
+// *DB pointer and route every query through db.querierFor(ctx), so
+// the same code runs inside or outside a transaction depending on
+// whether the caller wrapped the operation in DB.WithTx.
+type DB struct {
+	pool *pgxpool.Pool
 }
 
-// Close releases connection pool resources. Always safe to call.
-func (db *DB) Close() {}
+// Open establishes the pool against the given DATABASE_URL.
+// The caller is responsible for Close.
+func Open(ctx context.Context, databaseURL string) (*DB, error) {
+	if databaseURL == "" {
+		return nil, errors.New("postgres: empty DATABASE_URL")
+	}
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse DATABASE_URL: %w", err)
+	}
+	cfg.MaxConns = 10
+	cfg.MinConns = 1
+	cfg.MaxConnLifetime = 30 * time.Minute
+	cfg.MaxConnIdleTime = 5 * time.Minute
+	cfg.HealthCheckPeriod = 30 * time.Second
 
-// Ping verifies database connectivity. Used by /readyz.
-func (db *DB) Ping(_ context.Context) error {
-	return errors.New("postgres.Ping not yet implemented (Phase 1)")
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: new pool: %w", err)
+	}
+	return &DB{pool: pool}, nil
+}
+
+// Close releases pool resources. Safe to call from graceful-shutdown.
+func (db *DB) Close() {
+	if db == nil || db.pool == nil {
+		return
+	}
+	db.pool.Close()
+}
+
+// Ping verifies database connectivity. Used by the /readyz probe
+// registered in cmd/anchorix.
+func (db *DB) Ping(ctx context.Context) error {
+	if db == nil || db.pool == nil {
+		return errors.New("postgres: pool not initialized")
+	}
+	return db.pool.Ping(ctx)
+}
+
+// querier is the small subset of the pgxpool API that repositories
+// actually need. Both *pgxpool.Pool and pgx.Tx satisfy it, which is
+// what makes the ctx-carrying transaction pattern work: a repository
+// method that does `db.querierFor(ctx).QueryRow(...)` automatically
+// participates in any transaction the caller wrapped it in.
+type querier interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+type txKey struct{}
+
+func contextWithTx(ctx context.Context, tx pgx.Tx) context.Context {
+	return context.WithValue(ctx, txKey{}, tx)
+}
+
+func txFromContext(ctx context.Context) (pgx.Tx, bool) {
+	tx, ok := ctx.Value(txKey{}).(pgx.Tx)
+	return tx, ok
+}
+
+// querierFor returns the active tx if one is bound to ctx, otherwise
+// the pool itself. Callers do not need to know which they got.
+func (db *DB) querierFor(ctx context.Context) querier {
+	if tx, ok := txFromContext(ctx); ok {
+		return tx
+	}
+	return db.pool
+}
+
+// WithTx runs fn inside a single transaction. Every repository call
+// made with the ctx passed to fn participates in the same transaction.
+// On nil return from fn the tx commits; on any error or panic, the
+// tx rolls back. This is the domain-facing transactional API — it
+// does not leak pgx.Tx outside this package (CLAUDE.md §8.6: no
+// pgx imports in domain or httpapi).
+func (db *DB) WithTx(ctx context.Context, fn func(ctx context.Context) error) error {
+	return db.withRawTx(ctx, func(tx pgx.Tx) error {
+		return fn(contextWithTx(ctx, tx))
+	})
+}
+
+// WithTxRaw exposes the underlying pgx.Tx for callers inside this
+// package (migrations.go) and for integration tests that need to
+// exercise raw SQL (audit-events-are-append-only). Production
+// domain code MUST use WithTx instead.
+func (db *DB) WithTxRaw(ctx context.Context, fn func(pgx.Tx) error) error {
+	return db.withRawTx(ctx, fn)
+}
+
+func (db *DB) withRawTx(ctx context.Context, fn func(pgx.Tx) error) error {
+	tx, err := db.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("postgres: begin tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres: commit: %w", err)
+	}
+	committed = true
+	return nil
 }

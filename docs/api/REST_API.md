@@ -50,14 +50,70 @@ These are NOT under `/api/v1`. They must remain unauthenticated and stable.
 | POST   | `/auth/logout`      | user | Terminate the current session        |
 | GET    | `/auth/me`          | user | Return current operator profile      |
 
-Login body:
+### `POST /auth/login`
+
+Request body:
 
 ```json
 { "email": "alice@example.com", "password": "..." }
 ```
 
-A successful login sets a `Secure; HttpOnly; SameSite=Lax` session cookie.
-Body returns the user profile only — never the session id.
+Successful response — `200 OK`, sets the session cookie, body is the
+user profile:
+
+```json
+{
+  "id": "...",
+  "organization_id": "anchorix",
+  "email": "alice@example.com",
+  "display_name": "Alice",
+  "role": "admin",
+  "disabled": false,
+  "created_at": "2026-05-09T10:00:00Z",
+  "last_login_at": "2026-05-09T10:05:42Z"
+}
+```
+
+The cookie:
+
+- name: `anchorix_session` (overridable via `ANCHORIX_SESSION_COOKIE_NAME`)
+- attributes: `HttpOnly; SameSite=Lax`; `Secure` is set in production
+- value: signed; carries an opaque session id whose server-side row
+  is the source of truth (CLAUDE.md §17 — envelope is stable, the
+  cookie shape is implementation detail of the auth domain)
+
+Sessions slide on each authenticated request: `expires_at` is
+extended to `min(now + idle, created + absolute)`. Defaults are
+8h idle / 24h absolute, both configurable via
+`ANCHORIX_SESSION_IDLE_LIFETIME` and `ANCHORIX_SESSION_ABSOLUTE_LIFETIME`.
+
+Failure responses (canonical envelope):
+
+| Status | `code`                | When                                                |
+| ------ | --------------------- | --------------------------------------------------- |
+| 400    | `bad_request`         | Body is missing, malformed, or empty fields         |
+| 401    | `invalid_credentials` | No matching user, wrong password, or disabled user  |
+
+The server never distinguishes between "no user" and "wrong password"
+externally (CLAUDE.md §6: deterministic auth behavior).
+
+### `POST /auth/logout`
+
+Requires authentication. Revokes the current session and clears the
+cookie. `204 No Content` on success. `401 unauthorized` if no session
+is present.
+
+### `GET /auth/me`
+
+Requires authentication. Returns the same user profile shape as
+`POST /auth/login`.
+
+Failure responses:
+
+| Status | `code`            | When                                                       |
+| ------ | ----------------- | ---------------------------------------------------------- |
+| 401    | `unauthorized`    | No session cookie, or session is unknown                   |
+| 401    | `session_expired` | Cookie validates but the session is revoked or expired     |
 
 ## Agents
 
@@ -185,7 +241,9 @@ land in later phases.
 | Code                     | HTTP | Meaning                                                |
 | ------------------------ | ---- | ------------------------------------------------------ |
 | `bad_request`            | 400  | Malformed input                                        |
-| `unauthorized`           | 401  | Missing or invalid credentials                         |
+| `unauthorized`           | 401  | No session, unknown session, or session resolution failed |
+| `invalid_credentials`    | 401  | Login failed (no matching user, wrong password, or disabled user) |
+| `session_expired`        | 401  | Session is revoked or past its idle/absolute deadline  |
 | `forbidden`              | 403  | Authenticated but not allowed                          |
 | `not_found`              | 404  | Resource does not exist                                |
 | `conflict`               | 409  | Idempotency / state conflict                           |
@@ -194,6 +252,9 @@ land in later phases.
 | `enrollment_invalid`     | 400  | Token expired, consumed, or hostname mismatch          |
 | `not_implemented`        | 501  | Endpoint exists in contract but not in this build      |
 | `internal_error`         | 500  | Unhandled server error                                 |
+
+Per CLAUDE.md §17, this table is **additive only**. A code's
+meaning never changes within `/api/v1`; new codes may be added.
 
 ## Versioning
 

@@ -5,26 +5,25 @@ import (
 
 	"github.com/kidcarmi/anchorix/backend/internal/config"
 	"github.com/kidcarmi/anchorix/backend/internal/httpapi/handlers"
+	mw "github.com/kidcarmi/anchorix/backend/internal/httpapi/middleware"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
 )
 
 // newRouter assembles the API surface. Routes are grouped by resource and
-// kept stable under /api/v1; breaking changes require /api/v2.
-func newRouter(cfg *config.Config, log *logger.Logger, readiness *Readiness) http.Handler {
+// kept stable under /api/v1; breaking changes require /api/v2 (CLAUDE.md §17).
+func newRouter(cfg *config.Config, log *logger.Logger, readiness *Readiness, deps Dependencies) http.Handler {
 	mux := http.NewServeMux()
 
 	// Health endpoints sit outside /api/v1 — they are infrastructure, not
 	// part of the public REST surface. They must remain unauthenticated.
-	//
-	// /healthz is a process-only liveness probe and never depends on
-	// external resources. /readyz is dependency-aware and fails closed
-	// if any registered probe is unhealthy.
 	mux.HandleFunc("GET /healthz", handlers.Health)
 	mux.Handle("GET /readyz", readiness.handler())
 
-	// /api/v1 — versioned, authenticated REST surface.
-	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", apiV1Router()))
+	// /api/v1 — versioned REST surface.
+	mux.Handle("/api/v1/", http.StripPrefix("/api/v1", apiV1Router(cfg, deps)))
 
+	// Outer chain (applied to every request, including /healthz, /readyz):
+	// recovery -> request id -> logging -> security headers.
 	return chain(
 		mux,
 		recoverMiddleware(log),
@@ -34,13 +33,30 @@ func newRouter(cfg *config.Config, log *logger.Logger, readiness *Readiness) htt
 	)
 }
 
-func apiV1Router() http.Handler {
+func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 	mux := http.NewServeMux()
 
+	authDeps := handlers.AuthDeps{
+		Service:      deps.AuthService,
+		CookieSigner: deps.CookieSigner,
+		CookieName:   cfg.SessionCookieName,
+		// Secure cookie is required whenever TLS is actually in
+		// front of the API. The only TLS posture that justifies
+		// emitting a non-Secure cookie is disabled_dev — local dev
+		// over plain HTTP. Staging and reverse_proxy deployments
+		// MUST send Secure (CLAUDE.md §6.4).
+		CookieSecure:     cfg.TLSTermination != config.TLSDisabledDev,
+		IdleLifetime:     cfg.SessionIdleLifetime,
+		AbsoluteLifetime: cfg.SessionAbsoluteLifetime,
+	}
+	resolver := mw.SessionResolver(deps.AuthService, deps.CookieSigner, cfg.SessionCookieName)
+
 	// --- auth ---
-	mux.HandleFunc("POST /auth/login", handlers.AuthLogin)
-	mux.HandleFunc("POST /auth/logout", handlers.AuthLogout)
-	mux.HandleFunc("GET /auth/me", handlers.AuthMe)
+	// Login is anonymous; the session resolver runs but does not block.
+	mux.Handle("POST /auth/login", resolver(handlers.AuthLogin(authDeps)))
+	// Logout + /me require an authenticated session.
+	mux.Handle("POST /auth/logout", resolver(mw.RequireAuth(handlers.AuthLogout(authDeps))))
+	mux.Handle("GET /auth/me", resolver(mw.RequireAuth(handlers.AuthMe())))
 
 	// --- agents ---
 	mux.HandleFunc("GET /agents", handlers.AgentsList)

@@ -30,17 +30,44 @@ Two mechanisms are supported. Pick **one** at deployment time:
 
 #### Option A — CLI (recommended)
 
+The CLI **requires** `--password` — there is no default and no
+auto-generate path. Operators are expected to supply the password
+through their shell so it never appears in command history or logs:
+
+```bash
+# Interactive prompt (preferred — password is never written down).
+read -srp 'Password: ' PW && echo
+docker compose run --rm -T \
+  -e ANCHORIX_BCRYPT_COST \
+  -e DATABASE_URL \
+  -e ANCHORIX_SESSION_KEY \
+  api /anchorix admin create \
+    --email alice@example.com \
+    --display-name "Alice" \
+    --password "$PW"
+unset PW
+```
+
+Or, if your shell hides command lines from history and you trust the
+generation source:
+
 ```bash
 docker compose run --rm api /anchorix admin create \
     --email alice@example.com \
-    --display-name "Alice"
+    --display-name "Alice" \
+    --password "$(openssl rand -base64 24)"
 ```
 
-- If `--password` is omitted, the command **generates a strong random
-  password and prints it once**. It is never logged, never stored in
-  plaintext, and never returned a second time.
+Behaviour:
+
 - The created user gets the `admin` role.
-- An audit event of type `admin_created` is recorded.
+- The organization row referenced by `--organization` (default
+  `anchorix`) is upserted before the user insert, so a pristine
+  database is enough.
+- An audit event of type `auth.admin_created` is recorded.
+- **The CLI never prints the password back.** Capture it yourself
+  during the shell flow; if you forget it, rotate using
+  `anchorix admin reset-password` (planned).
 
 This is the path the v0.1 documentation, deploy templates, and operator
 runbooks assume.
@@ -69,7 +96,7 @@ bootstrap endpoint over HTTP.
 
 Sign in with the credentials from step 3. Immediately:
 
-- rotate the password if a generated one was used;
+- rotate the password if you suspect it was captured by anything other than your shell;
 - create additional operator accounts as needed;
 - restrict the `admin` role to as few accounts as practical.
 
@@ -78,7 +105,7 @@ Sign in with the credentials from step 3. Immediately:
 - **Never** ship a default admin account.
 - **Never** accept a default password.
 - **Never** silently re-enable a bootstrap mechanism after first use.
-- **Never** log the bootstrap token, the generated password, or the
+- **Never** log the bootstrap token, the supplied password, or the
   resulting password hash.
 
 If you find any of these in the code or in a deployment, that is a
