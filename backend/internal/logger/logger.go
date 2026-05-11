@@ -24,6 +24,27 @@ func New(level string, env config.Env) *Logger {
 	return newWithWriter(level, env, os.Stdout)
 }
 
+// NewWithWriter is the same as New but lets the caller supply the
+// destination io.Writer. The redaction allow-list, level parsing, and
+// handler selection are identical to New — only the sink differs.
+//
+// The single legitimate caller today is the integration redaction
+// sweep (backend/test/integration/redaction_test.go), which needs to
+// inspect the raw log stream end-to-end to prove no secret leaks. The
+// constructor is exported (not test-only) because:
+//
+//   - it adds no behavior beyond an io.Writer indirection that the
+//     unexported newWithWriter already accepted;
+//   - production callers that legitimately need a non-stdout sink
+//     (future cmd subcommands, embedded use) get a first-class
+//     constructor instead of duplicating the handler wiring.
+//
+// Production code still uses New(); this function is purely additive
+// and does not change New's behavior.
+func NewWithWriter(level string, env config.Env, w io.Writer) *Logger {
+	return newWithWriter(level, env, w)
+}
+
 func newWithWriter(level string, env config.Env, w io.Writer) *Logger {
 	opts := &slog.HandlerOptions{
 		Level:       parseLevel(level),

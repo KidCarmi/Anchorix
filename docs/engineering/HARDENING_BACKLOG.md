@@ -16,36 +16,12 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
 
 ## Open Items
 
-### H-001 — Full-flow log-redaction sweep test
+_No open items._
 
-- **Title:** `test(integration): assert no plaintext secrets appear in logs across a full auth flow`
-- **Risk:** medium. CLAUDE.md §6.9 / §9 require that no credential
-  material ends up in structured logs. The redaction allow-list is
-  unit-tested in `internal/logger/redact_test.go`, and PR-002 added a
-  spot-check on `auth.login_failed` metadata
-  (`audit_test.go` line 108). The gap is a full-flow assertion that
-  walks every captured log line emitted during a login → /me → logout
-  cycle and asserts that none contain the plaintext password,
-  session key, or session cookie value. Today this would catch a
-  regression where a new handler logs a request body or a panic stack
-  prints secrets.
-- **Scope:** add a Tier-2 integration test under
-  `backend/test/integration/redaction_test.go` that wires the test
-  server with a capturing logger sink, runs the existing
-  `TestLoginMeLogoutRoundTrip` flow, and asserts no captured line
-  contains the test password / session id substrings. Reuse
-  `internal/logger`'s redaction helpers — do not introduce a parallel
-  redaction list.
-- **Recommended PR:** `test(integration): full-flow log redaction sweep (H-001)`
-- **Reason not fixed now:** the metadata-level assertion already
-  covers the most common regression vector (a developer adding the
-  password to an audit event). The fuller sweep requires a
-  capturing-logger fixture that doesn't exist yet; adding it would
-  expand PR-005's scope beyond doc alignment. The current redaction
-  unit tests + the metadata spot-check together protect the §6.9
-  invariant; H-001 is the belt-and-braces follow-up.
-- **References:** CLAUDE.md §6.9, §9; `docs/engineering/TESTING_STRATEGY.md`
-  ("Audit & Logging Tests").
+The last open item, H-001 (full-flow log-redaction sweep), shipped in
+`backend/test/integration/redaction_test.go`. New items get added here
+only when a deferred follow-up has clear scope, real risk, and a
+recommended PR shape — see the rules below.
 
 ## How items get added or removed
 
