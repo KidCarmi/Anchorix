@@ -124,9 +124,14 @@ cd frontend && npm test
 
 # Backend integration tests. Build-tagged `//go:build integration`, so the
 # default `go test ./...` skips them. Requires a running Postgres reachable
-# via DATABASE_URL.
+# via DATABASE_URL. The `migrate` subcommand goes through `config.Load()`,
+# so ANCHORIX_SESSION_KEY must also be set — `.env` produced by
+# `./scripts/dev-env.sh` already contains both values.
 cd backend
-export DATABASE_URL='postgres://anchorix:change-me-locally@localhost:5432/anchorix?sslmode=disable'
+set -a; . ../.env; set +a   # export DATABASE_URL + ANCHORIX_SESSION_KEY from .env
+# Or set them explicitly if you don't have a .env yet:
+#   export DATABASE_URL='postgres://anchorix:change-me-locally@localhost:5432/anchorix?sslmode=disable'
+#   export ANCHORIX_SESSION_KEY="$(openssl rand -base64 32)"
 go run ./cmd/anchorix migrate up           # ensure schema is current
 go test -tags integration -count=1 ./test/integration/...
 ```
