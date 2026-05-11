@@ -41,26 +41,3 @@ func TestPasswordPolicyCostBounds(t *testing.T) {
 		}
 	}
 }
-
-func TestGenerateRandomPassword(t *testing.T) {
-	p1, err := GenerateRandomPassword(24)
-	if err != nil {
-		t.Fatalf("GenerateRandomPassword: %v", err)
-	}
-	p2, err := GenerateRandomPassword(24)
-	if err != nil {
-		t.Fatalf("GenerateRandomPassword: %v", err)
-	}
-	if p1 == p2 {
-		t.Fatal("two consecutive random passwords were equal")
-	}
-	if len(p1) < 24 {
-		t.Fatalf("password too short: %d", len(p1))
-	}
-}
-
-func TestGenerateRandomPasswordTooFewBytes(t *testing.T) {
-	if _, err := GenerateRandomPassword(8); err == nil {
-		t.Fatal("GenerateRandomPassword(8) returned nil error")
-	}
-}

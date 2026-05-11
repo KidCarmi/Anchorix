@@ -1,8 +1,6 @@
 package auth
 
 import (
-	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"fmt"
 
@@ -40,18 +38,4 @@ func (p PasswordPolicy) Hash(password string) ([]byte, error) {
 // reporting to clients (CLAUDE.md §6: deterministic auth behavior).
 func (PasswordPolicy) Verify(hash []byte, password string) error {
 	return bcrypt.CompareHashAndPassword(hash, []byte(password))
-}
-
-// GenerateRandomPassword returns a high-entropy password suitable for
-// the bootstrap admin flow. The output is printed once and never
-// stored in plaintext (CLAUDE.md §6.9).
-func GenerateRandomPassword(bytes int) (string, error) {
-	if bytes < 16 {
-		return "", errors.New("auth: refuse to generate password with < 16 bytes of entropy")
-	}
-	buf := make([]byte, bytes)
-	if _, err := rand.Read(buf); err != nil {
-		return "", fmt.Errorf("auth: read entropy: %w", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(buf), nil
 }

@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/kidcarmi/anchorix/backend/migrations"
 )
@@ -95,10 +96,13 @@ func assertSequential(ms []Migration) error {
 // Idempotent: re-running against an already-migrated DB is a no-op.
 // Deterministic: the same embedded migrations + the same DB state
 // always produce the same final schema (CLAUDE.md §16).
+//
+// We deliberately do NOT pre-create schema_migrations: 0001_init.sql
+// owns that DDL. If we created the table first, 0001_init.sql's
+// `CREATE TABLE schema_migrations` would fail with 42P07 on a
+// pristine DB. currentSchemaVersion below handles the "table does
+// not exist yet" state by returning 0.
 func (db *DB) MigrateUp(ctx context.Context, migrations []Migration) (applied int, err error) {
-	if err := db.ensureMigrationsTable(ctx); err != nil {
-		return 0, err
-	}
 	current, err := db.currentSchemaVersion(ctx)
 	if err != nil {
 		return 0, err
@@ -125,9 +129,6 @@ type MigrationStatus struct {
 
 // Status returns the current schema status.
 func (db *DB) Status(ctx context.Context, migrations []Migration) (MigrationStatus, error) {
-	if err := db.ensureMigrationsTable(ctx); err != nil {
-		return MigrationStatus{}, err
-	}
 	current, err := db.currentSchemaVersion(ctx)
 	if err != nil {
 		return MigrationStatus{}, err
@@ -148,9 +149,6 @@ func (db *DB) Status(ctx context.Context, migrations []Migration) (MigrationStat
 // Called at `anchorix serve` startup (CLAUDE.md §16: no auto-mutate
 // at runtime; the runner is explicit).
 func (db *DB) EnsureSchema(ctx context.Context, migrations []Migration) error {
-	if err := db.ensureMigrationsTable(ctx); err != nil {
-		return err
-	}
 	current, err := db.currentSchemaVersion(ctx)
 	if err != nil {
 		return err
@@ -169,26 +167,21 @@ func (db *DB) EnsureSchema(ctx context.Context, migrations []Migration) error {
 	}
 }
 
-func (db *DB) ensureMigrationsTable(ctx context.Context) error {
-	// schema_migrations is created by 0001_init.sql itself; for a
-	// pristine DB the first migration provisions it. To bootstrap
-	// correctly we only need to touch it after migrate. This helper
-	// is a no-op on an already-migrated DB and creates the bare
-	// minimum so currentSchemaVersion can read 0 on a fresh one.
-	const stmt = `CREATE TABLE IF NOT EXISTS schema_migrations (
-		version    INTEGER     PRIMARY KEY,
-		applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-	)`
-	if _, err := db.pool.Exec(ctx, stmt); err != nil {
-		return fmt.Errorf("postgres: ensure schema_migrations: %w", err)
-	}
-	return nil
-}
+// undefinedTableSQLState is PostgreSQL's SQLSTATE for "relation does
+// not exist" (42P01). currentSchemaVersion returns 0 in that case
+// (pristine DB; 0001_init.sql hasn't run yet).
+const undefinedTableSQLState = "42P01"
 
 func (db *DB) currentSchemaVersion(ctx context.Context) (int, error) {
 	var v int
 	row := db.pool.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`)
 	if err := row.Scan(&v); err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == undefinedTableSQLState {
+			// schema_migrations doesn't exist yet — pristine DB.
+			// 0001_init.sql will create the table when MigrateUp runs.
+			return 0, nil
+		}
 		return 0, fmt.Errorf("postgres: read schema version: %w", err)
 	}
 	return v, nil

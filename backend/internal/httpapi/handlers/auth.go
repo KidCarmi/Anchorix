@@ -2,6 +2,7 @@ package handlers
 
 import (
 	"encoding/json"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -122,16 +123,38 @@ func AuthMe() http.HandlerFunc {
 // for the development case (no proxy in the path); production
 // deploys terminate TLS at a trusted proxy that overwrites the
 // header in a known shape — that wiring is operator-side.
+//
+// Uses net.SplitHostPort so bracketed IPv6 forms like "[::1]:12345"
+// strip the port correctly. The session row's remote_ip column is
+// PostgreSQL `inet` and would reject anything that isn't a valid
+// address; rather than risk writing junk we return "" so the column
+// is stored NULL.
 func remoteIP(r *http.Request) string {
+	candidates := make([]string, 0, 2)
 	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+		first := xff
 		if i := strings.IndexByte(xff, ','); i > 0 {
-			return strings.TrimSpace(xff[:i])
+			first = xff[:i]
 		}
-		return strings.TrimSpace(xff)
+		candidates = append(candidates, strings.TrimSpace(first))
 	}
-	host := r.RemoteAddr
-	if i := strings.LastIndexByte(host, ':'); i > 0 {
-		host = host[:i]
+	candidates = append(candidates, r.RemoteAddr)
+
+	for _, raw := range candidates {
+		if raw == "" {
+			continue
+		}
+		// "host:port" — preferred shape; SplitHostPort handles
+		// bracketed IPv6.
+		if host, _, err := net.SplitHostPort(raw); err == nil {
+			if net.ParseIP(host) != nil {
+				return host
+			}
+		}
+		// Bare IP.
+		if net.ParseIP(raw) != nil {
+			return raw
+		}
 	}
-	return host
+	return ""
 }

@@ -89,6 +89,23 @@ func (r *AuthRepository) CreateUser(ctx context.Context, u *auth.User, passwordH
 	return nil
 }
 
+// EnsureOrganization upserts an organization row by id. Used by the
+// `anchorix admin create` bootstrap path to provision the row that
+// the users.organization_id foreign key requires (a pristine DB has
+// no organizations seeded). No-op if the row already exists.
+func (r *AuthRepository) EnsureOrganization(ctx context.Context, id, name string) error {
+	if id == "" || name == "" {
+		return fmt.Errorf("postgres: organization id and name required")
+	}
+	_, err := r.pool.Exec(ctx,
+		`INSERT INTO organizations (id, name) VALUES ($1, $2)
+		 ON CONFLICT (id) DO NOTHING`, id, name)
+	if err != nil {
+		return fmt.Errorf("postgres: ensure organization: %w", err)
+	}
+	return nil
+}
+
 func scanUser(row pgx.Row) (*auth.User, []byte, error) {
 	var (
 		u           auth.User
