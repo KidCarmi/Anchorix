@@ -66,7 +66,13 @@ func freshDatabase(t *testing.T, db *postgres.DB) {
 		stmts := []string{
 			"DELETE FROM sessions",
 			"DELETE FROM agent_enrollment_tokens",
-			"DELETE FROM audit_events",
+			// audit_events has BEFORE UPDATE/DELETE FOR EACH ROW
+			// triggers that enforce the §9 / §16 append-only invariant
+			// in production. TRUNCATE does not fire those row-level
+			// triggers, so it is the only safe way to reset audit
+			// rows between tests without weakening the production
+			// guarantee or granting tests trigger-bypass privileges.
+			"TRUNCATE TABLE audit_events",
 			"DELETE FROM users",
 			"DELETE FROM organizations",
 			`INSERT INTO organizations (id, name) VALUES ('anchorix', 'Anchorix')`,
