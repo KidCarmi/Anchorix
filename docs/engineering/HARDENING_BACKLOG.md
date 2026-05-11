@@ -47,29 +47,6 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
 - **References:** CLAUDE.md §6.9, §9; `docs/engineering/TESTING_STRATEGY.md`
   ("Audit & Logging Tests").
 
-### H-002 — `/readyz` negative-path smoke step
-
-- **Title:** `ci(docker): assert /readyz returns 503 when postgres is stopped`
-- **Risk:** low. `/readyz` already returns 503 on probe failure in
-  unit tests (`internal/httpapi/router_test.go`) and the integration
-  suite (`readiness_test.go`). The gap is the end-to-end smoke step
-  in `ci.yml` only asserting the happy path. A regression that turns
-  a real DB outage into a silent 200 would be caught by the
-  integration suite, but not by the smoke job.
-- **Scope:** extend the existing `docker (config + build + smoke)`
-  step in `.github/workflows/ci.yml` to stop the `postgres` service
-  mid-run, hit `/readyz`, assert HTTP 503 + body contains
-  `"postgres":"error`, then restart postgres and assert recovery.
-  Wall-clock budget: ~10s.
-- **Recommended PR:** `ci(docker): assert /readyz 503 when postgres is down (H-002)`
-- **Reason not fixed now:** PR-005 is explicitly forbidden from
-  modifying workflow YAML. The negative-path smoke is documented in
-  `CI_PLAN.md` and tracked here so the next CI-touching PR picks it
-  up.
-- **References:** CLAUDE.md §18 (`/readyz` checks real dependencies);
-  `docs/engineering/CI_PLAN.md` ("docker smoke step gains one
-  additional check").
-
 ## How items get added or removed
 
 - **Added** when a deferred follow-up has clear scope, a real risk,

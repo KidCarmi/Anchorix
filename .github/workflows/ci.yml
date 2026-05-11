@@ -249,6 +249,40 @@ jobs:
           # Postgres probe is registered in PR-002 and must report ok.
           grep -q '"postgres":"ok"' /tmp/readyz.json
 
+      # H-002: prove /readyz fails closed when postgres is unavailable.
+      # CLAUDE.md §18 binds the readiness probe to real dependencies, so
+      # stopping postgres mid-run MUST flip /readyz to 503. The api
+      # container keeps serving HTTP; only the probe result changes.
+      # `docker compose stop` halts the container without removing it,
+      # so the teardown step still cleans up uniformly via `down -v`.
+      - name: Smoke /readyz (negative — postgres down)
+        run: |
+          set -euo pipefail
+          docker compose stop postgres
+          # The probe runs fresh on each request, but the api's pgxpool
+          # may briefly hold a connection that hasn't yet noticed the
+          # peer went away. Retry up to ~10s for /readyz to flip.
+          code=""
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /tmp/readyz_unready.json -w "%{http_code}" http://localhost:8080/readyz || true)
+            if [ "$code" = "503" ]; then
+              break
+            fi
+            sleep 1
+          done
+          echo "readyz (postgres down) HTTP $code:"
+          cat /tmp/readyz_unready.json
+          echo
+          if [ "$code" != "503" ]; then
+            echo "::error::/readyz returned $code with postgres down, expected 503"
+            exit 1
+          fi
+          grep -q '"status":"unready"' /tmp/readyz_unready.json
+          # The probe wraps the underlying error as `error: <reason>`;
+          # we only assert the prefix because the reason text varies
+          # (broken pipe, connection refused, context deadline, etc.).
+          grep -q '"postgres":"error' /tmp/readyz_unready.json
+
       - name: Stack logs (on failure)
         if: failure()
         run: docker compose logs --no-color
