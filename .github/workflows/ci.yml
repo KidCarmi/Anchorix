@@ -205,7 +205,11 @@ jobs:
         timeout-minutes: 2
 
       - name: Run migrations
-        run: docker compose run --rm api /anchorix migrate up
+        # The api image's ENTRYPOINT is `/anchorix`; only the
+        # subcommand goes here (passing /anchorix again would feed
+        # it as the first argument and `anchorix: unknown command
+        # "/anchorix"` would result).
+        run: docker compose run --rm api migrate up
 
       - name: Bring up api
         run: docker compose up -d --wait api
