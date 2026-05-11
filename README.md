@@ -52,11 +52,21 @@ the full scope and engineering rules.
 
 ## Quick Start
 
-See [`DEVELOPMENT.md`](./DEVELOPMENT.md) for full instructions.
+See [`DEVELOPMENT.md`](./DEVELOPMENT.md) for full instructions and
+[`docs/BOOTSTRAP.md`](./docs/BOOTSTRAP.md) for the first-operator flow.
+Short version:
 
 ```bash
-cp .env.example .env
-docker compose up --build
+./scripts/dev-env.sh                    # generates .env with a real ANCHORIX_SESSION_KEY
+docker compose up -d --build postgres   # start the database first
+docker compose run --rm api migrate up  # apply embedded migrations
+# Create the first operator (no default admin, --password is required;
+# the CLI never prints the password back):
+read -srp 'Password: ' PW && echo
+docker compose run --rm -T api admin create \
+  --email you@example.com --display-name "You" --password "$PW"
+unset PW
+docker compose up --build               # bring up api + frontend
 ```
 
 The UI will be available at <http://localhost:5173> and the API at

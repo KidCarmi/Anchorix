@@ -40,9 +40,12 @@ have a smoke test for any non-obvious branch.
 - Inventory ingestion (private-key rejection). Already in
   `internal/inventory/inventory_test.go`.
 - Auth (password hash/compare, cookie sign/verify, session lifetime
-  semantics). **Required in PR-002.**
+  semantics). Landed in PR-002 — `internal/auth/{cookies,passwords,sessions}_test.go`.
 - Migration runner (parse, version detection, idempotence at the
-  parser layer). **Required in PR-002.**
+  parser layer). Exercised end-to-end via the Tier-2 integration suite
+  (`migrations_test.go`); parser-only unit coverage is intentionally
+  thin because the runner code is small and the integration test runs
+  in CI on every PR.
 - Agent enrollment (token-hash equality, single-use semantics).
   Required when the enrollment domain lands.
 - Risk-rule evaluation (deterministic given a fixed cert + clock).
@@ -62,21 +65,27 @@ have a smoke test for any non-obvious branch.
 ## Tier 2 — Backend Integration Tests
 
 **Lives at:** `backend/test/integration/`. Build-tagged
-`//go:build integration` so default `go test ./...` skips them.
+`//go:build integration` so default `go test ./...` skips them. Run
+locally with a live Postgres reachable via `DATABASE_URL`:
+
+```bash
+go run ./cmd/anchorix migrate up
+go test -tags integration -count=1 ./test/integration/...
+```
 
 **Runs in CI** under the existing `backend (go)` job, with the
 postgres service container described in
 [`CI_PLAN.md`](./CI_PLAN.md).
 
-**Scope (PR-002):**
+**Scope (PR-002, merged):**
 
 | Test                              | Asserts                                                                              |
 | --------------------------------- | ------------------------------------------------------------------------------------ |
 | `migrations_test.go`              | Fresh DB → `migrate up` succeeds; `schema_migrations` shows the expected version. Repeat `migrate up` is a no-op. |
-| `readiness_test.go`               | With probe registered + DB up → `/readyz` returns 200. Stop DB → `/readyz` returns 503 within one probe interval. |
+| `readiness_test.go`               | With probe registered + DB up → `/readyz` returns 200 with `postgres:"ok"`. Liveness `/healthz` is unconditional. |
 | `auth_session_test.go`            | Login with valid creds → 200 + Set-Cookie. `GET /me` with cookie → 200. Logout → cookie revoked. `GET /me` after logout → 401 with the canonical envelope. |
-| `request_identity_test.go`        | `X-Request-Id` propagates from request → log line → `audit_events.request_id`. |
-| `audit_test.go`                   | `audit_events` is insert-only at the DB level (DELETE/UPDATE both error). |
+| `audit_test.go`                   | `auth.admin_created` / `login_succeeded` / `login_failed` / `logout` all produce audit rows. `X-Request-Id` propagates from the request header into `audit_events.request_id` (the request-identity assertion lives here rather than in a separate file). `audit_events` is insert-only at the DB level — UPDATE / DELETE are rejected by trigger. |
+| `atomicity_test.go`               | A synthetic `failingRecorder` makes the audit write error mid-flow; the test asserts that no `sessions` row persists after a failed Login and no `users` row persists after a failed CreateUser. Proves the `auth.Service` ↔ `db.WithTx` atomic-tx contract (CLAUDE.md §18). |
 
 **Scope (PR-003+):**
 
@@ -161,12 +170,17 @@ CLAUDE.md §9 makes audit a first-class behavior. Where practical:
 
 - Domain operations that mutate state include a test that asserts an
   `audit_events` row was written with the expected `actor`,
-  `action`, `target_type`, `target_id`. Lives in Tier 2.
+  `action`, `target_type`, `target_id`. Lives in Tier 2
+  (`audit_test.go`).
 - The redaction allow-list is unit-tested (Tier 1, already present).
-- A "no plaintext secrets in logs" smoke test runs a full login flow
-  through the test logger and asserts no field tagged `password`,
-  `session_key`, `enrollment_token`, etc. appears unredacted. Lives
-  in Tier 2; **required in PR-002**.
+- PR-002 ships a `login_failed`-metadata assertion in `audit_test.go`:
+  `auth.login_failed` metadata carries `severity:"security"` and never
+  contains the plaintext password. The full "no plaintext secrets in
+  any log line" sweep is tracked as a follow-up in
+  [`HARDENING_BACKLOG.md`](./HARDENING_BACKLOG.md) — the redaction
+  unit tests cover the same surface at the formatter layer, so the
+  product invariant is enforced; what's deferred is the
+  belt-and-braces full-flow assertion.
 
 ## What's Forbidden
 

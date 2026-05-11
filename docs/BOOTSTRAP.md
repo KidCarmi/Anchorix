@@ -12,23 +12,34 @@ follow this sequence.
 ### 1. Configure environment
 
 ```bash
-./scripts/dev-env.sh        # generates .env with a real ANCHORIX_SESSION_KEY
-docker compose up -d postgres
+./scripts/dev-env.sh                       # generates .env with a real ANCHORIX_SESSION_KEY
+docker compose up -d --build postgres      # start the database first
 ```
+
+`./scripts/dev-env.sh` populates `DATABASE_URL` and a fresh
+`ANCHORIX_SESSION_KEY`; the control plane refuses to start on the
+placeholder value from `.env.example` (CLAUDE.md §8.9: no silent
+fallback for security-sensitive settings). To generate the key
+manually instead, run `openssl rand -base64 32` and paste it into `.env`.
 
 ### 2. Apply migrations
 
 ```bash
-docker compose run --rm api /anchorix migrate up
+docker compose run --rm api migrate up
 ```
 
-This creates schema and an empty `users` table. There is no seeded admin.
+The image's `ENTRYPOINT` is `/anchorix`, so the subcommand
+(`migrate up`) is passed directly — do **not** prefix it with
+`/anchorix` again. The migrate runner is idempotent (CLAUDE.md §16):
+applied on a pristine DB it creates the schema; applied on an
+up-to-date DB it is a no-op. A pristine schema includes an empty
+`users` table — there is no seeded admin.
 
-### 3. Create the first operator (Phase 1+)
+### 3. Create the first operator
 
 Two mechanisms are supported. Pick **one** at deployment time:
 
-#### Option A — CLI (recommended)
+#### Option A — CLI (recommended, implemented)
 
 The CLI **requires** `--password` — there is no default and no
 auto-generate path. Operators are expected to supply the password
@@ -41,7 +52,7 @@ docker compose run --rm -T \
   -e ANCHORIX_BCRYPT_COST \
   -e DATABASE_URL \
   -e ANCHORIX_SESSION_KEY \
-  api /anchorix admin create \
+  api admin create \
     --email alice@example.com \
     --display-name "Alice" \
     --password "$PW"
@@ -52,7 +63,7 @@ Or, if your shell hides command lines from history and you trust the
 generation source:
 
 ```bash
-docker compose run --rm api /anchorix admin create \
+docker compose run --rm api admin create \
     --email alice@example.com \
     --display-name "Alice" \
     --password "$(openssl rand -base64 24)"
@@ -72,11 +83,14 @@ Behaviour:
 This is the path the v0.1 documentation, deploy templates, and operator
 runbooks assume.
 
-#### Option B — First-run bootstrap token
+#### Option B — First-run bootstrap token (planned, not yet implemented)
 
 For environments where running an interactive command on the control
 plane host is awkward (e.g. fully unattended deployment), Anchorix
-supports a one-shot bootstrap token:
+will support a one-shot bootstrap token. Option B is **not** wired up
+in v0.1; only Option A (CLI) is available today. The contract below
+is preserved here as the design that the bootstrap-token PR must
+follow:
 
 1. The operator sets `ANCHORIX_BOOTSTRAP_TOKEN` in the control plane's
    environment **before** the very first start.
@@ -92,9 +106,33 @@ Pick exactly one mechanism per deployment. Do not enable both for the
 same database — the CLI path is safer because it never exposes a
 bootstrap endpoint over HTTP.
 
-### 4. Log in and rotate
+### 4. Start the control plane
 
-Sign in with the credentials from step 3. Immediately:
+```bash
+docker compose up --build
+```
+
+`anchorix serve` calls `EnsureSchema` against the embedded migrations
+and refuses to start when the DB is behind the binary; if you skipped
+step 2, run it now.
+
+### 5. Log in and rotate
+
+Sign in via `POST /api/v1/auth/login` with the credentials from step 3:
+
+```bash
+curl -sS -i -X POST http://localhost:8080/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"email":"alice@example.com","password":"…"}'
+```
+
+A successful login returns 200, a `Set-Cookie: anchorix_session=...`
+header, and the user profile body documented in
+[`docs/api/REST_API.md`](./api/REST_API.md#post-authlogin).
+Subsequent `GET /api/v1/auth/me` calls with the cookie return the same
+profile; `POST /api/v1/auth/logout` revokes the session.
+
+Immediately:
 
 - rotate the password if you suspect it was captured by anything other than your shell;
 - create additional operator accounts as needed;
