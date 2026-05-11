@@ -37,7 +37,10 @@ up-to-date DB it is a no-op. A pristine schema includes an empty
 
 ### 3. Create the first operator
 
-Two mechanisms are supported. Pick **one** at deployment time:
+Today, only **Option A — CLI bootstrap** is implemented and supported.
+
+**Option B — first-run bootstrap token** is planned, not implemented,
+and documented only as the future design contract.
 
 #### Option A — CLI (recommended, implemented)
 
@@ -102,9 +105,10 @@ follow:
 4. The control plane refuses to start if the env var is set in
    production with `ANCHORIX_TLS_TERMINATION=disabled_dev`.
 
-Pick exactly one mechanism per deployment. Do not enable both for the
-same database — the CLI path is safer because it never exposes a
-bootstrap endpoint over HTTP.
+Once Option B ships, deployments must pick exactly one mechanism per
+database. Both must never be enabled together — the CLI path is safer
+because it never exposes a bootstrap endpoint over HTTP. Until then,
+Option A is the only supported path.
 
 ### 4. Start the control plane
 
