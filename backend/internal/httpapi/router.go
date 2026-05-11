@@ -37,10 +37,15 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 	mux := http.NewServeMux()
 
 	authDeps := handlers.AuthDeps{
-		Service:          deps.AuthService,
-		CookieSigner:     deps.CookieSigner,
-		CookieName:       cfg.SessionCookieName,
-		CookieSecure:     cfg.IsProduction(),
+		Service:      deps.AuthService,
+		CookieSigner: deps.CookieSigner,
+		CookieName:   cfg.SessionCookieName,
+		// Secure cookie is required whenever TLS is actually in
+		// front of the API. The only TLS posture that justifies
+		// emitting a non-Secure cookie is disabled_dev — local dev
+		// over plain HTTP. Staging and reverse_proxy deployments
+		// MUST send Secure (CLAUDE.md §6.4).
+		CookieSecure:     cfg.TLSTermination != config.TLSDisabledDev,
 		IdleLifetime:     cfg.SessionIdleLifetime,
 		AbsoluteLifetime: cfg.SessionAbsoluteLifetime,
 	}

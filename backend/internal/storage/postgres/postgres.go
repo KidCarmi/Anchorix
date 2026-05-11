@@ -7,22 +7,21 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // DB owns the pgx connection pool. Construct exactly one per process
-// in the composition root (cmd/anchorix). Repository types take a
-// *DB by reference and use its accessor methods; they do not
-// construct their own pool.
+// in the composition root (cmd/anchorix). Repository types hold a
+// *DB pointer and route every query through db.querierFor(ctx), so
+// the same code runs inside or outside a transaction depending on
+// whether the caller wrapped the operation in DB.WithTx.
 type DB struct {
 	pool *pgxpool.Pool
 }
 
 // Open establishes the pool against the given DATABASE_URL.
 // The caller is responsible for Close.
-//
-// Open honors ctx so callers can bound startup time. Individual
-// query timeouts are set at the call site (CLAUDE.md §8.11).
 func Open(ctx context.Context, databaseURL string) (*DB, error) {
 	if databaseURL == "" {
 		return nil, errors.New("postgres: empty DATABASE_URL")
@@ -31,7 +30,6 @@ func Open(ctx context.Context, databaseURL string) (*DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("postgres: parse DATABASE_URL: %w", err)
 	}
-	// Conservative pool defaults — production tuning lands later.
 	cfg.MaxConns = 10
 	cfg.MinConns = 1
 	cfg.MaxConnLifetime = 30 * time.Minute
@@ -62,14 +60,58 @@ func (db *DB) Ping(ctx context.Context) error {
 	return db.pool.Ping(ctx)
 }
 
-// pool exposes the underlying *pgxpool.Pool to sibling repository
-// files in this package only (unexported).
-func (db *DB) querier() *pgxpool.Pool { return db.pool }
+// querier is the small subset of the pgxpool API that repositories
+// actually need. Both *pgxpool.Pool and pgx.Tx satisfy it, which is
+// what makes the ctx-carrying transaction pattern work: a repository
+// method that does `db.querierFor(ctx).QueryRow(...)` automatically
+// participates in any transaction the caller wrapped it in.
+type querier interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
 
-// WithTx runs fn inside a single transaction. Commits on nil return;
-// rolls back on any error or panic. CLAUDE.md §18: ctx is always
-// honored; non-nil returns from fn never leave a dangling tx.
-func (db *DB) WithTx(ctx context.Context, fn func(pgx.Tx) error) error {
+type txKey struct{}
+
+func contextWithTx(ctx context.Context, tx pgx.Tx) context.Context {
+	return context.WithValue(ctx, txKey{}, tx)
+}
+
+func txFromContext(ctx context.Context) (pgx.Tx, bool) {
+	tx, ok := ctx.Value(txKey{}).(pgx.Tx)
+	return tx, ok
+}
+
+// querierFor returns the active tx if one is bound to ctx, otherwise
+// the pool itself. Callers do not need to know which they got.
+func (db *DB) querierFor(ctx context.Context) querier {
+	if tx, ok := txFromContext(ctx); ok {
+		return tx
+	}
+	return db.pool
+}
+
+// WithTx runs fn inside a single transaction. Every repository call
+// made with the ctx passed to fn participates in the same transaction.
+// On nil return from fn the tx commits; on any error or panic, the
+// tx rolls back. This is the domain-facing transactional API — it
+// does not leak pgx.Tx outside this package (CLAUDE.md §8.6: no
+// pgx imports in domain or httpapi).
+func (db *DB) WithTx(ctx context.Context, fn func(ctx context.Context) error) error {
+	return db.withRawTx(ctx, func(tx pgx.Tx) error {
+		return fn(contextWithTx(ctx, tx))
+	})
+}
+
+// WithTxRaw exposes the underlying pgx.Tx for callers inside this
+// package (migrations.go) and for integration tests that need to
+// exercise raw SQL (audit-events-are-append-only). Production
+// domain code MUST use WithTx instead.
+func (db *DB) WithTxRaw(ctx context.Context, fn func(pgx.Tx) error) error {
+	return db.withRawTx(ctx, fn)
+}
+
+func (db *DB) withRawTx(ctx context.Context, fn func(pgx.Tx) error) error {
 	tx, err := db.pool.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return fmt.Errorf("postgres: begin tx: %w", err)

@@ -61,7 +61,10 @@ func cmdServe(ctx context.Context, cfg *config.Config, log *logger.Logger) error
 	if err != nil {
 		return fmt.Errorf("signed cookie: %w", err)
 	}
-	authService := auth.NewService(usersRepo, sessionsRepo, auditRecorder, passwd, sessPol, clock.System{})
+	authService, err := auth.NewService(usersRepo, sessionsRepo, auditRecorder, db, passwd, sessPol, clock.System{})
+	if err != nil {
+		return fmt.Errorf("auth service: %w", err)
+	}
 
 	// HTTP layer.
 	srv, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{

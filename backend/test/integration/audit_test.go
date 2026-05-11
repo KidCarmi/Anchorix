@@ -149,10 +149,13 @@ func tryStatement(db *postgres.DB, sql string, args ...any) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	var execErr error
-	_ = db.WithTx(ctx, func(tx pgx.Tx) error {
+	// WithTxRaw exposes pgx.Tx because this test exercises raw SQL
+	// (UPDATE/DELETE on audit_events) to confirm the production
+	// trigger rejects them. Domain code MUST NOT use WithTxRaw.
+	_ = db.WithTxRaw(ctx, func(tx pgx.Tx) error {
 		_, execErr = tx.Exec(ctx, sql, args...)
-		// Always return a sentinel error so WithTx rolls back; the
-		// real error we care about is execErr, captured above.
+		// Always return a sentinel error so WithTxRaw rolls back;
+		// the real error we care about is execErr, captured above.
 		return errors.New("rollback")
 	})
 	return execErr

@@ -10,40 +10,62 @@ import (
 	"github.com/kidcarmi/anchorix/backend/internal/ids"
 )
 
+// Transactor runs fn inside a single transaction. The implementation
+// (storage/postgres.DB) binds a tx to the ctx so that repository
+// calls made with that ctx automatically participate. The auth
+// service uses this to make Login and CreateUser atomic across
+// multiple repository writes without leaking pgx.Tx outside the
+// storage layer (CLAUDE.md §8.6, §18).
+type Transactor interface {
+	WithTx(ctx context.Context, fn func(ctx context.Context) error) error
+}
+
 // Service is the auth domain entrypoint. Handlers depend on this
-// struct, never on Repository or SessionStore directly (CLAUDE.md
-// §8.6, §8.8).
+// struct, never on Repository / SessionStore / Transactor directly
+// (CLAUDE.md §8.6, §8.8).
 type Service struct {
 	users    Repository
 	sessions SessionStore
 	audit    audit.Recorder
+	tx       Transactor
 	passwd   PasswordPolicy
 	sessPol  SessionPolicy
 	clock    clock.Clock
 }
 
-// NewService wires the service. Constructor-based DI per
-// CLAUDE.md §8.8. All dependencies are required; passing nil is a
-// programmer error.
+// NewService wires the service. Constructor-based DI per CLAUDE.md
+// §8.8. Returns a validation error if any dependency is missing —
+// never panics (CLAUDE.md §18: no panic-driven business flow).
 func NewService(
 	users Repository,
 	sessions SessionStore,
 	auditRec audit.Recorder,
+	tx Transactor,
 	passwd PasswordPolicy,
 	sessPol SessionPolicy,
 	clk clock.Clock,
-) *Service {
-	if users == nil || sessions == nil || auditRec == nil || clk == nil {
-		panic("auth.NewService: nil dependency")
+) (*Service, error) {
+	switch {
+	case users == nil:
+		return nil, errors.New("auth.NewService: users repository required")
+	case sessions == nil:
+		return nil, errors.New("auth.NewService: sessions store required")
+	case auditRec == nil:
+		return nil, errors.New("auth.NewService: audit recorder required")
+	case tx == nil:
+		return nil, errors.New("auth.NewService: transactor required")
+	case clk == nil:
+		return nil, errors.New("auth.NewService: clock required")
 	}
 	return &Service{
 		users:    users,
 		sessions: sessions,
 		audit:    auditRec,
+		tx:       tx,
 		passwd:   passwd,
 		sessPol:  sessPol,
 		clock:    clk,
-	}
+	}, nil
 }
 
 // LoginInput carries the request-side identity of a login attempt.
@@ -61,11 +83,18 @@ type LoginOutput struct {
 	Session *Session
 }
 
-// Login authenticates the user and creates a new session. The
-// returned error is one of the sentinel values from auth.go; the
-// HTTP handler maps each to the canonical API error envelope
-// (CLAUDE.md §17). Failed-credential attempts emit an audit event
-// flagged `severity:"security"`.
+// Login authenticates the user and creates a new session.
+//
+// State-changing steps (sessions.Create, users.UpdateLastLogin,
+// audit.Record of `auth.login_succeeded`) run inside a single
+// transaction. If any one of them fails, none of them persist —
+// no half-issued session, no orphan last_login, no
+// auditless session creation (CLAUDE.md §18).
+//
+// Read-only steps (GetUserByEmail, password verify) run outside the
+// transaction; they have no rollback semantics. Failed-credential
+// attempts emit a `severity:"security"` audit event via the silent
+// auditAuthFailure helper.
 func (s *Service) Login(ctx context.Context, in LoginInput) (*LoginOutput, error) {
 	user, hash, err := s.users.GetUserByEmail(ctx, in.Email)
 	if err != nil {
@@ -93,22 +122,28 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (*LoginOutput, error
 		UserAgent: in.UserAgent,
 		RemoteIP:  in.RemoteIP,
 	}
-	if err := s.sessions.Create(ctx, session); err != nil {
-		return nil, fmt.Errorf("auth: create session: %w", err)
-	}
-	if err := s.users.UpdateLastLogin(ctx, user.ID, now); err != nil {
-		return nil, fmt.Errorf("auth: update last_login: %w", err)
-	}
-	if err := s.audit.Record(ctx, audit.Event{
-		OrganizationID: user.OrganizationID,
-		Actor:          user.ID,
-		ActorType:      "user",
-		Action:         "auth.login_succeeded",
-		TargetType:     "session",
-		TargetID:       session.ID,
-		RequestID:      in.RequestID,
+
+	if err := s.tx.WithTx(ctx, func(ctx context.Context) error {
+		if err := s.sessions.Create(ctx, session); err != nil {
+			return fmt.Errorf("auth: create session: %w", err)
+		}
+		if err := s.users.UpdateLastLogin(ctx, user.ID, now); err != nil {
+			return fmt.Errorf("auth: update last_login: %w", err)
+		}
+		if err := s.audit.Record(ctx, audit.Event{
+			OrganizationID: user.OrganizationID,
+			Actor:          user.ID,
+			ActorType:      "user",
+			Action:         "auth.login_succeeded",
+			TargetType:     "session",
+			TargetID:       session.ID,
+			RequestID:      in.RequestID,
+		}); err != nil {
+			return fmt.Errorf("auth: record login: %w", err)
+		}
+		return nil
 	}); err != nil {
-		return nil, fmt.Errorf("auth: record login: %w", err)
+		return nil, err
 	}
 	return &LoginOutput{User: user, Session: session}, nil
 }
@@ -117,6 +152,8 @@ func (s *Service) Login(ctx context.Context, in LoginInput) (*LoginOutput, error
 // expiry as a side effect (sliding-session pattern). Returns one of
 // ErrSessionNotFound / ErrSessionExpired / ErrSessionRevoked /
 // ErrUserNotFound when the request cannot be authenticated.
+//
+// The slide is a single UPDATE; no transaction is needed.
 func (s *Service) Authenticate(ctx context.Context, sessionID string) (*User, *Session, error) {
 	session, err := s.sessions.Get(ctx, sessionID)
 	if err != nil {
@@ -143,27 +180,32 @@ func (s *Service) Authenticate(ctx context.Context, sessionID string) (*User, *S
 	return user, session, nil
 }
 
-// Logout revokes the session. Audits the action.
+// Logout revokes the session and audits the action. Both steps run
+// in one transaction so a session never reaches "revoked but
+// unaudited" state.
 func (s *Service) Logout(ctx context.Context, user *User, session *Session, requestID string) error {
 	now := s.clock.Now()
-	if err := s.sessions.Revoke(ctx, session.ID, now); err != nil {
-		return fmt.Errorf("auth: revoke session: %w", err)
-	}
-	return s.audit.Record(ctx, audit.Event{
-		OrganizationID: user.OrganizationID,
-		Actor:          user.ID,
-		ActorType:      "user",
-		Action:         "auth.logout",
-		TargetType:     "session",
-		TargetID:       session.ID,
-		RequestID:      requestID,
+	return s.tx.WithTx(ctx, func(ctx context.Context) error {
+		if err := s.sessions.Revoke(ctx, session.ID, now); err != nil {
+			return fmt.Errorf("auth: revoke session: %w", err)
+		}
+		return s.audit.Record(ctx, audit.Event{
+			OrganizationID: user.OrganizationID,
+			Actor:          user.ID,
+			ActorType:      "user",
+			Action:         "auth.logout",
+			TargetType:     "session",
+			TargetID:       session.ID,
+			RequestID:      requestID,
+		})
 	})
 }
 
-// CreateUser is invoked by `anchorix admin create`. It hashes the
-// password, inserts the user, and audits the action under actor
-// "system". The plaintext password never leaves the call site; the
-// hash is what reaches storage (CLAUDE.md §6.9).
+// CreateUser is invoked by `anchorix admin create`. The user insert
+// and the `auth.admin_created` audit row are written in a single
+// transaction so no user can exist without its creation having been
+// audited (CLAUDE.md §9, §18). The plaintext password never leaves
+// the call site; only the hash reaches storage (CLAUDE.md §6.9).
 func (s *Service) CreateUser(
 	ctx context.Context,
 	organizationID, email, displayName, plaintextPassword string,
@@ -181,18 +223,20 @@ func (s *Service) CreateUser(
 		Role:           role,
 		CreatedAt:      s.clock.Now(),
 	}
-	if err := s.users.CreateUser(ctx, user, hash); err != nil {
-		return nil, fmt.Errorf("auth: create user: %w", err)
-	}
-	if err := s.audit.Record(ctx, audit.Event{
-		OrganizationID: organizationID,
-		Actor:          "system",
-		ActorType:      "system",
-		Action:         "auth.admin_created",
-		TargetType:     "user",
-		TargetID:       user.ID,
+	if err := s.tx.WithTx(ctx, func(ctx context.Context) error {
+		if err := s.users.CreateUser(ctx, user, hash); err != nil {
+			return fmt.Errorf("auth: create user: %w", err)
+		}
+		return s.audit.Record(ctx, audit.Event{
+			OrganizationID: organizationID,
+			Actor:          "system",
+			ActorType:      "system",
+			Action:         "auth.admin_created",
+			TargetType:     "user",
+			TargetID:       user.ID,
+		})
 	}); err != nil {
-		return nil, fmt.Errorf("auth: record admin_created: %w", err)
+		return nil, err
 	}
 	return user, nil
 }

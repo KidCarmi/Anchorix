@@ -62,7 +62,7 @@ func freshDatabase(t *testing.T, db *postgres.DB) {
 	if _, err := db.MigrateUp(ctx, migrations); err != nil {
 		t.Fatalf("MigrateUp: %v", err)
 	}
-	err = db.WithTx(ctx, func(tx pgx.Tx) error {
+	err = db.WithTxRaw(ctx, func(tx pgx.Tx) error {
 		stmts := []string{
 			"DELETE FROM sessions",
 			"DELETE FROM agent_enrollment_tokens",
@@ -114,7 +114,10 @@ func testServer(t *testing.T, db *postgres.DB) (*httptest.Server, *auth.Service)
 	if err != nil {
 		t.Fatalf("signed cookie: %v", err)
 	}
-	svc := auth.NewService(usersRepo, sessionsRepo, auditRecorder, passwd, sessPol, clock.System{})
+	svc, err := auth.NewService(usersRepo, sessionsRepo, auditRecorder, db, passwd, sessPol, clock.System{})
+	if err != nil {
+		t.Fatalf("auth.NewService: %v", err)
+	}
 
 	srv, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{
 		AuthService:  svc,

@@ -40,6 +40,18 @@ func run(args []string) error {
 	}
 	cmd, rest := args[0], args[1:]
 
+	// Commands that don't need config — and MUST work without env
+	// (e.g. someone running `anchorix version` to confirm what's
+	// installed). Loading config here would force ANCHORIX_SESSION_KEY
+	// and DATABASE_URL to be set just to print a version string.
+	switch cmd {
+	case "version":
+		fmt.Println("anchorix v0.1.0-dev")
+		return nil
+	case "-h", "--help", "help":
+		return usageError()
+	}
+
 	cfg, err := config.Load()
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -58,11 +70,6 @@ func run(args []string) error {
 		return cmdAdmin(ctx, cfg, log, rest)
 	case "healthcheck":
 		return cmdHealthcheck(ctx, cfg)
-	case "version":
-		fmt.Println("anchorix v0.1.0-dev")
-		return nil
-	case "-h", "--help", "help":
-		return usageError()
 	default:
 		return fmt.Errorf("unknown command %q", cmd)
 	}

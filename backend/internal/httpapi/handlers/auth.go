@@ -119,42 +119,32 @@ func AuthMe() http.HandlerFunc {
 	}
 }
 
-// remoteIP extracts the client IP. We accept X-Forwarded-For only
-// for the development case (no proxy in the path); production
-// deploys terminate TLS at a trusted proxy that overwrites the
-// header in a known shape — that wiring is operator-side.
+// remoteIP extracts the client IP from r.RemoteAddr.
+//
+// We deliberately do NOT consult X-Forwarded-For, X-Real-IP, or any
+// other client-supplied header. Those are spoofable by any HTTP
+// client; trusting them without a trusted-proxy allowlist would let
+// callers forge the source IP recorded against their session.
+// A trusted-proxy configuration can re-introduce header parsing in
+// a future PR — until then RemoteAddr is the only source.
 //
 // Uses net.SplitHostPort so bracketed IPv6 forms like "[::1]:12345"
 // strip the port correctly. The session row's remote_ip column is
 // PostgreSQL `inet` and would reject anything that isn't a valid
-// address; rather than risk writing junk we return "" so the column
-// is stored NULL.
+// address; we return "" so the column is stored NULL when parsing
+// fails.
 func remoteIP(r *http.Request) string {
-	candidates := make([]string, 0, 2)
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		first := xff
-		if i := strings.IndexByte(xff, ','); i > 0 {
-			first = xff[:i]
-		}
-		candidates = append(candidates, strings.TrimSpace(first))
+	raw := r.RemoteAddr
+	if raw == "" {
+		return ""
 	}
-	candidates = append(candidates, r.RemoteAddr)
-
-	for _, raw := range candidates {
-		if raw == "" {
-			continue
+	if host, _, err := net.SplitHostPort(raw); err == nil {
+		if net.ParseIP(host) != nil {
+			return host
 		}
-		// "host:port" — preferred shape; SplitHostPort handles
-		// bracketed IPv6.
-		if host, _, err := net.SplitHostPort(raw); err == nil {
-			if net.ParseIP(host) != nil {
-				return host
-			}
-		}
-		// Bare IP.
-		if net.ParseIP(raw) != nil {
-			return raw
-		}
+	}
+	if net.ParseIP(raw) != nil {
+		return raw
 	}
 	return ""
 }

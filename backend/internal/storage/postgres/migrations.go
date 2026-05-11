@@ -174,7 +174,7 @@ const undefinedTableSQLState = "42P01"
 
 func (db *DB) currentSchemaVersion(ctx context.Context) (int, error) {
 	var v int
-	row := db.pool.QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`)
+	row := db.querierFor(ctx).QueryRow(ctx, `SELECT COALESCE(MAX(version), 0) FROM schema_migrations`)
 	if err := row.Scan(&v); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && pgErr.Code == undefinedTableSQLState {
@@ -188,7 +188,7 @@ func (db *DB) currentSchemaVersion(ctx context.Context) (int, error) {
 }
 
 func (db *DB) applyMigration(ctx context.Context, m Migration) error {
-	return db.WithTx(ctx, func(tx pgx.Tx) error {
+	return db.WithTxRaw(ctx, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, m.SQL); err != nil {
 			return fmt.Errorf("exec: %w", err)
 		}

@@ -86,7 +86,10 @@ func cmdAdminCreate(ctx context.Context, cfg *config.Config, log *logger.Logger,
 	if err != nil {
 		return fmt.Errorf("admin create: session policy: %w", err)
 	}
-	svc := auth.NewService(usersRepo, sessionsRepo, auditRecorder, passwd, sessPol, clock.System{})
+	svc, err := auth.NewService(usersRepo, sessionsRepo, auditRecorder, db, passwd, sessPol, clock.System{})
+	if err != nil {
+		return fmt.Errorf("admin create: %w", err)
+	}
 
 	// Bootstrap: provision the organization row before creating the
 	// user. The users.organization_id foreign key requires it, and a

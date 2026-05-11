@@ -6,8 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-
 	"github.com/kidcarmi/anchorix/backend/internal/audit"
 	"github.com/kidcarmi/anchorix/backend/internal/clock"
 	"github.com/kidcarmi/anchorix/backend/internal/ids"
@@ -17,19 +15,19 @@ import (
 // database level — UPDATE/DELETE on the table are rejected by
 // trigger (CLAUDE.md §9, §16).
 type AuditRecorder struct {
-	pool  *pgxpool.Pool
+	db    *DB
 	clock clock.Clock
 }
 
 // NewAuditRecorder wires the recorder.
 func NewAuditRecorder(db *DB, c clock.Clock) *AuditRecorder {
-	return &AuditRecorder{pool: db.querier(), clock: c}
+	return &AuditRecorder{db: db, clock: c}
 }
 
-// Record inserts a new audit row. Fills in ID and OccurredAt if the
-// caller left them zero, so callers only need to set the semantic
-// fields (actor, action, target). CLAUDE.md §9: every state-changing
-// operation calls this exactly once on success.
+// Record inserts a new audit row. Caller fills in the semantic fields;
+// ID and OccurredAt are filled by the recorder if zero. Routes through
+// querierFor so the write participates in any transaction the caller
+// wrapped this in.
 func (r *AuditRecorder) Record(ctx context.Context, e audit.Event) error {
 	if e.ID == "" {
 		e.ID = ids.New()
@@ -58,7 +56,7 @@ func (r *AuditRecorder) Record(ctx context.Context, e audit.Event) error {
 		  (id, organization_id, occurred_at, actor, actor_type,
 		   action, target_type, target_id, request_id, metadata)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)`
-	_, err := r.pool.Exec(ctx, q,
+	_, err := r.db.querierFor(ctx).Exec(ctx, q,
 		e.ID, e.OrganizationID, e.OccurredAt, e.Actor, e.ActorType,
 		e.Action, e.TargetType, e.TargetID, nullIfEmpty(e.RequestID), metadata,
 	)
@@ -85,7 +83,7 @@ func (r *AuditRecorder) List(ctx context.Context, q audit.ListQuery) ([]audit.Ev
 		   AND ($5::text IS NULL OR target_id = $5)
 		 ORDER BY occurred_at DESC
 		 LIMIT $6`
-	rows, err := r.pool.Query(ctx, sql,
+	rows, err := r.db.querierFor(ctx).Query(ctx, sql,
 		nullIfEmpty(q.OrganizationID), nullIfEmpty(q.Actor),
 		nullIfEmpty(q.Action), nullIfEmpty(q.TargetType),
 		nullIfEmpty(q.TargetID), limit,
