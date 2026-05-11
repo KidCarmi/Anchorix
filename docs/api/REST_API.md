@@ -77,7 +77,11 @@ user profile:
 The cookie:
 
 - name: `anchorix_session` (overridable via `ANCHORIX_SESSION_COOKIE_NAME`)
-- attributes: `HttpOnly; SameSite=Lax`; `Secure` is set in production
+- attributes: `HttpOnly; SameSite=Lax`. `Secure` is emitted whenever
+  `ANCHORIX_TLS_TERMINATION` is anything other than `disabled_dev`
+  — so production, staging, and reverse-proxy postures all get
+  Secure cookies (CLAUDE.md §6.4). The only mode that emits a
+  non-Secure cookie is the local dev mode over plain HTTP.
 - value: signed; carries an opaque session id whose server-side row
   is the source of truth (CLAUDE.md §17 — envelope is stable, the
   cookie shape is implementation detail of the auth domain)

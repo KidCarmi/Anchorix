@@ -39,12 +39,13 @@ gitleaks                dependency obituary
 (Plus the auto-generated `Trivy` and `CodeQL` SARIF-upload runs that
 GitHub renders separately.)
 
-## PR-002 — Additive CI Changes
+## PR-002 — Additive CI Changes (merged)
 
-PR-002 introduces real PostgreSQL persistence, so CI must exercise
-it. The changes below are **additive** to the existing
-`backend (go)` job — no new top-level workflow, no new required-check
-name, no new gate to configure in branch protection.
+PR-002 introduced real PostgreSQL persistence, so CI exercises it.
+The changes below are **additive** to the existing `backend (go)` job
+— no new top-level workflow, no new required-check name, no new gate
+to configure in branch protection. All landed in `ci.yml` on commit
+`482188b` (merge of PR #4).
 
 ### `ci.yml backend (go)` — postgres service container
 
@@ -90,16 +91,17 @@ Notes:
 - The job's wall-clock budget grows by ~30 seconds (postgres health
   + migrate + integration suite). Acceptable.
 
-### `docker (config + build + smoke)` — readiness assertion tightens
+### `docker (config + build + smoke)` — readiness assertion (merged)
 
-Currently the smoke step asserts `{"status":"ready"}` on `/readyz`
-when no probes are registered. After PR-002, postgres is a registered
-probe, so the existing assertion still holds — the probe is healthy
-because the api container `depends_on: postgres: condition: service_healthy`.
-
-The smoke step gains one additional check: stop postgres mid-run and
-assert that `/readyz` flips to 503. This validates fail-closed
-behavior end-to-end. Adds another ~10s to the job.
+Pre-PR-002 the smoke step asserted `{"status":"ready"}` on `/readyz`
+when no probes were registered. The merged step now grep-asserts
+`"postgres":"ok"` in `/readyz`, which fails closed when the api
+container can't reach postgres. The "stop postgres mid-run, assert
+503" sweep is retained as a follow-up in
+[`HARDENING_BACKLOG.md`](./HARDENING_BACKLOG.md): the current smoke
+proves the happy path; the negative-path assertion is deferred so
+that adding it doesn't expand the smoke step's wall-clock budget on
+every PR.
 
 ### What does **not** change in CI for PR-002
 
@@ -145,8 +147,9 @@ to both this doc and `.github/workflows/README.md`.
 
 This plan is "done" when:
 
-1. PR-002 lands using exactly the additive changes above.
+1. PR-002 lands using exactly the additive changes above. ✅ (merged
+   in PR #4)
 2. Branch protection on `main` still requires the same 14 jobs (no
-   gate added without a §11 amendment).
+   gate added without a §11 amendment). ✅
 3. The "Tracked, not yet wired" list is updated as each phase lands,
    with a row removed and a "Today" line added.

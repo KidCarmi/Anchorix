@@ -1,7 +1,11 @@
 # PR-002 — Implementation Plan
 
-**Status:** approved scope, not yet implemented.
-**Owner:** to be assigned at PR-002 open.
+**Status:** merged in PR #4 (`feat(backend): PR-002 — DB + migrations
++ auth + sessions (no UI)`). This document is retained as the planning
+record. Deviations from the original plan, discovered during
+implementation, are flagged inline with `> **Post-merge note:**`
+callouts so future contributors can see what shipped vs. what was
+proposed.
 **Source of truth for rules:** [`CLAUDE.md`](../../CLAUDE.md). If this
 plan and CLAUDE.md disagree, CLAUDE.md wins.
 
@@ -103,33 +107,48 @@ PR-002 implementation is not free design. It must obey CLAUDE.md
 ```
 backend/
   cmd/anchorix/
-    migrate.go                      # cmdMigrate full implementation
-    serve.go                        # extracted from main.go — composition only
+    admin.go                         # cmdAdmin / cmdAdminCreate
+    healthcheck.go                   # container HEALTHCHECK entrypoint
+    migrate.go                       # cmdMigrate full implementation
+    serve.go                         # extracted from main.go — composition only
   internal/
     storage/
       postgres/
         doc.go
-        db.go                        # Open / Close / Ping / Tx
-        migrations.go                # //go:embed migrations/*.sql + runner
-        agents_repository.go         # skeletal — only what auth flow needs
-        auth_repository.go
+        postgres.go                  # Open / Close / Ping / WithTx / WithTxRaw
+        migrations.go                # //go:embed via migrations package + runner
+        auth_repository.go           # users + EnsureOrganization
         sessions_repository.go
         audit_repository.go
     auth/
       doc.go
-      sessions.go                    # Session, SessionStore (interface)
-      service.go                     # Login, Logout, Authenticate
+      auth.go                        # User, Role, sentinel errors, Repository iface
+      sessions.go                    # Session, SessionStore, SessionPolicy
+      service.go                     # Login, Logout, Authenticate, CreateUser
       cookies.go                     # signed-cookie encode/decode
+      passwords.go                   # PasswordPolicy (bcrypt)
     httpapi/
       middleware/
-        auth.go                      # session resolver middleware
+        auth.go                      # SessionResolver, RequireAuth, MapAuthError
+  migrations/
+    embed.go                         # //go:embed *.sql FS
   test/integration/
-    integration_test.go              # shared TestMain + postgres service ctn helper
+    integration_test.go              # testDB + freshDatabase helpers
     migrations_test.go
     readiness_test.go
     auth_session_test.go
-    request_identity_test.go
+    audit_test.go                    # also covers request-id propagation
+    atomicity_test.go                # post-merge: TestLoginRollsBackOnAuditFailure
+                                     #             TestCreateUserRollsBackOnAuditFailure
 ```
+
+> **Post-merge note:** the plan listed `request_identity_test.go` and
+> `agents_repository.go` as separate files. The merged shape folds the
+> X-Request-Id propagation assertion into `audit_test.go` (it's the same
+> chain: HTTP → audit row) and defers `agents_repository.go` to the
+> PR that introduces agent enrollment. `atomicity_test.go` is new in
+> PR-002 — it covers the §18 atomicity contract for the
+> auth.Service ↔ db.WithTx wiring.
 
 Approximate size: 700–900 LOC product code + 400–600 LOC tests. Stays
 within CLAUDE.md §8.7 file-size guidance (each file < 500 LOC; each
@@ -186,19 +205,24 @@ PR-002 is done when:
 
 1. `make dev` (a fresh checkout, fresh postgres) brings the stack up
    end-to-end and `curl http://localhost:8080/readyz` returns
-   `{"status":"ready","checks":{"postgres":"ok"}}`.
+   `{"status":"ready","checks":{"postgres":"ok"}}`. ✅
 2. Stopping postgres and re-hitting `/readyz` returns HTTP 503 with
-   `{"status":"unready","checks":{"postgres":"error: ..."}}`.
-3. `anchorix admin create --email alice@example.com` (per
-   `docs/BOOTSTRAP.md`) succeeds, prints the generated password once,
-   and writes one user row.
+   `{"status":"unready","checks":{"postgres":"error: ..."}}`. ✅
+3. `anchorix admin create --email alice@example.com --password "$PW"`
+   (per `docs/BOOTSTRAP.md`) succeeds with an explicit, caller-supplied
+   password and writes one user row. ✅
+   > **Post-merge note:** the original wording said "prints the
+   > generated password once". Per the PR-#4 review the auto-generate
+   > path was removed — `--password` is required and the CLI never
+   > prints the password back (CLAUDE.md §6.9). `GenerateRandomPassword`
+   > was deleted along with its tests.
 4. `POST /api/v1/auth/login` returns a session cookie; subsequent
    `GET /api/v1/auth/me` returns the profile; `POST /api/v1/auth/logout`
    revokes the session and a follow-up `GET /api/v1/auth/me` returns
-   401.
+   401. ✅
 5. An `audit_events` row is written for each login, logout, and admin
-   creation.
-6. CI (all 14 blocking gates) passes on the PR's HEAD commit.
+   creation. Failed logins emit a `severity:"security"` row. ✅
+6. CI (all 14 blocking gates) passes on the PR's HEAD commit. ✅
 
 ## Sequencing
 
@@ -211,14 +235,18 @@ enough (under ~1.5k LOC including tests) to review in one sitting.
 PR-003 picks up the login UI on the frontend; PR-004 picks up agent
 enrollment.
 
-## Open Questions
+## Open Questions (resolved at merge)
 
-1. **bcrypt cost.** Default 12 unless the user prefers stronger.
-   Configurable via `ANCHORIX_AUTH_BCRYPT_COST` with bounds [10, 14].
-2. **Session lifetime.** Proposed 8h idle / 24h absolute, both
-   configurable via `internal/config`. Defaults align with §8.9
-   (no silent fallback for security-sensitive settings).
-3. **`pgx` major version.** Proposed v5 (current stable, native
-   support for cancellation, structured logger interface). Falls
-   under §8.11 outbound-client rules even though the database is
-   "internal" — same retry/timeout/structured-error discipline.
+1. **bcrypt cost.** Default 12, configurable via `ANCHORIX_BCRYPT_COST`
+   with bounds [10, 14]. ✅
+   > **Post-merge note:** plan said `ANCHORIX_AUTH_BCRYPT_COST`; the
+   > merged env-var name dropped the `AUTH_` infix to match the other
+   > auth-policy keys in `internal/config` (`ANCHORIX_SESSION_IDLE_LIFETIME`,
+   > `ANCHORIX_SESSION_ABSOLUTE_LIFETIME`).
+2. **Session lifetime.** Landed at 8h idle / 24h absolute, both
+   configurable via `ANCHORIX_SESSION_IDLE_LIFETIME` and
+   `ANCHORIX_SESSION_ABSOLUTE_LIFETIME`. Defaults align with §8.9. ✅
+3. **`pgx` major version.** Landed at `github.com/jackc/pgx/v5 v5.9.2`
+   (the older v5.7.1 was upgraded mid-review after a Trivy CRITICAL
+   surfaced on the older patch). Discipline aligned with §8.11
+   (per-call timeouts, structured errors, no `http.DefaultClient`). ✅

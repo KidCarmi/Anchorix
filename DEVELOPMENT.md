@@ -7,7 +7,7 @@ This guide describes how to bring up Anchorix v0.1 locally.
 ## Prerequisites
 
 - **Docker** 24+ and **Docker Compose** v2
-- **Go** 1.22+ (for backend / agent development outside Docker)
+- **Go** 1.25+ (matches `backend/go.mod`; agent module uses the same toolchain)
 - **Node.js** 20+ and **npm** 10+ (for frontend development outside Docker)
 - **PostgreSQL** client tools (`psql`) optional but useful
 - A POSIX shell (Linux or macOS). Windows contributors should use WSL2.
@@ -20,10 +20,27 @@ The Windows agent is built with Go. Cross-compilation from Linux is supported.
 git clone https://github.com/kidcarmi/anchorix.git
 cd anchorix
 
-# Generates .env with a real ANCHORIX_SESSION_KEY.
-# Refuses to overwrite an existing .env (use --force if you really mean it).
+# 1. Generates .env with a real ANCHORIX_SESSION_KEY.
+#    Refuses to overwrite an existing .env (use --force if you really mean it).
 ./scripts/dev-env.sh
 
+# 2. Start the database first.
+docker compose up -d --build postgres
+
+# 3. Apply embedded migrations. `anchorix serve` refuses to start
+#    against a DB whose schema_migrations version does not match
+#    what the binary expects (CLAUDE.md §16, fail-closed schema).
+docker compose run --rm api migrate up
+
+# 4. Create the first operator. Anchorix ships **no default admin**
+#    and the CLI requires `--password`; it never prints the password
+#    back. Pass it via a shell variable so it stays out of history.
+read -srp 'Password: ' PW && echo
+docker compose run --rm -T api admin create \
+  --email alice@example.com --display-name "Alice" --password "$PW"
+unset PW
+
+# 5. Bring up the full stack (api + frontend).
 docker compose up --build
 ```
 
@@ -32,8 +49,9 @@ docker compose up --build
 > bootstrap script (or generate a key by hand) before `docker compose up`.
 > By hand: `openssl rand -base64 32` and paste into `.env`.
 
-After the database is up, create the first operator account — Anchorix
-ships **no default admin**. See [`docs/BOOTSTRAP.md`](./docs/BOOTSTRAP.md).
+See [`docs/BOOTSTRAP.md`](./docs/BOOTSTRAP.md) for the full first-operator
+flow, including the bootstrap-token (Option B) alternative for unattended
+deployments.
 
 Services exposed by Compose:
 
@@ -41,10 +59,13 @@ Services exposed by Compose:
 | -------------- | ------------------------------- | ------------------------ |
 | Frontend (UI)  | <http://localhost:5173>         | React dev server         |
 | Backend (API)  | <http://localhost:8080/api/v1>  | Go control plane         |
-| Health check   | <http://localhost:8080/healthz> | Liveness                 |
+| Liveness       | <http://localhost:8080/healthz> | Process is up            |
+| Readiness      | <http://localhost:8080/readyz>  | DB ping + registered probes |
 | PostgreSQL     | `localhost:5432`                | User/db from `.env`      |
 
-The first run initializes the database via the bundled migration runner.
+`/readyz` reports `{"status":"ready","checks":{"postgres":"ok"}}` once
+the postgres probe registered in `cmd/anchorix/serve.go` succeeds; it
+flips to 503 when the database is unreachable (CLAUDE.md §18).
 
 ## Running Components Individually
 
@@ -95,20 +116,40 @@ make clean         # remove build artifacts
 ## Running Tests
 
 ```bash
-# Backend
+# Backend unit tests (fast, offline)
 cd backend && go test ./...
 
 # Frontend
 cd frontend && npm test
 
-# Integration (requires running Postgres)
-cd backend && go test ./test/integration/...
+# Backend integration tests. Build-tagged `//go:build integration`, so the
+# default `go test ./...` skips them. Requires a running Postgres reachable
+# via DATABASE_URL. The `migrate` subcommand goes through `config.Load()`,
+# so ANCHORIX_SESSION_KEY must also be set — `.env` produced by
+# `./scripts/dev-env.sh` already contains both values.
+cd backend
+set -a; . ../.env; set +a   # export DATABASE_URL + ANCHORIX_SESSION_KEY from .env
+# Or set them explicitly if you don't have a .env yet:
+#   export DATABASE_URL='postgres://anchorix:change-me-locally@localhost:5432/anchorix?sslmode=disable'
+#   export ANCHORIX_SESSION_KEY="$(openssl rand -base64 32)"
+go run ./cmd/anchorix migrate up           # ensure schema is current
+go test -tags integration -count=1 ./test/integration/...
 ```
 
 The full tier model — unit / integration / frontend / smoke /
 Windows — is documented in
 [`docs/engineering/TESTING_STRATEGY.md`](./docs/engineering/TESTING_STRATEGY.md).
 Adding tests for a new behavior must reference that document.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `anchorix serve` exits with `schema check: ...` | DB schema version doesn't match the binary's expectation (CLAUDE.md §16, fail-closed). | Run `anchorix migrate up`. |
+| `/readyz` returns 503 with `postgres:"error..."` | DB is unreachable or restarting. | Check `docker compose ps postgres` and the container logs. |
+| `admin create: --password is required` | Auto-generate path was removed in PR-002. | Supply `--password` via your shell. The CLI never prints it back. |
+| `anchorix serve` fails on `ANCHORIX_SESSION_KEY` | Placeholder value in `.env`. | Re-run `./scripts/dev-env.sh` or paste `openssl rand -base64 32` into `.env`. |
+| Integration tests pass but unit `go test ./...` shows no integration runs | Integration tests live under build tag `integration`. | Add `-tags integration` and point `DATABASE_URL` at a live Postgres. |
 
 ## Database Migrations
 
