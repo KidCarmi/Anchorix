@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kidcarmi/anchorix/backend/internal/auth"
 	"github.com/kidcarmi/anchorix/backend/internal/config"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
 )
@@ -16,15 +18,34 @@ import (
 // testRouter wires a handler exactly the way Server does, but without
 // binding a TCP socket. Tests inject probes and exercise routes via
 // httptest.
+//
+// The auth.Service it constructs has a nil Repository / SessionStore —
+// fine for the existing /healthz, /readyz, envelope and 404 tests
+// which don't exercise auth. Tests that exercise the login flow live
+// in backend/test/integration/ and stand up real postgres.
 func testRouter(t *testing.T, register func(*Readiness)) http.Handler {
 	t.Helper()
-	cfg := &config.Config{Env: config.EnvDevelopment}
+	cfg := &config.Config{
+		Env:                     config.EnvDevelopment,
+		SessionCookieName:       "anchorix_session",
+		SessionIdleLifetime:     8 * 60 * 60_000_000_000,
+		SessionAbsoluteLifetime: 24 * 60 * 60_000_000_000,
+		BcryptCost:              10,
+	}
 	log := logger.New("error", config.EnvDevelopment)
 	r := NewReadiness()
 	if register != nil {
 		register(r)
 	}
-	return newRouter(cfg, log, r)
+	signer, err := auth.NewSignedCookie(bytes.Repeat([]byte("A"), 32))
+	if err != nil {
+		t.Fatalf("NewSignedCookie: %v", err)
+	}
+	deps := Dependencies{
+		AuthService:  &auth.Service{},
+		CookieSigner: signer,
+	}
+	return newRouter(cfg, log, r, deps)
 }
 
 func TestHealthzAlwaysOK(t *testing.T) {
@@ -124,12 +145,13 @@ func TestReadyzMixedProbesFailClosed(t *testing.T) {
 
 // TestNotImplementedRouteEnvelope guarantees the stable error response
 // shape that clients rely on:  { "error": { "code": ..., "message": ... } }.
-// Every handler that returns notImplemented must produce this shape; this
-// test catches regressions in the helper or the router wiring.
+// Every handler that still returns notImplemented must produce this
+// shape; this test catches regressions in the helper or the router
+// wiring. We exercise a still-stub route (GET /agents) so the test
+// stays valid as more handlers gain real implementations.
 func TestNotImplementedRouteEnvelope(t *testing.T) {
 	h := testRouter(t, nil)
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{}`))
-	req.Header.Set("Content-Type", "application/json")
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -150,6 +172,33 @@ func TestNotImplementedRouteEnvelope(t *testing.T) {
 	}
 	if body.Error.Message == "" {
 		t.Fatal("error.message must be non-empty")
+	}
+}
+
+// TestAuthLoginBadRequest exercises the new auth login handler's
+// input validation: an empty body must produce a bad_request envelope.
+// We do NOT exercise the success path here — that requires a real
+// postgres and lives in backend/test/integration/.
+func TestAuthLoginBadRequest(t *testing.T) {
+	h := testRouter(t, nil)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/auth/login", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	var body struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.NewDecoder(rec.Body).Decode(&body); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if body.Error.Code != "bad_request" {
+		t.Fatalf("error.code = %q, want bad_request", body.Error.Code)
 	}
 }
 

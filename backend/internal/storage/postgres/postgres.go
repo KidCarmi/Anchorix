@@ -1,30 +1,91 @@
-// Package postgres is the concrete storage implementation backed by
-// PostgreSQL. The pgx driver is the chosen client (added in Phase 1).
-//
-// All SQL lives here. Domain modules MUST NOT contain SQL. Queries use
-// parameter binding only; never string concatenation (CLAUDE.md §6.7).
 package postgres
 
 import (
 	"context"
 	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// DB is the placeholder for the pgx connection pool. Phase 1 replaces this
-// with a real *pgxpool.Pool. We keep the type defined now so dependent
-// packages can compile against the intended shape.
-type DB struct{}
-
-// Open returns an initialized DB. The signature is stable; the body lands
-// in Phase 1 with pgx wiring and migration runner integration.
-func Open(_ context.Context, _ string) (*DB, error) {
-	return nil, errors.New("postgres.Open not yet implemented (Phase 1)")
+// DB owns the pgx connection pool. Construct exactly one per process
+// in the composition root (cmd/anchorix). Repository types take a
+// *DB by reference and use its accessor methods; they do not
+// construct their own pool.
+type DB struct {
+	pool *pgxpool.Pool
 }
 
-// Close releases connection pool resources. Always safe to call.
-func (db *DB) Close() {}
+// Open establishes the pool against the given DATABASE_URL.
+// The caller is responsible for Close.
+//
+// Open honors ctx so callers can bound startup time. Individual
+// query timeouts are set at the call site (CLAUDE.md §8.11).
+func Open(ctx context.Context, databaseURL string) (*DB, error) {
+	if databaseURL == "" {
+		return nil, errors.New("postgres: empty DATABASE_URL")
+	}
+	cfg, err := pgxpool.ParseConfig(databaseURL)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: parse DATABASE_URL: %w", err)
+	}
+	// Conservative pool defaults — production tuning lands later.
+	cfg.MaxConns = 10
+	cfg.MinConns = 1
+	cfg.MaxConnLifetime = 30 * time.Minute
+	cfg.MaxConnIdleTime = 5 * time.Minute
+	cfg.HealthCheckPeriod = 30 * time.Second
 
-// Ping verifies database connectivity. Used by /readyz.
-func (db *DB) Ping(_ context.Context) error {
-	return errors.New("postgres.Ping not yet implemented (Phase 1)")
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: new pool: %w", err)
+	}
+	return &DB{pool: pool}, nil
+}
+
+// Close releases pool resources. Safe to call from graceful-shutdown.
+func (db *DB) Close() {
+	if db == nil || db.pool == nil {
+		return
+	}
+	db.pool.Close()
+}
+
+// Ping verifies database connectivity. Used by the /readyz probe
+// registered in cmd/anchorix.
+func (db *DB) Ping(ctx context.Context) error {
+	if db == nil || db.pool == nil {
+		return errors.New("postgres: pool not initialized")
+	}
+	return db.pool.Ping(ctx)
+}
+
+// pool exposes the underlying *pgxpool.Pool to sibling repository
+// files in this package only (unexported).
+func (db *DB) querier() *pgxpool.Pool { return db.pool }
+
+// WithTx runs fn inside a single transaction. Commits on nil return;
+// rolls back on any error or panic. CLAUDE.md §18: ctx is always
+// honored; non-nil returns from fn never leave a dangling tx.
+func (db *DB) WithTx(ctx context.Context, fn func(pgx.Tx) error) error {
+	tx, err := db.pool.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("postgres: begin tx: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres: commit: %w", err)
+	}
+	committed = true
+	return nil
 }

@@ -12,14 +12,24 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/kidcarmi/anchorix/backend/internal/auth"
 	"github.com/kidcarmi/anchorix/backend/internal/config"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
 )
+
+// Dependencies bundles the runtime dependencies the HTTP layer needs.
+// The composition root in cmd/anchorix constructs one of these and
+// passes it to NewServer (CLAUDE.md §8.8 constructor DI).
+type Dependencies struct {
+	AuthService  *auth.Service
+	CookieSigner *auth.SignedCookie
+}
 
 // Server owns the HTTP listener and graceful shutdown lifecycle.
 type Server struct {
 	cfg       *config.Config
 	log       *logger.Logger
+	deps      Dependencies
 	srv       *http.Server
 	readiness *Readiness
 }
@@ -30,15 +40,18 @@ type Server struct {
 // returned server's Readiness() before invoking Run, so that probes
 // reflecting real runtime dependencies (e.g. a database ping) are in
 // place from the first request /readyz serves.
-func NewServer(cfg *config.Config, log *logger.Logger) (*Server, error) {
+func NewServer(cfg *config.Config, log *logger.Logger, deps Dependencies) (*Server, error) {
 	if cfg == nil {
 		return nil, errors.New("nil config")
 	}
 	if log == nil {
 		return nil, errors.New("nil logger")
 	}
+	if deps.AuthService == nil || deps.CookieSigner == nil {
+		return nil, errors.New("httpapi: incomplete Dependencies (AuthService + CookieSigner required)")
+	}
 	readiness := NewReadiness()
-	router := newRouter(cfg, log, readiness)
+	router := newRouter(cfg, log, readiness, deps)
 	srv := &http.Server{
 		Addr:              cfg.HTTPAddr,
 		Handler:           router,
@@ -47,12 +60,17 @@ func NewServer(cfg *config.Config, log *logger.Logger) (*Server, error) {
 		WriteTimeout:      30 * time.Second,
 		IdleTimeout:       60 * time.Second,
 	}
-	return &Server{cfg: cfg, log: log, srv: srv, readiness: readiness}, nil
+	return &Server{cfg: cfg, log: log, deps: deps, srv: srv, readiness: readiness}, nil
 }
 
 // Readiness exposes the server's probe registry so the composition root
 // can register dependency probes before Run is called.
 func (s *Server) Readiness() *Readiness { return s.readiness }
+
+// Handler returns the assembled HTTP handler. Used by integration
+// tests that drive the server via httptest without binding a port.
+// Not part of any production code path.
+func (s *Server) Handler() http.Handler { return s.srv.Handler }
 
 // Run starts listening and blocks until the context is cancelled.
 // On cancellation it performs a graceful shutdown with a fixed timeout.
