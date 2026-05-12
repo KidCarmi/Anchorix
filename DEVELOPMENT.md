@@ -95,6 +95,17 @@ Started flow: the SPA boots into the sign-in screen, posts to
 cookie is HttpOnly + server-issued — nothing in the frontend reads
 or stores it.
 
+Click **Sign out** in the sidebar to revoke the session: the
+frontend posts to `/api/v1/auth/logout`, evicts authenticated
+page-level cache data, refetches `/api/v1/auth/me` (which now
+returns 401), and renders the sign-in screen again. If you have
+the SPA open in multiple tabs, signing out (or in) in one tab is
+broadcast over `BroadcastChannel("anchorix-session")` and the
+other tabs flip on the next event-loop tick. The end-to-end auth
+contract — including the global 401 handler that catches expired
+sessions mid-navigation — is documented in
+[`docs/engineering/AUTH_FOUNDATION.md`](./docs/engineering/AUTH_FOUNDATION.md).
+
 ### Windows Agent
 
 ```bash
