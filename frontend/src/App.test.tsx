@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 
 import { App } from "./App";
 import { api, type User } from "./lib/api";
@@ -422,5 +422,329 @@ describe("global 401 handler (H-003)", () => {
     await waitFor(() => {
       expect(meCallCount).toBeLessThanOrEqual(2);
     });
+  });
+});
+
+// renderAppTab renders an independent <App> instance into its own
+// container under document.body, with its own QueryClient. Two
+// instances in one test model two browser tabs sharing the same
+// origin: their BroadcastChannel instances communicate, their
+// fetches share the global fetch mock, and their DOM is queryable
+// via within(container).
+function renderAppTab() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const utils = render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={["/"]}>
+        <App />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+  return { ...utils, queryClient };
+}
+
+describe("cross-tab session sync (H-004)", () => {
+  it("propagates logout to other tabs", async () => {
+    // Both tabs start authenticated. Tab A signs out; tab B
+    // receives the BroadcastChannel "logout" event, invalidates
+    // its session, and AuthGate flips to LoginPage on the next
+    // /me refetch (which now returns 401 because the server-side
+    // `loggedIn` flag is false).
+    //
+    // We assert tab B's state — the cross-tab guarantee. Tab A's
+    // own state is exercised by the PR-008 / PR-009 logout tests
+    // and is not the contract this test is here to prove.
+    let loggedIn = true;
+    fetchRouter({
+      "GET /api/v1/auth/me": async () =>
+        loggedIn
+          ? jsonResponse(sampleUser)
+          : jsonResponse(
+              { error: { code: "unauthorized", message: "" } },
+              401,
+            ),
+      "POST /api/v1/auth/logout": async () => {
+        loggedIn = false;
+        return new Response(null, { status: 204 });
+      },
+    });
+
+    const tabA = renderAppTab();
+    const tabB = renderAppTab();
+    const inA = within(tabA.container);
+    const inB = within(tabB.container);
+
+    // Both tabs reach AppShell.
+    await inA.findByRole("link", { name: /dashboard/i });
+    await inB.findByRole("link", { name: /dashboard/i });
+
+    // Sign out in tab A.
+    fireEvent.click(inA.getByRole("button", { name: /sign out/i }));
+
+    // Tab B receives the broadcast, invalidates, refetches /me,
+    // sees 401, and flips to LoginPage.
+    expect(
+      await inB.findByRole("heading", { name: /sign in to anchorix/i }),
+    ).toBeInTheDocument();
+    expect(
+      inB.queryByRole("link", { name: /dashboard/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("propagates login to other tabs", async () => {
+    // Both tabs start anonymous. Tab A submits valid credentials;
+    // POST /login flips `loggedIn` and returns the user. Tab B
+    // receives the "login" BroadcastChannel event, invalidates its
+    // session, and AuthGate flips to AppShell on the refetch.
+    let loggedIn = false;
+    fetchRouter({
+      "GET /api/v1/auth/me": async () =>
+        loggedIn
+          ? jsonResponse(sampleUser)
+          : jsonResponse(
+              { error: { code: "unauthorized", message: "" } },
+              401,
+            ),
+      "POST /api/v1/auth/login": async () => {
+        loggedIn = true;
+        return jsonResponse(sampleUser);
+      },
+    });
+
+    const tabA = renderAppTab();
+    const tabB = renderAppTab();
+    const inA = within(tabA.container);
+    const inB = within(tabB.container);
+
+    // Both tabs start on LoginPage.
+    await inA.findByRole("heading", { name: /sign in to anchorix/i });
+    await inB.findByRole("heading", { name: /sign in to anchorix/i });
+
+    // Sign in via tab A.
+    fireEvent.change(inA.getByLabelText(/email/i), {
+      target: { value: "alice@example.com" },
+    });
+    fireEvent.change(inA.getByLabelText(/password/i), {
+      target: { value: "correct horse" },
+    });
+    fireEvent.click(inA.getByRole("button", { name: /sign in/i }));
+
+    // Tab B receives "login", invalidates, refetches /me, gets a
+    // user, and renders AppShell.
+    expect(
+      await inB.findByRole("link", { name: /dashboard/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("broadcasts only the event type — no user, email, role, or session value", async () => {
+    // CLAUDE.md §6.9: secrets and identifying material must not
+    // leave the application boundary. The cross-tab channel is one
+    // such boundary. This test spies on every BroadcastChannel
+    // postMessage call made during a login + sign-out flow and
+    // asserts every payload is a primitive "login"/"logout" string
+    // with none of the forbidden substrings present in its JSON
+    // representation.
+    const postSpy = vi.spyOn(BroadcastChannel.prototype, "postMessage");
+
+    let loggedIn = false;
+    fetchRouter({
+      "GET /api/v1/auth/me": async () =>
+        loggedIn
+          ? jsonResponse(sampleUser)
+          : jsonResponse(
+              { error: { code: "unauthorized", message: "" } },
+              401,
+            ),
+      "POST /api/v1/auth/login": async () => {
+        loggedIn = true;
+        return jsonResponse(sampleUser);
+      },
+      "POST /api/v1/auth/logout": async () => {
+        loggedIn = false;
+        return new Response(null, { status: 204 });
+      },
+    });
+
+    renderApp();
+    await screen.findByRole("heading", { name: /sign in to anchorix/i });
+
+    // Login (publishes "login").
+    fireEvent.change(screen.getByLabelText(/email/i), {
+      target: { value: sampleUser.email },
+    });
+    fireEvent.change(screen.getByLabelText(/password/i), {
+      target: { value: "correct horse" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /sign in/i }));
+    await screen.findByRole("link", { name: /dashboard/i });
+
+    // Trigger logout (publishes "logout"). We do NOT assert the
+    // tab's own gate flips here — the publish happens in
+    // useLogout.onSettled regardless. waitFor watches for the spy
+    // to have captured both payloads.
+    fireEvent.click(screen.getByRole("button", { name: /sign out/i }));
+    await waitFor(() => {
+      const payloads = postSpy.mock.calls.map((c) => c[0]);
+      expect(payloads).toContain("logout");
+    });
+
+    const payloads = postSpy.mock.calls.map((c) => c[0]);
+    expect(payloads).toContain("login");
+    expect(payloads).toContain("logout");
+
+    const forbiddenSubstrings = [
+      sampleUser.id,
+      sampleUser.email,
+      sampleUser.organization_id,
+      sampleUser.display_name,
+      sampleUser.role,
+      "password",
+      "session",
+      "cookie",
+      "token",
+      "secret",
+      "authorization",
+    ];
+    for (const payload of payloads) {
+      // All payloads must be the bare event-type string.
+      expect(typeof payload).toBe("string");
+      expect(["login", "logout"]).toContain(payload as string);
+      const serialized = JSON.stringify(payload).toLowerCase();
+      for (const forbidden of forbiddenSubstrings) {
+        expect(serialized).not.toContain(forbidden.toLowerCase());
+      }
+    }
+
+    postSpy.mockRestore();
+  });
+});
+
+// renderAppWithClient is renderApp + access to the QueryClient. Used
+// by the cache-cleanup test to inspect cache state directly. The
+// rest of the suite uses renderApp / renderAppTab because they
+// don't need cache-level introspection.
+function renderAppWithClient() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const utils = render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={["/"]}>
+        <App />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+  return { ...utils, queryClient };
+}
+
+describe("logout determinism (H-004 fix)", () => {
+  it("logging-out tab returns to LoginPage on /logout 204", async () => {
+    // Server-side state: loggedIn=true initially; POST /logout flips
+    // it to false and returns 204. /me reads the flag, so the next
+    // /me after sign-out returns 401. The fix in useLogout
+    // (refetchQueries instead of clear+invalidate) makes the gate
+    // flip on the same tick that the mutation settles.
+    let loggedIn = true;
+    fetchRouter({
+      "GET /api/v1/auth/me": async () =>
+        loggedIn
+          ? jsonResponse(sampleUser)
+          : jsonResponse(
+              { error: { code: "unauthorized", message: "" } },
+              401,
+            ),
+      "POST /api/v1/auth/logout": async () => {
+        loggedIn = false;
+        return new Response(null, { status: 204 });
+      },
+    });
+    renderApp();
+
+    await screen.findByRole("link", { name: /dashboard/i });
+    fireEvent.click(screen.getByRole("button", { name: /sign out/i }));
+
+    expect(
+      await screen.findByRole("heading", { name: /sign in to anchorix/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: /dashboard/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("logging-out tab returns to LoginPage even when /logout returns 500", async () => {
+    // The frontend treats the mutation as settled regardless of
+    // outcome. Whatever the server reports on the next /me is the
+    // authoritative answer. If the server actually revoked the
+    // session despite responding 500, /me returns 401 and the gate
+    // flips. This test models that case via a meCallCount-based /me
+    // mock that surfaces 401 from the second call onward.
+    let meCallCount = 0;
+    fetchRouter({
+      "GET /api/v1/auth/me": async () => {
+        meCallCount += 1;
+        if (meCallCount === 1) return jsonResponse(sampleUser);
+        return jsonResponse(
+          { error: { code: "unauthorized", message: "" } },
+          401,
+        );
+      },
+      "POST /api/v1/auth/logout": async () =>
+        jsonResponse(
+          { error: { code: "internal_error", message: "boom" } },
+          500,
+        ),
+    });
+    renderApp();
+
+    await screen.findByRole("link", { name: /dashboard/i });
+    fireEvent.click(screen.getByRole("button", { name: /sign out/i }));
+
+    expect(
+      await screen.findByRole("heading", { name: /sign in to anchorix/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: /dashboard/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("removes page-level cached queries on logout but keeps the session observer working", async () => {
+    // The cache cleanup in useLogout MUST drop authenticated
+    // page-level data (so the next operator doesn't inherit it)
+    // while preserving the session query observer's subscription
+    // (so the gate can still react to the post-logout /me 401).
+    let loggedIn = true;
+    fetchRouter({
+      "GET /api/v1/auth/me": async () =>
+        loggedIn
+          ? jsonResponse(sampleUser)
+          : jsonResponse(
+              { error: { code: "unauthorized", message: "" } },
+              401,
+            ),
+      "POST /api/v1/auth/logout": async () => {
+        loggedIn = false;
+        return new Response(null, { status: 204 });
+      },
+    });
+
+    const { queryClient } = renderAppWithClient();
+    await screen.findByRole("link", { name: /dashboard/i });
+
+    // Prime a non-session query as if a page had fetched data.
+    queryClient.setQueryData(["agents", "list"], [{ id: "agent-1" }]);
+    expect(queryClient.getQueryData(["agents", "list"])).toEqual([
+      { id: "agent-1" },
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: /sign out/i }));
+
+    // The gate flipped — proves the session observer is still wired
+    // up after the cache cleanup ran.
+    await screen.findByRole("heading", { name: /sign in to anchorix/i });
+
+    // Page-level data is gone.
+    expect(queryClient.getQueryData(["agents", "list"])).toBeUndefined();
   });
 });

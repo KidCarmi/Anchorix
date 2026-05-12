@@ -2,7 +2,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 
 import { AppShell } from "./components/AppShell";
 import { AuthGate } from "./components/AuthGate";
-import { useGlobalUnauthorizedHandler } from "./lib/session";
+import { useCrossTabSessionSync, useGlobalUnauthorizedHandler } from "./lib/session";
 import { AgentsPage } from "./pages/AgentsPage";
 import { AuditPage } from "./pages/AuditPage";
 import { CertificatesPage } from "./pages/CertificatesPage";
@@ -22,8 +22,14 @@ import { ProvidersPage } from "./pages/ProvidersPage";
 // QueryClient (H-003). Component code never implements its own 401
 // handling — when any non-/me request returns 401, the session
 // query is invalidated and AuthGate flips automatically.
+//
+// App also subscribes the tree to cross-tab session events (H-004):
+// when another tab logs in or out, this tab invalidates its session
+// query and flips on the next /me round trip without waiting for
+// its next page-level API call.
 export function App() {
   useGlobalUnauthorizedHandler();
+  useCrossTabSessionSync();
   return (
     <AuthGate>
       <Routes>

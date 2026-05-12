@@ -2,7 +2,7 @@ import { useState, type FormEvent } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 
 import { ApiError, api } from "../lib/api";
-import { sessionQueryKey } from "../lib/session";
+import { publishSessionEvent, sessionQueryKey } from "../lib/session";
 
 // Backend returns `invalid_credentials` for every failed-login mode
 // (no user / wrong password / disabled user). The UI mirrors that
@@ -31,7 +31,10 @@ export function LoginPage() {
     onSuccess: async () => {
       // The auth cookie is now set HttpOnly by the server. Force the
       // session query to refetch so AuthGate flips to the AppShell.
+      // Also notify other tabs (H-004) so a tab sitting on LoginPage
+      // can transition without waiting for its next /me probe.
       await queryClient.invalidateQueries({ queryKey: sessionQueryKey });
+      publishSessionEvent("login");
     },
     onError: (err: unknown) => {
       if (err instanceof ApiError) {
