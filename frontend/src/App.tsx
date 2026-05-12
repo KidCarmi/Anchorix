@@ -2,6 +2,7 @@ import { Navigate, Route, Routes } from "react-router-dom";
 
 import { AppShell } from "./components/AppShell";
 import { AuthGate } from "./components/AuthGate";
+import { useGlobalUnauthorizedHandler } from "./lib/session";
 import { AgentsPage } from "./pages/AgentsPage";
 import { AuditPage } from "./pages/AuditPage";
 import { CertificatesPage } from "./pages/CertificatesPage";
@@ -16,7 +17,13 @@ import { ProvidersPage } from "./pages/ProvidersPage";
 // signed-in operator can't accidentally land on a duplicate login
 // form, and a signed-out operator can't accidentally see protected
 // content even if they paste a deep link.
+//
+// App also wires the api.ts global 401 dispatcher to this tree's
+// QueryClient (H-003). Component code never implements its own 401
+// handling — when any non-/me request returns 401, the session
+// query is invalidated and AuthGate flips automatically.
 export function App() {
+  useGlobalUnauthorizedHandler();
   return (
     <AuthGate>
       <Routes>

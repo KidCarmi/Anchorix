@@ -4,7 +4,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { App } from "./App";
-import type { User } from "./lib/api";
+import { api, type User } from "./lib/api";
 
 afterEach(() => {
   vi.unstubAllGlobals();
@@ -288,5 +288,84 @@ describe("App auth flow", () => {
     expect(
       await screen.findByRole("heading", { name: /sign in to anchorix/i }),
     ).toBeInTheDocument();
+  });
+});
+
+describe("global 401 handler (H-003)", () => {
+  it("returns the operator to LoginPage when a non-/me request returns 401", async () => {
+    // Authenticated session, then a page-level API call returns 401
+    // (server-side session expired mid-navigation). The global
+    // handler must invalidate the session query, and the next /me
+    // refetch must surface the 401 so AuthGate flips to LoginPage.
+    let meCallCount = 0;
+    fetchRouter({
+      "GET /api/v1/auth/me": async () => {
+        meCallCount += 1;
+        if (meCallCount === 1) return jsonResponse(sampleUser);
+        // After the page call's 401 fires the handler and
+        // invalidates /me, the refetch returns the expired-session
+        // 401 the server would actually emit.
+        return jsonResponse(
+          { error: { code: "session_expired", message: "" } },
+          401,
+        );
+      },
+      "GET /api/v1/agents": async () =>
+        jsonResponse(
+          { error: { code: "session_expired", message: "" } },
+          401,
+        ),
+    });
+
+    renderApp();
+
+    // Wait until AppShell is mounted (operator is authenticated).
+    await screen.findByRole("link", { name: /dashboard/i });
+
+    // Trigger a page-level API call directly. Components are not
+    // required to implement their own 401 handling — invoking the
+    // typed API client surfaces the 401 path used everywhere.
+    await expect(api.listAgents()).rejects.toThrow();
+
+    // AuthGate flips to LoginPage after the session refetch.
+    expect(
+      await screen.findByRole("heading", { name: /sign in to anchorix/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: /dashboard/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not loop /me when /me itself returns 401", async () => {
+    // The /auth/me exemption inside api.ts is what makes the gate's
+    // own probe safe. Without the exemption, /me 401 would fire the
+    // handler, which would invalidate /me, which would refetch /me,
+    // which would 401 again — infinite loop. This test proves the
+    // exemption holds: /me is called a small, bounded number of
+    // times even though every call returns 401.
+    let meCallCount = 0;
+    fetchRouter({
+      "GET /api/v1/auth/me": async () => {
+        meCallCount += 1;
+        return jsonResponse(
+          { error: { code: "unauthorized", message: "" } },
+          401,
+        );
+      },
+    });
+
+    renderApp();
+
+    // LoginPage must render — proves the gate handled the 401
+    // without hanging on an invalidation loop.
+    await screen.findByRole("heading", { name: /sign in to anchorix/i });
+
+    // A short stability wait so a runaway loop has time to surface
+    // as a call-count explosion before we assert. waitFor's default
+    // timeout (~1s) is the upper bound; a real loop would push
+    // meCallCount into the hundreds.
+    await waitFor(() => {
+      expect(meCallCount).toBeLessThanOrEqual(2);
+    });
   });
 });
