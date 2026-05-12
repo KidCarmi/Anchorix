@@ -53,9 +53,10 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
   next `/me` refetch (mount, invalidate, or window focus — the
   PR-009 focus refetch will catch it the moment they switch tabs).
   Conversely, signing in on tab A leaves tab B on LoginPage until it
-  is brought to the foreground. No incorrect data is shown — tab B's
-  AppShell is mounted but every API call will fail with 401 — but
-  the UX is jarring.
+  is brought to the foreground. No new API access is granted —
+  subsequent API calls fail with 401 — but another tab may continue
+  showing stale cached UI until the session query is invalidated.
+  The UX is jarring; the security boundary is intact.
 - **Scope:** small. Add a `BroadcastChannel("anchorix-session")` (or
   `storage` event fallback) to `src/lib/session.ts`. On
   `useLogout.onSettled` post a `"logout"` message; on
