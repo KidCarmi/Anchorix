@@ -336,6 +336,61 @@ describe("global 401 handler (H-003)", () => {
     ).not.toBeInTheDocument();
   });
 
+  it("does not invalidate the session or refetch /me on /auth/login 401", async () => {
+    // /auth/login is the deterministic invalid-credentials path —
+    // not an expired session. The global handler must NOT fire for
+    // login 401s, so the gate's /me state stays exactly where it
+    // was (anonymous, one initial probe). Without the /auth/login
+    // exemption, every failed login attempt would force an extra
+    // /me refetch — wasted work and the wrong UX framing.
+    let meCallCount = 0;
+    let loginCallCount = 0;
+    fetchRouter({
+      "GET /api/v1/auth/me": async () => {
+        meCallCount += 1;
+        return jsonResponse(
+          { error: { code: "unauthorized", message: "" } },
+          401,
+        );
+      },
+      "POST /api/v1/auth/login": async () => {
+        loginCallCount += 1;
+        return jsonResponse(
+          { error: { code: "invalid_credentials", message: "wrong" } },
+          401,
+        );
+      },
+    });
+
+    renderApp();
+
+    // Initial gate probe runs once.
+    await screen.findByRole("heading", { name: /sign in to anchorix/i });
+    const initialMeCallCount = meCallCount;
+
+    fireEvent.change(screen.getByLabelText(/email/i), {
+      target: { value: "alice@example.com" },
+    });
+    fireEvent.change(screen.getByLabelText(/password/i), {
+      target: { value: "wrong" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /sign in/i }));
+
+    // Safe invalid-credentials message is shown. Backend "wrong"
+    // text must not reach the operator.
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent(/invalid email or password\./i);
+    expect(alert).not.toHaveTextContent(/wrong/i);
+    expect(loginCallCount).toBe(1);
+
+    // The login 401 must NOT have invalidated the session or
+    // triggered an extra /me refetch. A short stability wait lets
+    // any spurious refetch settle before we assert.
+    await waitFor(() => {
+      expect(meCallCount).toBe(initialMeCallCount);
+    });
+  });
+
   it("does not loop /me when /me itself returns 401", async () => {
     // The /auth/me exemption inside api.ts is what makes the gate's
     // own probe safe. Without the exemption, /me 401 would fire the

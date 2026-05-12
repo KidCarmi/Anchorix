@@ -20,14 +20,25 @@ export class ApiError extends Error {
 type UnauthorizedHandler = (path: string) => void;
 
 // unauthorizedExemptPaths lists request paths whose 401 must NOT
-// trigger the global handler. /auth/me is the gate's own probe —
-// invalidating the session query in response to its 401 would create
-// an infinite invalidate → refetch → 401 → invalidate loop.
+// trigger the global handler.
+//
+//   - /auth/me is the gate's own probe; invalidating the session
+//     query in response to its 401 would loop:
+//     invalidate → refetch → 401 → invalidate.
+//   - /auth/login's 401 is the deterministic "invalid credentials"
+//     path, not an expired/revoked session. The login form already
+//     surfaces the safe canonical message; forcing an extra /me
+//     refetch from here would be wasted work, and the
+//     "expired session" UX path is the wrong one for "you typed
+//     the wrong password".
 //
 // Everything else (page-level data, future state-changing endpoints)
 // uses the handler so an expired or revoked session surfaces in the
 // gate within one /me round trip.
-const unauthorizedExemptPaths: ReadonlySet<string> = new Set(["/auth/me"]);
+const unauthorizedExemptPaths: ReadonlySet<string> = new Set([
+  "/auth/me",
+  "/auth/login",
+]);
 
 // Single-slot registry. The composition root (src/lib/session.ts
 // via useGlobalUnauthorizedHandler) sets this exactly once. We
