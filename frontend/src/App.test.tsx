@@ -69,6 +69,43 @@ function renderApp() {
 }
 
 describe("App auth flow", () => {
+  it("renders the LoadingSplash status region while /me is in flight", async () => {
+    // Hold /me open: while the request is pending, AuthGate must
+    // show its loading state — never AppShell, never LoginPage —
+    // so protected content cannot flash for users with an invalid
+    // cookie.
+    let resolveMe!: (r: Response) => void;
+    fetchRouter({
+      "GET /api/v1/auth/me": () =>
+        new Promise<Response>((r) => {
+          resolveMe = r;
+        }),
+    });
+
+    renderApp();
+
+    const loading = await screen.findByRole("status", {
+      name: /checking session/i,
+    });
+    expect(loading).toBeInTheDocument();
+    expect(
+      screen.queryByRole("heading", { name: /sign in to anchorix/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: /dashboard/i }),
+    ).not.toBeInTheDocument();
+
+    // Resolve to a 401 so the loading state cleanly transitions and
+    // we don't leak an unresolved promise into the next test.
+    resolveMe(
+      jsonResponse(
+        { error: { code: "unauthorized", message: "" } },
+        401,
+      ),
+    );
+    await screen.findByRole("heading", { name: /sign in to anchorix/i });
+  });
+
   it("keeps the user on the login page when /me returns 401", async () => {
     fetchRouter({
       "GET /api/v1/auth/me": async () =>
@@ -124,6 +161,98 @@ describe("App auth flow", () => {
     ).toBeInTheDocument();
     expect(screen.getByText(/alice/i)).toBeInTheDocument();
     // The sign-in form is gone.
+    expect(
+      screen.queryByRole("heading", { name: /sign in to anchorix/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("returns the user to the login page even when /logout returns 500", async () => {
+    // CLAUDE.md §6 + the useLogout onSettled design: even if the
+    // server rejects the logout call, the frontend must still drop
+    // every cached query and re-probe /me. The next /me reflects
+    // whatever the server says — including that the cookie is now
+    // gone — and AuthGate flips to LoginPage.
+    let meCallCount = 0;
+    fetchRouter({
+      "GET /api/v1/auth/me": async () => {
+        meCallCount += 1;
+        if (meCallCount === 1) return jsonResponse(sampleUser);
+        return jsonResponse(
+          { error: { code: "unauthorized", message: "" } },
+          401,
+        );
+      },
+      "POST /api/v1/auth/logout": async () =>
+        jsonResponse(
+          { error: { code: "internal_error", message: "boom" } },
+          500,
+        ),
+    });
+
+    renderApp();
+    await screen.findByRole("link", { name: /dashboard/i });
+
+    fireEvent.click(screen.getByRole("button", { name: /sign out/i }));
+
+    expect(
+      await screen.findByRole("heading", { name: /sign in to anchorix/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: /dashboard/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("preserves the deep-link target across the auth gate", async () => {
+    // Anonymous user lands on /agents → AuthGate renders LoginPage;
+    // the URL is left alone. After a successful login the gate
+    // flips and the same /agents route now resolves inside
+    // AppShell — proving the deep-link target survived the
+    // intermediate login screen.
+    let meCallCount = 0;
+    fetchRouter({
+      "GET /api/v1/auth/me": async () => {
+        meCallCount += 1;
+        if (meCallCount === 1) {
+          return jsonResponse(
+            { error: { code: "unauthorized", message: "" } },
+            401,
+          );
+        }
+        return jsonResponse(sampleUser);
+      },
+      "POST /api/v1/auth/login": async () => jsonResponse(sampleUser),
+    });
+
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+    });
+    render(
+      <QueryClientProvider client={queryClient}>
+        <MemoryRouter initialEntries={["/agents"]}>
+          <App />
+        </MemoryRouter>
+      </QueryClientProvider>,
+    );
+
+    // Anonymous: login form is the only thing rendered.
+    await screen.findByRole("heading", { name: /sign in to anchorix/i });
+    expect(
+      screen.queryByRole("link", { name: /agents/i }),
+    ).not.toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText(/email/i), {
+      target: { value: "alice@example.com" },
+    });
+    fireEvent.change(screen.getByLabelText(/password/i), {
+      target: { value: "pw" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: /sign in/i }));
+
+    // After login, the gate flips and the URL we started on
+    // (/agents) renders inside AppShell. The sidebar's "Agents" link
+    // marks the route as active, and the form is gone.
+    const agentsLink = await screen.findByRole("link", { name: /agents/i });
+    expect(agentsLink).toHaveAttribute("aria-current", "page");
     expect(
       screen.queryByRole("heading", { name: /sign in to anchorix/i }),
     ).not.toBeInTheDocument();

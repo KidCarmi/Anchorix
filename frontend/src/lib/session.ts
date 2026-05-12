@@ -38,6 +38,13 @@ export function useSession(): UseQueryResult<User, ApiError> {
     // the cookie was revoked server-side.
     staleTime: 0,
     gcTime: 0,
+    // Re-probe /me when the user returns to the tab. If the cookie
+    // expired server-side (sliding-session idle timeout, server-side
+    // revocation, operator restart), the next focus surfaces it and
+    // the gate flips to LoginPage. Overrides the global
+    // refetchOnWindowFocus:false in main.tsx for the session query
+    // only — page-level data queries keep the cheaper default.
+    refetchOnWindowFocus: true,
   });
 }
 
