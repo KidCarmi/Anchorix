@@ -13,6 +13,48 @@ export class ApiError extends Error {
   }
 }
 
+// UnauthorizedHandler is invoked once per 401 response from any
+// non-exempt endpoint, BEFORE the ApiError is thrown to the caller.
+// The session layer wires a handler that invalidates the session
+// query; AuthGate then flips to LoginPage on the next /me refetch.
+type UnauthorizedHandler = (path: string) => void;
+
+// unauthorizedExemptPaths lists request paths whose 401 must NOT
+// trigger the global handler.
+//
+//   - /auth/me is the gate's own probe; invalidating the session
+//     query in response to its 401 would loop:
+//     invalidate → refetch → 401 → invalidate.
+//   - /auth/login's 401 is the deterministic "invalid credentials"
+//     path, not an expired/revoked session. The login form already
+//     surfaces the safe canonical message; forcing an extra /me
+//     refetch from here would be wasted work, and the
+//     "expired session" UX path is the wrong one for "you typed
+//     the wrong password".
+//
+// Everything else (page-level data, future state-changing endpoints)
+// uses the handler so an expired or revoked session surfaces in the
+// gate within one /me round trip.
+const unauthorizedExemptPaths: ReadonlySet<string> = new Set([
+  "/auth/me",
+  "/auth/login",
+]);
+
+// Single-slot registry. The composition root (src/lib/session.ts
+// via useGlobalUnauthorizedHandler) sets this exactly once. We
+// deliberately use a module-level slot rather than an event bus or
+// pub/sub: there is exactly one consumer (the session layer), and
+// exposing a list of subscribers would invite scope creep
+// (CLAUDE.md §8.5 anti-patterns).
+let unauthorizedHandler: UnauthorizedHandler | null = null;
+
+// registerUnauthorizedHandler installs the global 401 callback.
+// Pass null to clear (used by test cleanup). Last writer wins —
+// re-registering replaces the previous handler.
+export function registerUnauthorizedHandler(handler: UnauthorizedHandler | null): void {
+  unauthorizedHandler = handler;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${baseURL}${path}`, {
     ...init,
@@ -24,6 +66,14 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
 
   if (!res.ok) {
+    // Dispatch the global 401 callback BEFORE reading the body so a
+    // handler that triggers a session refetch can race the response
+    // body parse without affecting either path. The handler is
+    // called at most once per response and never for /auth/me, which
+    // is the gate's own probe and would loop on its own 401.
+    if (res.status === 401 && unauthorizedHandler && !unauthorizedExemptPaths.has(path)) {
+      unauthorizedHandler(path);
+    }
     let code: string | undefined;
     let message = res.statusText;
     try {

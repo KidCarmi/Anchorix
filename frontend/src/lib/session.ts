@@ -8,10 +8,11 @@
 //
 // CLAUDE.md §6 + §8.3: source of truth is the server session.
 
+import { useEffect } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { UseQueryResult } from "@tanstack/react-query";
 
-import { ApiError, api, type User } from "./api";
+import { ApiError, api, registerUnauthorizedHandler, type User } from "./api";
 
 // sessionQueryKey is a constant so tests, hooks, and the AuthGate all
 // agree on which cache slot represents the current operator. A typo
@@ -46,6 +47,27 @@ export function useSession(): UseQueryResult<User, ApiError> {
     // only — page-level data queries keep the cheaper default.
     refetchOnWindowFocus: true,
   });
+}
+
+// useGlobalUnauthorizedHandler installs the api.ts 401 dispatcher
+// onto this React tree's QueryClient. Mounted once at the
+// composition root (App), it makes "any non-/me API call returning
+// 401" invalidate the session query, which causes AuthGate to flip
+// to LoginPage on the next /me round trip.
+//
+// The /auth/me exemption lives inside api.ts; the handler itself
+// just needs to invalidate. Loop avoidance is by construction: a
+// /me 401 cannot fire this handler, so the handler cannot recurse.
+export function useGlobalUnauthorizedHandler(): void {
+  const queryClient = useQueryClient();
+  useEffect(() => {
+    registerUnauthorizedHandler(() => {
+      void queryClient.invalidateQueries({ queryKey: sessionQueryKey });
+    });
+    return () => {
+      registerUnauthorizedHandler(null);
+    };
+  }, [queryClient]);
 }
 
 // useLogout is a mutation so callers get a stable, typed handle. On
