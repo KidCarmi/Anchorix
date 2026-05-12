@@ -1,5 +1,7 @@
 import { NavLink, Outlet } from "react-router-dom";
 
+import { useLogout, useSession } from "../lib/session";
+
 const navLinks = [
   { to: "/dashboard", label: "Dashboard" },
   { to: "/certificates", label: "Certificates" },
@@ -10,6 +12,15 @@ const navLinks = [
 ];
 
 export function AppShell() {
+  const session = useSession();
+  const logout = useLogout();
+
+  // When AppShell is rendered, AuthGate has confirmed session.data
+  // is present. The fallback is defensive — a refetch can briefly
+  // return undefined while the cookie was invalidated server-side.
+  const displayName = session.data?.display_name ?? session.data?.email ?? "";
+  const role = session.data?.role ?? "";
+
   return (
     <div className="flex min-h-full bg-anchor-50">
       <aside className="w-60 bg-anchor-900 text-anchor-50 flex flex-col">
@@ -29,7 +40,22 @@ export function AppShell() {
             </NavLink>
           ))}
         </nav>
-        <div className="px-4 py-3 text-xs text-anchor-100/70">v0.1 — visibility before automation</div>
+        <div className="border-t border-anchor-700/60 px-4 py-3 text-xs text-anchor-100/80">
+          {displayName && (
+            <div className="mb-2">
+              <div className="font-medium text-anchor-50">{displayName}</div>
+              {role && <div className="text-anchor-100/60">{role}</div>}
+            </div>
+          )}
+          <button
+            type="button"
+            onClick={() => logout.mutate()}
+            disabled={logout.isPending}
+            className="w-full rounded border border-anchor-700/80 px-2 py-1 text-anchor-50 hover:bg-anchor-700/60 disabled:cursor-not-allowed disabled:opacity-60"
+          >
+            {logout.isPending ? "Signing out…" : "Sign out"}
+          </button>
+        </div>
       </aside>
       <main className="flex-1 p-8 overflow-auto">
         <Outlet />

@@ -42,13 +42,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export const api = {
   // --- Auth ---
+  //
+  // Login, logout, and /me round-trip the HttpOnly session cookie
+  // owned by the backend (CLAUDE.md §6: session value never reaches
+  // JavaScript). The shared request() helper sets
+  // `credentials: "include"` so the browser attaches the cookie on
+  // every API call.
   login: (email: string, password: string) =>
-    request<{ id: string; email: string; display_name: string }>(
-      "/auth/login",
-      { method: "POST", body: JSON.stringify({ email, password }) },
-    ),
+    request<User>("/auth/login", {
+      method: "POST",
+      body: JSON.stringify({ email, password }),
+    }),
   logout: () => request<void>("/auth/logout", { method: "POST" }),
-  me: () => request<{ id: string; email: string; display_name: string }>("/auth/me"),
+  me: () => request<User>("/auth/me"),
 
   // --- Agents ---
   listAgents: () => request<{ items: Agent[]; next_cursor: string | null }>("/agents"),
@@ -74,6 +80,20 @@ export const api = {
 };
 
 // --- Types (kept thin; richer types arrive when each phase lands) ---
+
+// User mirrors backend/internal/auth/auth.go User. `last_login_at`
+// is JSON-omitempty on the server, so it may be missing or null on
+// the first login.
+export type User = {
+  id: string;
+  organization_id: string;
+  email: string;
+  display_name: string;
+  role: "admin" | "operator";
+  disabled: boolean;
+  created_at: string;
+  last_login_at?: string | null;
+};
 
 export type Agent = {
   id: string;
