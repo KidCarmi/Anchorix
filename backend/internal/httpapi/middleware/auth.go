@@ -82,6 +82,32 @@ func RequireAuth(next http.Handler) http.Handler {
 	})
 }
 
+// RequireAdmin is RequireAuth + a role gate. Operators with the
+// admin role pass through; anyone else (anonymous, or an
+// authenticated non-admin) receives 403 forbidden. Used today by
+// the deployment-package create endpoint where the action is
+// scoped to admins only (CLAUDE.md §6.3 least-privilege).
+//
+// A future per-permission RBAC layer would consult a richer policy;
+// for v0.1 the binary admin/operator split is sufficient and avoids
+// the speculative-abstraction trap (CLAUDE.md §8.5).
+func RequireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user := UserFromContext(r.Context())
+		if user == nil {
+			envelope.WriteError(w, http.StatusUnauthorized,
+				"unauthorized", "authentication required")
+			return
+		}
+		if user.Role != auth.RoleAdmin {
+			envelope.WriteError(w, http.StatusForbidden,
+				"forbidden", "admin role required")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // MapAuthError translates an auth.* sentinel error into the
 // canonical envelope. Returns true if it handled the error.
 func MapAuthError(w http.ResponseWriter, err error) bool {

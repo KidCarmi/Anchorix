@@ -12,6 +12,7 @@ import (
 
 	"github.com/kidcarmi/anchorix/backend/internal/auth"
 	"github.com/kidcarmi/anchorix/backend/internal/config"
+	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
 )
 
@@ -42,8 +43,9 @@ func testRouter(t *testing.T, register func(*Readiness)) http.Handler {
 		t.Fatalf("NewSignedCookie: %v", err)
 	}
 	deps := Dependencies{
-		AuthService:  &auth.Service{},
-		CookieSigner: signer,
+		AuthService:       &auth.Service{},
+		CookieSigner:      signer,
+		EnrollmentService: &enrollment.Service{},
 	}
 	return newRouter(cfg, log, r, deps)
 }
@@ -147,11 +149,12 @@ func TestReadyzMixedProbesFailClosed(t *testing.T) {
 // shape that clients rely on:  { "error": { "code": ..., "message": ... } }.
 // Every handler that still returns notImplemented must produce this
 // shape; this test catches regressions in the helper or the router
-// wiring. We exercise a still-stub route (GET /agents) so the test
-// stays valid as more handlers gain real implementations.
+// wiring. We exercise a still-stub route (GET /certificates) so the
+// test stays valid as more handlers gain real implementations.
+// GET /agents was the original target but it became real in PR-013.
 func TestNotImplementedRouteEnvelope(t *testing.T) {
 	h := testRouter(t, nil)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/agents", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/certificates", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 

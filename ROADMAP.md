@@ -67,19 +67,48 @@ The end-to-end shape and security properties of the auth foundation
 are documented in
 [`docs/engineering/AUTH_FOUNDATION.md`](./docs/engineering/AUTH_FOUNDATION.md).
 
-## Phase 2 — Agent Enrollment (next)
+## Phase 2 — Agent Enrollment (in progress)
 
-**Goal:** a Windows agent can register and prove identity.
+**Goal:** a Windows agent can register and prove identity. PR #13
+shipped the **backend / API / domain foundation** as a Deployment
+Package model designed for SCCM-style bulk rollouts; subsequent PRs
+add the agent-side wiring and the operator UI.
 
-- [ ] Enrollment token issuance API + UI
-- [ ] `POST /api/v1/agents/enroll` (token + agent pubkey)
-- [ ] Persistent `agents` table with status lifecycle
-- [ ] Agent identity material (initially HMAC bearer; mTLS in Phase 4)
-- [ ] Agent skeleton: config, logging, transport, single enrollment call
-- [ ] Audit events for enrollment, revocation, deletion
-- [ ] UI: agents list + enrollment token modal
+Foundation (PR #13, shipped):
 
-**Exit criteria:** an agent can enroll and appear in the UI.
+- [x] `POST /api/v1/deployment-packages` (admin only); bootstrap
+      secret returned once, stored as `sha256(secret)`
+- [x] `POST /api/v1/agents/enroll`; bootstrap-secret-based, generic
+      rejection envelope, organization-scoped
+- [x] Persistent `agents` table extended with deployment_package_id,
+      machine_fingerprint_hash, install_id, group_name, labels,
+      credential_hash
+- [x] Agent identity material as bearer credential (mTLS deferred to
+      Phase 6)
+- [x] Atomic `max_uses` / `expires_at` / `revoked_at` enforcement
+      via conditional UPDATE; tested under concurrency
+- [x] Audit events for `deployment_package.created`,
+      `agent.enrolled`, `agent.enrollment_rejected`
+      (severity:"security")
+- [x] `GET /api/v1/agents` (operator-only, org-scoped) with
+      group/labels in the response
+- [x] Design + contract documented in
+      [`docs/engineering/AGENT_ENROLLMENT.md`](./docs/engineering/AGENT_ENROLLMENT.md)
+
+Still to come in Phase 2:
+
+- [ ] Agent skeleton: config, logging, transport, single enrollment
+      call
+- [ ] Installer / MSI / .intunewin generator that bakes the bootstrap
+      metadata
+- [ ] Operator UI: deployment-package list + create dialog; agents
+      list view
+- [ ] Package revocation API + UI
+- [ ] Agent revocation API + UI
+
+**Exit criteria:** an admin can create a deployment package in the
+UI, deploy the resulting installer artifact, and watch agents appear
+in the UI as they enroll.
 
 ## Phase 3 — Inventory & Heartbeat
 
@@ -150,6 +179,8 @@ Engineering plans referenced by phases above:
   — unit / integration / smoke / Windows tier model.
 - [`docs/engineering/AGENT_HARDENING.md`](./docs/engineering/AGENT_HARDENING.md)
   — sequenced agent hardening items (H1–H7).
+- [`docs/engineering/AGENT_ENROLLMENT.md`](./docs/engineering/AGENT_ENROLLMENT.md)
+  — Phase 2 deployment-package + enrollment foundation contract.
 - [`docs/architecture/PACKAGE_BOUNDARIES.md`](./docs/architecture/PACKAGE_BOUNDARIES.md)
   — per-package responsibility and forbidden imports.
 - [`docs/architecture/EVOLUTION.md`](./docs/architecture/EVOLUTION.md)

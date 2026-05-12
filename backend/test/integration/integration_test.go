@@ -12,6 +12,7 @@ package integration
 
 import (
 	"context"
+	"crypto/rand"
 	"net/http/httptest"
 	"os"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"github.com/kidcarmi/anchorix/backend/internal/auth"
 	"github.com/kidcarmi/anchorix/backend/internal/clock"
 	"github.com/kidcarmi/anchorix/backend/internal/config"
+	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
 	"github.com/kidcarmi/anchorix/backend/internal/httpapi"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
 	"github.com/kidcarmi/anchorix/backend/internal/storage/postgres"
@@ -66,6 +68,10 @@ func freshDatabase(t *testing.T, db *postgres.DB) {
 		stmts := []string{
 			"DELETE FROM sessions",
 			"DELETE FROM agent_enrollment_tokens",
+			// agents must go before deployment_packages because of the
+			// FK from agents.deployment_package_id (added in 0002).
+			"DELETE FROM agents",
+			"DELETE FROM deployment_packages",
 			// audit_events has BEFORE UPDATE/DELETE FOR EACH ROW
 			// triggers that enforce the §9 / §16 append-only invariant
 			// in production. TRUNCATE does not fire those row-level
@@ -119,9 +125,19 @@ func testServer(t *testing.T, db *postgres.DB) (*httptest.Server, *auth.Service)
 		t.Fatalf("auth.NewService: %v", err)
 	}
 
+	deploymentRepo := postgres.NewDeploymentPackageRepository(db)
+	agentsRepo := postgres.NewAgentRepository(db)
+	enrollSvc, err := enrollment.NewService(
+		deploymentRepo, agentsRepo, auditRecorder, db, clock.System{}, rand.Reader,
+	)
+	if err != nil {
+		t.Fatalf("enrollment.NewService: %v", err)
+	}
+
 	srv, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{
-		AuthService:  svc,
-		CookieSigner: signer,
+		AuthService:       svc,
+		CookieSigner:      signer,
+		EnrollmentService: enrollSvc,
 	})
 	if err != nil {
 		t.Fatalf("httpapi.NewServer: %v", err)
