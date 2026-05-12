@@ -621,3 +621,130 @@ describe("cross-tab session sync (H-004)", () => {
   });
 });
 
+// renderAppWithClient is renderApp + access to the QueryClient. Used
+// by the cache-cleanup test to inspect cache state directly. The
+// rest of the suite uses renderApp / renderAppTab because they
+// don't need cache-level introspection.
+function renderAppWithClient() {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  });
+  const utils = render(
+    <QueryClientProvider client={queryClient}>
+      <MemoryRouter initialEntries={["/"]}>
+        <App />
+      </MemoryRouter>
+    </QueryClientProvider>,
+  );
+  return { ...utils, queryClient };
+}
+
+describe("logout determinism (H-004 fix)", () => {
+  it("logging-out tab returns to LoginPage on /logout 204", async () => {
+    // Server-side state: loggedIn=true initially; POST /logout flips
+    // it to false and returns 204. /me reads the flag, so the next
+    // /me after sign-out returns 401. The fix in useLogout
+    // (refetchQueries instead of clear+invalidate) makes the gate
+    // flip on the same tick that the mutation settles.
+    let loggedIn = true;
+    fetchRouter({
+      "GET /api/v1/auth/me": async () =>
+        loggedIn
+          ? jsonResponse(sampleUser)
+          : jsonResponse(
+              { error: { code: "unauthorized", message: "" } },
+              401,
+            ),
+      "POST /api/v1/auth/logout": async () => {
+        loggedIn = false;
+        return new Response(null, { status: 204 });
+      },
+    });
+    renderApp();
+
+    await screen.findByRole("link", { name: /dashboard/i });
+    fireEvent.click(screen.getByRole("button", { name: /sign out/i }));
+
+    expect(
+      await screen.findByRole("heading", { name: /sign in to anchorix/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: /dashboard/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("logging-out tab returns to LoginPage even when /logout returns 500", async () => {
+    // The frontend treats the mutation as settled regardless of
+    // outcome. Whatever the server reports on the next /me is the
+    // authoritative answer. If the server actually revoked the
+    // session despite responding 500, /me returns 401 and the gate
+    // flips. This test models that case via a meCallCount-based /me
+    // mock that surfaces 401 from the second call onward.
+    let meCallCount = 0;
+    fetchRouter({
+      "GET /api/v1/auth/me": async () => {
+        meCallCount += 1;
+        if (meCallCount === 1) return jsonResponse(sampleUser);
+        return jsonResponse(
+          { error: { code: "unauthorized", message: "" } },
+          401,
+        );
+      },
+      "POST /api/v1/auth/logout": async () =>
+        jsonResponse(
+          { error: { code: "internal_error", message: "boom" } },
+          500,
+        ),
+    });
+    renderApp();
+
+    await screen.findByRole("link", { name: /dashboard/i });
+    fireEvent.click(screen.getByRole("button", { name: /sign out/i }));
+
+    expect(
+      await screen.findByRole("heading", { name: /sign in to anchorix/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("link", { name: /dashboard/i }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("removes page-level cached queries on logout but keeps the session observer working", async () => {
+    // The cache cleanup in useLogout MUST drop authenticated
+    // page-level data (so the next operator doesn't inherit it)
+    // while preserving the session query observer's subscription
+    // (so the gate can still react to the post-logout /me 401).
+    let loggedIn = true;
+    fetchRouter({
+      "GET /api/v1/auth/me": async () =>
+        loggedIn
+          ? jsonResponse(sampleUser)
+          : jsonResponse(
+              { error: { code: "unauthorized", message: "" } },
+              401,
+            ),
+      "POST /api/v1/auth/logout": async () => {
+        loggedIn = false;
+        return new Response(null, { status: 204 });
+      },
+    });
+
+    const { queryClient } = renderAppWithClient();
+    await screen.findByRole("link", { name: /dashboard/i });
+
+    // Prime a non-session query as if a page had fetched data.
+    queryClient.setQueryData(["agents", "list"], [{ id: "agent-1" }]);
+    expect(queryClient.getQueryData(["agents", "list"])).toEqual([
+      { id: "agent-1" },
+    ]);
+
+    fireEvent.click(screen.getByRole("button", { name: /sign out/i }));
+
+    // The gate flipped — proves the session observer is still wired
+    // up after the cache cleanup ran.
+    await screen.findByRole("heading", { name: /sign in to anchorix/i });
+
+    // Page-level data is gone.
+    expect(queryClient.getQueryData(["agents", "list"])).toBeUndefined();
+  });
+});

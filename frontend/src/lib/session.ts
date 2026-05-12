@@ -19,6 +19,22 @@ import { ApiError, api, registerUnauthorizedHandler, type User } from "./api";
 // here would silently fail a cache invalidation.
 export const sessionQueryKey = ["session"] as const;
 
+// isSessionQuery returns true if a given React Query queryKey matches
+// the session query exactly. Used by useLogout's cache eviction so
+// the active session observer's subscription survives the cleanup —
+// queryClient.clear() removes the session entry too, and removing
+// the slot a mounted observer is subscribed to desynchronizes it so
+// the subsequent invalidate-driven refetch never re-renders the
+// gate. Excluding sessionQueryKey is what keeps logout deterministic
+// in the tab that initiated it.
+function isSessionQuery(queryKey: readonly unknown[]): boolean {
+  if (queryKey.length !== sessionQueryKey.length) return false;
+  for (let i = 0; i < queryKey.length; i += 1) {
+    if (queryKey[i] !== sessionQueryKey[i]) return false;
+  }
+  return true;
+}
+
 // useSession queries /auth/me on mount.
 //
 //   - data        → authenticated User
@@ -151,10 +167,22 @@ export function useLogout() {
   return useMutation<void, ApiError>({
     mutationFn: () => api.logout(),
     onSettled: async () => {
-      // Drop every cached query: any page-level data fetched while
-      // authenticated is no longer the next operator's to see.
-      queryClient.clear();
-      await queryClient.invalidateQueries({ queryKey: sessionQueryKey });
+      // Drop every cached PAGE-LEVEL query — the next operator must
+      // not inherit cached data — but preserve the session query
+      // itself. queryClient.clear() would remove the session entry
+      // too, which desynchronizes AuthGate's mounted observer (the
+      // subscription target disappears, so the subsequent
+      // invalidate-driven refetch never re-renders the gate). The
+      // predicate keeps the session observer wired while evicting
+      // everything else.
+      queryClient.removeQueries({
+        predicate: (query) => !isSessionQuery(query.queryKey),
+      });
+      // refetchQueries gives deterministic timing: invalidateQueries
+      // is fire-and-forget, while refetchQueries awaits the next /me
+      // round trip. The logging-out tab's gate flips on this same
+      // promise.
+      await queryClient.refetchQueries({ queryKey: sessionQueryKey });
       publishSessionEvent("logout");
     },
   });
