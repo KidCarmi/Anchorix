@@ -88,7 +88,12 @@ npm install
 npm run dev
 ```
 
-The dev server proxies `/api` to `http://localhost:8080`.
+The dev server proxies `/api` to `http://localhost:8080`. Sign in
+with the operator credentials created in step 4 of the Getting
+Started flow: the SPA boots into the sign-in screen, posts to
+`/api/v1/auth/login`, and then renders the AppShell. The session
+cookie is HttpOnly + server-issued — nothing in the frontend reads
+or stores it.
 
 ### Windows Agent
 
