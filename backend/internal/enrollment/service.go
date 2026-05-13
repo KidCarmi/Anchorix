@@ -378,8 +378,18 @@ func (s *Service) EnrollAgent(ctx context.Context, in EnrollAgentInput) (*Enroll
 // attached to the deployment package. The two have different
 // lifecycles (one-per-package vs. one-per-agent) and different
 // trust boundaries; do not conflate them.
+//
+// HeaderRejection is the middleware's signal that the
+// Authorization header itself was unusable before any credential
+// was extracted (missing entirely, wrong scheme, or empty token).
+// When non-empty, the service short-circuits the credential
+// lookup and records the rejection so probing patterns show up
+// in the security audit feed alongside unknown-credential and
+// disabled-agent failures (CLAUDE.md §9 — every auth failure
+// is auditable).
 type AuthenticateAgentInput struct {
 	AgentCredential string // the agent_credential issued at enrollment
+	HeaderRejection string // non-empty signals a pre-credential header failure
 	RequestID       string // for audit correlation on failure
 	RemoteAddr      string // for audit metadata only; never persisted as-is
 }
@@ -397,6 +407,16 @@ type AuthenticateAgentInput struct {
 // every authenticated read would generate one row-update per
 // authenticated request, which is the wrong cost model.
 func (s *Service) AuthenticateAgent(ctx context.Context, in AuthenticateAgentInput) (*AuthenticatedAgent, error) {
+	if in.HeaderRejection != "" {
+		// Middleware classified the Authorization header itself as
+		// unusable. Audit the rejection so probing patterns
+		// (missing header, wrong scheme, empty token) are visible
+		// in the security feed, then surface the same
+		// ErrAgentAuthenticationFailed sentinel as any other
+		// failure mode (CLAUDE.md §6 deterministic auth).
+		s.recordAuthFailure(ctx, "", "", in.HeaderRejection, in)
+		return nil, ErrAgentAuthenticationFailed
+	}
 	if strings.TrimSpace(in.AgentCredential) == "" {
 		s.recordAuthFailure(ctx, "", "", "credential_empty", in)
 		return nil, ErrAgentAuthenticationFailed

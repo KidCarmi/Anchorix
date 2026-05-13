@@ -52,18 +52,23 @@ func AgentFromContext(ctx context.Context) *enrollment.AuthenticatedAgent {
 func RequireAuthenticatedAgent(authenticator AgentAuthenticator) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			plaintext, ok := bearerToken(r.Header.Get("Authorization"))
-			if !ok {
-				envelope.WriteError(w, http.StatusUnauthorized,
-					"agent_unauthorized", "agent authentication required")
-				return
-			}
+			plaintext, headerRejection := parseBearer(r.Header.Get("Authorization"))
 
-			agent, err := authenticator.AuthenticateAgent(r.Context(), enrollment.AuthenticateAgentInput{
+			input := enrollment.AuthenticateAgentInput{
 				AgentCredential: plaintext,
+				HeaderRejection: headerRejection,
 				RequestID:       r.Header.Get("X-Request-Id"),
 				RemoteAddr:      r.RemoteAddr,
-			})
+			}
+			// IMPORTANT: AuthenticateAgent is called on EVERY path,
+			// including malformed-header paths, so the security
+			// audit feed records header_missing /
+			// header_wrong_scheme / header_empty_token rejections
+			// the same way it records credential_unknown and
+			// agent_status_* rejections. Returning 401 before the
+			// service call would leave a blind spot for the most
+			// common probing patterns (CLAUDE.md §9).
+			agent, err := authenticator.AuthenticateAgent(r.Context(), input)
 			if err != nil {
 				if errors.Is(err, enrollment.ErrAgentAuthenticationFailed) {
 					envelope.WriteError(w, http.StatusUnauthorized,
@@ -81,26 +86,35 @@ func RequireAuthenticatedAgent(authenticator AgentAuthenticator) func(http.Handl
 	}
 }
 
-// bearerToken parses the Authorization header and returns the
+// parseBearer parses the Authorization header and returns the
 // token portion of a Bearer scheme. The scheme name is matched
 // case-insensitively (RFC 6750 §2.1 specifies a case-insensitive
 // scheme), but the rest of the header is taken verbatim.
 //
-// Empty token, missing header, or non-Bearer scheme all return
-// (_, false) — the middleware translates that into the standard
-// 401 envelope without exposing which specific check failed.
-func bearerToken(header string) (string, bool) {
+// On failure, returns ("", reason) where reason is one of:
+//
+//   - "header_missing": no Authorization header at all
+//   - "header_wrong_scheme": header present but not Bearer
+//   - "header_empty_token": "Bearer" with no token after it
+//
+// The reason is passed through to the service via
+// AuthenticateAgentInput.HeaderRejection so the audit feed
+// distinguishes between the three probing patterns. The HTTP
+// envelope remains the same generic 401 either way (CLAUDE.md
+// §6 deterministic auth — no enumeration via error code).
+func parseBearer(header string) (token, reason string) {
 	const schemePrefix = "bearer "
 	header = strings.TrimSpace(header)
-	if len(header) < len(schemePrefix) {
-		return "", false
+	if header == "" {
+		return "", "header_missing"
 	}
-	if !strings.EqualFold(header[:len(schemePrefix)], schemePrefix) {
-		return "", false
+	if len(header) < len(schemePrefix) ||
+		!strings.EqualFold(header[:len(schemePrefix)], schemePrefix) {
+		return "", "header_wrong_scheme"
 	}
-	token := strings.TrimSpace(header[len(schemePrefix):])
+	token = strings.TrimSpace(header[len(schemePrefix):])
 	if token == "" {
-		return "", false
+		return "", "header_empty_token"
 	}
-	return token, true
+	return token, ""
 }

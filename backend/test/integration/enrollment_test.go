@@ -1022,6 +1022,26 @@ func TestAgentMeRejectsMissingHeader(t *testing.T) {
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("status = %d, want 401", resp.StatusCode)
 	}
+
+	// Codex P2 fix: even missing/malformed headers must land in
+	// the security audit feed so probing patterns are visible.
+	// The middleware now passes HeaderRejection=header_missing
+	// through to AuthenticateAgent for exactly this purpose.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var count int
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT COUNT(*) FROM audit_events
+			  WHERE action = 'agent.authentication_failed'
+			    AND metadata::text LIKE '%header_missing%'`,
+		).Scan(&count)
+	}); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("audit rows with reason=header_missing = %d, want 1", count)
+	}
 }
 
 func TestAgentMeRejectsMalformedHeader(t *testing.T) {

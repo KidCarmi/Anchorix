@@ -1111,6 +1111,30 @@ func TestAuthenticateAgentRejectsDisabledAgent(t *testing.T) {
 	}
 }
 
+func TestAuthenticateAgentAuditsHeaderRejection(t *testing.T) {
+	// Middleware passes HeaderRejection when the Authorization
+	// header is missing or malformed before any credential can be
+	// extracted. The service must audit each such case with the
+	// supplied reason so security analytics sees the probing
+	// patterns, not just credential-level failures (Codex P2
+	// review on PR-16).
+	cases := []string{"header_missing", "header_wrong_scheme", "header_empty_token"}
+	for _, reason := range cases {
+		t.Run(reason, func(t *testing.T) {
+			svc, _, _, auditRec, _ := newTestService(t)
+			_, err := svc.AuthenticateAgent(context.Background(), AuthenticateAgentInput{
+				HeaderRejection: reason,
+			})
+			if !errors.Is(err, ErrAgentAuthenticationFailed) {
+				t.Fatalf("err = %v, want ErrAgentAuthenticationFailed", err)
+			}
+			if !hasAuthFailureWithReason(auditRec.events, reason) {
+				t.Errorf("missing agent.authentication_failed audit with reason=%s", reason)
+			}
+		})
+	}
+}
+
 func TestAuthenticateAgentLookupErrorPropagates(t *testing.T) {
 	svc, _, agents, _, _ := newTestService(t)
 	agents.findErr = errors.New("synthetic repository failure")
