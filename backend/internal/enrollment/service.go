@@ -371,10 +371,17 @@ func (s *Service) EnrollAgent(ctx context.Context, in EnrollAgentInput) (*Enroll
 // to the service when validating an Authorization: Bearer header.
 // Plaintext credential is hashed inside this method; the value
 // never reaches the repository or any storage layer.
+//
+// Vocabulary note: AgentCredential is the post-enrollment bearer
+// credential the control plane issued in
+// EnrollAgentOutput.AgentCredential — NOT the bootstrap secret
+// attached to the deployment package. The two have different
+// lifecycles (one-per-package vs. one-per-agent) and different
+// trust boundaries; do not conflate them.
 type AuthenticateAgentInput struct {
-	BootstrapCredential string // the agent_credential issued at enrollment
-	RequestID           string // for audit correlation on failure
-	RemoteAddr          string // for audit metadata only; never persisted as-is
+	AgentCredential string // the agent_credential issued at enrollment
+	RequestID       string // for audit correlation on failure
+	RemoteAddr      string // for audit metadata only; never persisted as-is
 }
 
 // AuthenticateAgent verifies an agent's bearer credential and
@@ -390,12 +397,12 @@ type AuthenticateAgentInput struct {
 // every authenticated read would generate one row-update per
 // authenticated request, which is the wrong cost model.
 func (s *Service) AuthenticateAgent(ctx context.Context, in AuthenticateAgentInput) (*AuthenticatedAgent, error) {
-	if strings.TrimSpace(in.BootstrapCredential) == "" {
+	if strings.TrimSpace(in.AgentCredential) == "" {
 		s.recordAuthFailure(ctx, "", "", "credential_empty", in)
 		return nil, ErrAgentAuthenticationFailed
 	}
 
-	hash := hashBearerToken(in.BootstrapCredential)
+	hash := hashBearerToken(in.AgentCredential)
 	agent, err := s.agents.FindByCredentialHash(ctx, hash)
 	if err != nil {
 		if errors.Is(err, ErrAgentNotFound) {

@@ -60,9 +60,9 @@ func RequireAuthenticatedAgent(authenticator AgentAuthenticator) func(http.Handl
 			}
 
 			agent, err := authenticator.AuthenticateAgent(r.Context(), enrollment.AuthenticateAgentInput{
-				BootstrapCredential: plaintext,
-				RequestID:           r.Header.Get("X-Request-Id"),
-				RemoteAddr:          r.RemoteAddr,
+				AgentCredential: plaintext,
+				RequestID:       r.Header.Get("X-Request-Id"),
+				RemoteAddr:      r.RemoteAddr,
 			})
 			if err != nil {
 				if errors.Is(err, enrollment.ErrAgentAuthenticationFailed) {

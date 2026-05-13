@@ -1043,7 +1043,7 @@ func TestAuthenticateAgentHappyPath(t *testing.T) {
 	plaintext, agentID := enrollOneAgent(t, svc, agents)
 
 	got, err := svc.AuthenticateAgent(context.Background(), AuthenticateAgentInput{
-		BootstrapCredential: plaintext,
+		AgentCredential: plaintext,
 	})
 	if err != nil {
 		t.Fatalf("AuthenticateAgent: %v", err)
@@ -1062,7 +1062,7 @@ func TestAuthenticateAgentHappyPath(t *testing.T) {
 func TestAuthenticateAgentRejectsEmptyCredential(t *testing.T) {
 	svc, _, _, auditRec, _ := newTestService(t)
 	_, err := svc.AuthenticateAgent(context.Background(), AuthenticateAgentInput{
-		BootstrapCredential: "",
+		AgentCredential: "",
 	})
 	if !errors.Is(err, ErrAgentAuthenticationFailed) {
 		t.Fatalf("err = %v, want ErrAgentAuthenticationFailed", err)
@@ -1077,7 +1077,7 @@ func TestAuthenticateAgentRejectsEmptyCredential(t *testing.T) {
 func TestAuthenticateAgentRejectsUnknownCredential(t *testing.T) {
 	svc, _, _, auditRec, _ := newTestService(t)
 	_, err := svc.AuthenticateAgent(context.Background(), AuthenticateAgentInput{
-		BootstrapCredential: "not-a-real-credential",
+		AgentCredential: "not-a-real-credential",
 	})
 	if !errors.Is(err, ErrAgentAuthenticationFailed) {
 		t.Fatalf("err = %v, want ErrAgentAuthenticationFailed", err)
@@ -1101,7 +1101,7 @@ func TestAuthenticateAgentRejectsDisabledAgent(t *testing.T) {
 	agents.mu.Unlock()
 
 	_, err := svc.AuthenticateAgent(context.Background(), AuthenticateAgentInput{
-		BootstrapCredential: plaintext,
+		AgentCredential: plaintext,
 	})
 	if !errors.Is(err, ErrAgentAuthenticationFailed) {
 		t.Fatalf("err = %v, want ErrAgentAuthenticationFailed", err)
@@ -1116,7 +1116,7 @@ func TestAuthenticateAgentLookupErrorPropagates(t *testing.T) {
 	agents.findErr = errors.New("synthetic repository failure")
 
 	_, err := svc.AuthenticateAgent(context.Background(), AuthenticateAgentInput{
-		BootstrapCredential: "anything",
+		AgentCredential: "anything",
 	})
 	if err == nil {
 		t.Fatal("expected error")
@@ -1131,7 +1131,7 @@ func TestAuthenticateAgentAuditFailureStaysBestEffort(t *testing.T) {
 	auditRec.failOnAction = "agent.authentication_failed"
 
 	_, err := svc.AuthenticateAgent(context.Background(), AuthenticateAgentInput{
-		BootstrapCredential: "not-real",
+		AgentCredential: "not-real",
 	})
 	// Audit failure must NOT cause the auth response to flip to
 	// 500 — otherwise an attacker can DOS agent connectivity by
