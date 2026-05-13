@@ -67,6 +67,8 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 	// --- deployment packages (admin-only) ---
 	mux.Handle("POST /deployment-packages",
 		resolver(mw.RequireAdmin(handlers.DeploymentPackagesCreate(deploymentDeps))))
+	mux.Handle("POST /deployment-packages/{id}/revoke",
+		resolver(mw.RequireAdmin(handlers.DeploymentPackagesRevoke(deploymentDeps))))
 
 	// --- agents ---
 	// List is operator-only; enroll is anonymous (the bootstrap

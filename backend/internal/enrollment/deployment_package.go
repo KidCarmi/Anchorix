@@ -118,6 +118,14 @@ type DeploymentPackageRepository interface {
 	// matches the hash.
 	GetByBootstrapHash(ctx context.Context, hash []byte) (*DeploymentPackage, error)
 
+	// GetByIDAndOrg looks up a package by id within a specific
+	// organization. Returns ErrPackageNotFound if no row matches
+	// (either the id is invalid OR the id belongs to a different
+	// org). The two cases collapse on purpose: surfacing
+	// "different org" would let an admin enumerate packages in
+	// neighboring tenants.
+	GetByIDAndOrg(ctx context.Context, id, organizationID string) (*DeploymentPackage, error)
+
 	// IncrementUses atomically increments uses_count for the package
 	// at the given timestamp. The implementation MUST only succeed
 	// when the package is still active (not revoked, not expired,
@@ -128,6 +136,17 @@ type DeploymentPackageRepository interface {
 	// This is the choke point that makes concurrent SCCM-style mass
 	// enrollment safe under MaxUses.
 	IncrementUses(ctx context.Context, id string, at time.Time) error
+
+	// Revoke flips revoked_at + revoked_by_user_id + revoked_reason
+	// on a package. The conditional UPDATE matches only rows where
+	// revoked_at IS NULL, so a concurrent revoke from another admin
+	// cannot double-write the columns. Returns
+	// ErrPackageAlreadyRevoked when the UPDATE matched zero rows —
+	// the service is responsible for distinguishing
+	// "not found in org" (via a prior GetByIDAndOrg) from "already
+	// revoked" so the API can surface the idempotent 200 instead of
+	// a misleading 404.
+	Revoke(ctx context.Context, id, organizationID, revokedByUserID, reason string, at time.Time) error
 }
 
 // Sentinel errors. Centralized so domain and storage agree on the
@@ -172,4 +191,13 @@ var (
 	// folded into ErrEnrollmentRejected at the HTTP boundary so
 	// callers cannot distinguish malformed input from a bad secret.
 	ErrInvalidEnrollmentInput = errors.New("enrollment: invalid enrollment input")
+
+	// ErrPackageAlreadyRevoked indicates the package was revoked
+	// before this revoke call ran (either by a prior admin action
+	// or by a concurrent admin racing the same package). The
+	// service treats this as the idempotent-success case and the
+	// HTTP layer responds 200 with the package's existing revoked
+	// state — re-revoking a revoked package is a no-op, not an
+	// error.
+	ErrPackageAlreadyRevoked = errors.New("enrollment: deployment package already revoked")
 )

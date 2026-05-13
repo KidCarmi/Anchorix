@@ -92,6 +92,75 @@ func (r *DeploymentPackageRepository) GetByBootstrapHash(
 	return pkg, nil
 }
 
+// GetByIDAndOrg returns the package only when both id AND
+// organization_id match. The org scope is enforced at the WHERE
+// clause so a cross-org id surfaces as ErrPackageNotFound rather
+// than a forbidden — operators cannot enumerate the existence of
+// packages in other orgs (CLAUDE.md §6 deterministic auth).
+func (r *DeploymentPackageRepository) GetByIDAndOrg(
+	ctx context.Context,
+	id, organizationID string,
+) (*enrollment.DeploymentPackage, error) {
+	const q = `
+		SELECT id, organization_id, name, description, package_type,
+		       agent_version, max_uses, uses_count, expires_at,
+		       revoked_at, revoked_by_user_id, revoked_reason,
+		       created_by_user_id, created_at, last_used_at,
+		       default_group_name, default_labels
+		  FROM deployment_packages
+		 WHERE id = $1 AND organization_id = $2`
+	row := r.db.querierFor(ctx).QueryRow(ctx, q, id, organizationID)
+	pkg, err := scanDeploymentPackage(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, enrollment.ErrPackageNotFound
+		}
+		return nil, fmt.Errorf("postgres: get package by id and org: %w", err)
+	}
+	return pkg, nil
+}
+
+// Revoke flips revoked_at + revoked_by_user_id + revoked_reason on
+// a single package row. The conditional UPDATE only matches rows
+// where revoked_at IS NULL, so a concurrent revoke from another
+// admin cannot double-write the columns. The caller (the service)
+// is responsible for pre-checking and emitting the audit event in
+// the same transaction; this method only owns the SQL.
+//
+// Returns enrollment.ErrPackageNotFound if no row matched the
+// (id, organization_id, revoked_at IS NULL) predicate. The service
+// distinguishes "not found in org" from "already revoked" by
+// reading the package state first.
+func (r *DeploymentPackageRepository) Revoke(
+	ctx context.Context,
+	id, organizationID, revokedByUserID, reason string,
+	at time.Time,
+) error {
+	const q = `
+		UPDATE deployment_packages
+		   SET revoked_at         = $3,
+		       revoked_by_user_id = $4,
+		       revoked_reason     = $5
+		 WHERE id = $1
+		   AND organization_id = $2
+		   AND revoked_at IS NULL`
+	tag, err := r.db.querierFor(ctx).Exec(ctx, q,
+		id, organizationID, at, revokedByUserID, reason,
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: revoke deployment package: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		// Either the package does not exist for this org, or it is
+		// already revoked. The service has already confirmed
+		// existence via GetByIDAndOrg, so a 0-row outcome here is
+		// the concurrent-revoke race and is treated as "already
+		// revoked" (idempotent success at the service layer).
+		return enrollment.ErrPackageAlreadyRevoked
+	}
+	return nil
+}
+
 // IncrementUses is the atomic choke point for safe concurrent
 // enrollment. The conditional UPDATE only succeeds when the
 // package is still active at the moment of the SQL statement —

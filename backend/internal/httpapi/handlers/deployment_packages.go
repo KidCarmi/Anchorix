@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -137,5 +138,113 @@ func DeploymentPackagesCreate(deps DeploymentPackageDeps) http.HandlerFunc {
 			},
 		}
 		envelope.WriteJSON(w, http.StatusCreated, resp)
+	}
+}
+
+// revokeRequest is the body of POST /deployment-packages/{id}/revoke.
+// All fields are optional; an empty body is a valid revoke with no
+// reason.
+type revokeRequest struct {
+	Reason string `json:"reason"`
+}
+
+// revokedPackageResponse is the success body for a revoke call.
+// Deliberately distinct from deploymentPackageResponse so the
+// bootstrap_secret field cannot accidentally be echoed back here —
+// the only place the plaintext secret ever appears in any response
+// is the original create call.
+type revokedPackageResponse struct {
+	ID              string `json:"id"`
+	OrganizationID  string `json:"organization_id"`
+	Name            string `json:"name"`
+	PackageType     string `json:"package_type"`
+	RevokedAt       string `json:"revoked_at"`
+	RevokedByUserID string `json:"revoked_by_user_id"`
+	RevokedReason   string `json:"revoked_reason,omitempty"`
+	AlreadyRevoked  bool   `json:"already_revoked"`
+}
+
+// DeploymentPackagesRevoke handles
+// POST /api/v1/deployment-packages/{id}/revoke. Admin-only — the
+// route is wrapped with middleware.RequireAdmin in the router.
+//
+// Idempotent: re-revoking a revoked package returns 200 with
+// `already_revoked: true` and the existing revoked metadata; the
+// service does NOT emit a duplicate
+// deployment_package.revoked audit row in that case (the original
+// revoke's audit is the source of truth).
+//
+// A package belonging to a different organization surfaces as
+// 404 not_found — the same envelope a truly-missing id produces —
+// so admins cannot enumerate packages in neighboring tenants.
+func DeploymentPackagesRevoke(deps DeploymentPackageDeps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := middleware.UserFromContext(r.Context())
+		if user == nil {
+			// RequireAdmin guards the route, so this should never
+			// fire. Defensive 401 protects against router
+			// misconfiguration.
+			envelope.WriteError(w, http.StatusUnauthorized,
+				"unauthorized", "authentication required")
+			return
+		}
+
+		packageID := strings.TrimSpace(r.PathValue("id"))
+		if packageID == "" {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request",
+				"package id required")
+			return
+		}
+
+		// Reason is optional. An empty body is valid. We do NOT
+		// guard the decode with r.ContentLength because that breaks
+		// chunked-transfer requests (ContentLength = -1) — proxies
+		// and streaming clients commonly use chunked encoding, so
+		// the guard would silently accept malformed JSON instead of
+		// returning the documented 400 bad_request envelope. The
+		// EOF check below covers the truly-empty-body case
+		// (Content-Length: 0 or no body sent at all).
+		var body revokeRequest
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+			return
+		}
+
+		out, err := deps.Service.RevokePackage(r.Context(), enrollment.RevokePackageInput{
+			OrganizationID:  user.OrganizationID,
+			PackageID:       packageID,
+			RevokedByUserID: user.ID,
+			Reason:          strings.TrimSpace(body.Reason),
+		})
+		if err != nil {
+			if errors.Is(err, enrollment.ErrPackageNotFound) {
+				envelope.WriteError(w, http.StatusNotFound, "not_found",
+					"deployment package not found")
+				return
+			}
+			if errors.Is(err, enrollment.ErrInvalidPackageInput) {
+				envelope.WriteError(w, http.StatusBadRequest, "bad_request",
+					"invalid revoke input")
+				return
+			}
+			envelope.WriteError(w, http.StatusInternalServerError,
+				"internal_error", "could not revoke deployment package")
+			return
+		}
+
+		revokedAt := ""
+		if out.Package.RevokedAt != nil {
+			revokedAt = out.Package.RevokedAt.UTC().Format(time.RFC3339)
+		}
+		envelope.WriteJSON(w, http.StatusOK, revokedPackageResponse{
+			ID:              out.Package.ID,
+			OrganizationID:  out.Package.OrganizationID,
+			Name:            out.Package.Name,
+			PackageType:     string(out.Package.PackageType),
+			RevokedAt:       revokedAt,
+			RevokedByUserID: out.Package.RevokedByUserID,
+			RevokedReason:   out.Package.RevokedReason,
+			AlreadyRevoked:  out.AlreadyRevoked,
+		})
 	}
 }
