@@ -5,6 +5,7 @@ package integration
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"net/http"
 	"net/http/cookiejar"
 	"net/http/httptest"
@@ -18,6 +19,7 @@ import (
 
 	"github.com/kidcarmi/anchorix/backend/internal/auth"
 	"github.com/kidcarmi/anchorix/backend/internal/clock"
+	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
 	"github.com/kidcarmi/anchorix/backend/internal/httpapi"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
 	"github.com/kidcarmi/anchorix/backend/internal/storage/postgres"
@@ -99,9 +101,24 @@ func TestNoPlaintextSecretsInLogs(t *testing.T) {
 		t.Fatalf("auth.NewService: %v", err)
 	}
 
+	// EnrollmentService is required by httpapi.NewServer's
+	// Dependencies (PR-013). The redaction sweep does not exercise
+	// enrollment routes, but the server constructor validates every
+	// dep at construction time — wire a real service so the gate
+	// passes.
+	deploymentPkgRepo := postgres.NewDeploymentPackageRepository(db)
+	agentsRepo := postgres.NewAgentRepository(db)
+	enrollSvc, err := enrollment.NewService(
+		deploymentPkgRepo, agentsRepo, auditRecorder, db, clock.System{}, rand.Reader,
+	)
+	if err != nil {
+		t.Fatalf("enrollment.NewService: %v", err)
+	}
+
 	apiServer, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{
-		AuthService:  svc,
-		CookieSigner: signer,
+		AuthService:       svc,
+		CookieSigner:      signer,
+		EnrollmentService: enrollSvc,
 	})
 	if err != nil {
 		t.Fatalf("httpapi.NewServer: %v", err)
