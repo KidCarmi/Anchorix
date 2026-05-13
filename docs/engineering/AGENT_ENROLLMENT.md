@@ -222,27 +222,80 @@ Group/label management is **enrollment-time only** in v0.1. There
 is no policy-by-group engine, no RBAC-by-group, no label taxonomy
 service. Those land in later phases if the product demands them.
 
-## Reinstall / idempotency posture
+## Reinstall behavior in v0.1
 
-The enrollment request accepts:
+The enrollment request accepts identity hints:
 
 - `hostname`
 - `machine_fingerprint` (hashed before storage)
 - `install_id` (stable installer-issued id)
 - `agent_version`
 
-v0.1 behavior:
+The contract for `install_id` in v0.1 is **single-use identity
+binding**, deliberately:
 
-- `install_id` is unique per organization. A second enrollment with
-  the same `install_id` is rejected with `enrollment_rejected`
-  (failing closed). Re-issuing a credential to a "returning" agent
-  requires an explicit design — v0.1 deliberately does not do it.
-- `machine_fingerprint` is hashed at the API boundary and stored
-  as bytes. The raw fingerprint never reaches the DB.
-- Operators handling a reinstall should revoke the existing agent
-  (Phase 3+ UI) and re-deploy the installer with a fresh
-  `install_id`. v0.1 documents the gap rather than papering over
-  it.
+- `install_id` is unique per organization (enforced by the
+  conditional unique index on `agents(organization_id, install_id)
+  WHERE install_id IS NOT NULL` introduced in migration 0002).
+- A second enrollment with the same `install_id` is rejected with
+  the standard `enrollment_rejected` envelope and an
+  `agent.enrollment_rejected` audit row tagged
+  `reason: "install_id_already_enrolled"`.
+- The previously issued agent credential is **never returned
+  again** by any endpoint. The plaintext exists only in the
+  original `POST /agents/enroll` response struct and is GC'd as
+  soon as that response is written.
+- Reinstall, rebind, and recovery flows are **intentionally
+  deferred**. Re-issuing a credential to a "returning"
+  `install_id` requires an explicit design (probably a Phase-3
+  admin-approved reinstall token + credential rotation flow), and
+  v0.1 does not paper over the gap.
+- Future versions may support explicit rebind / rotation flows
+  with operator approval. The current behavior is **fail-closed by
+  design** so two installers cannot race to take over the same
+  logical agent identity, and so a stolen `install_id` cannot be
+  re-used to mint a fresh credential.
+
+Operators handling an actual reinstall today should:
+
+1. Revoke the existing agent row (Phase 3+ UI; direct
+   `UPDATE agents SET status='revoked' WHERE id='...'` for now),
+2. re-deploy the installer with a **fresh** `install_id`.
+
+`machine_fingerprint` is hashed at the API boundary and stored as
+bytes. The raw fingerprint never reaches the DB; it serves as a
+diagnostic signal for operators trying to recognize a returning
+host without being a stable identity primitive.
+
+## Schema notes
+
+### `agents.public_key_fingerprint` is now nullable
+
+Migration 0001 declared `agents.public_key_fingerprint` as
+`NOT NULL` under the assumption that agents would identify with a
+pinned public key from the start. PR-013 introduces a
+**bearer-credential identity model** for v0.1 — see "Agent
+Credential" above — and `public_key_fingerprint` is therefore
+**not** populated by the current enrollment flow. Migration 0002
+relaxes the column to nullable so the bearer flow can write `NULL`
+without a synthetic placeholder.
+
+This change is **deliberate and additive**, not a trust-model
+weakening:
+
+- The bearer credential (server-issued, SHA-256-stored,
+  returned-once) remains the v0.1 agent identity primitive.
+- The Phase 6 mTLS migration will populate the column for every
+  agent that completes the mTLS bootstrap, restoring the pinned-
+  public-key model on top of the bearer flow.
+- The column kept its UNIQUE constraint on
+  `(organization_id, public_key_fingerprint)`. PostgreSQL treats
+  multiple NULLs as distinct under default UNIQUE semantics, so
+  v0.1 enrollments coexist; once Phase 6 populates the column,
+  the constraint enforces one mTLS identity per agent per org as
+  originally designed.
+- No existing data is dropped or rewritten by 0002; only the
+  NOT NULL declaration is relaxed.
 
 ## Audit events
 
