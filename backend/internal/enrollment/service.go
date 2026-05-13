@@ -337,6 +337,25 @@ func (s *Service) EnrollAgent(ctx context.Context, in EnrollAgentInput) (*Enroll
 				return nil, fmt.Errorf("enrollment: record rejection: %w", auditErr)
 			}
 			return nil, ErrEnrollmentRejected
+		case errors.Is(err, ErrPackageNotFound):
+			// IncrementUses returns ErrPackageNotFound when the
+			// package row disappeared between the conditional
+			// UPDATE and the follow-up classification SELECT —
+			// almost always a concurrent operator hard-delete of
+			// the package. The agent must still see the standard
+			// generic rejection envelope (CLAUDE.md §6: no
+			// enumeration via error code), so map this case to
+			// ErrEnrollmentRejected rather than letting it fall
+			// through to a 500.
+			//
+			// pkg.OrganizationID is the org we resolved BEFORE the
+			// transaction, so we can still scope the audit row
+			// correctly even though the package row itself is
+			// gone.
+			if auditErr := s.recordRejection(ctx, pkg.OrganizationID, pkg.ID, "package_concurrently_deleted", in); auditErr != nil {
+				return nil, fmt.Errorf("enrollment: record rejection: %w", auditErr)
+			}
+			return nil, ErrEnrollmentRejected
 		}
 		return nil, err
 	}

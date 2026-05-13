@@ -623,6 +623,48 @@ func TestEnrollAgentUnknownSecretAuditFailureStaysBestEffort(t *testing.T) {
 	}
 }
 
+func TestEnrollAgentPackageConcurrentlyDeletedSurfacesAsRejection(t *testing.T) {
+	// IncrementUses returns ErrPackageNotFound when the package row
+	// disappeared between the conditional UPDATE and the follow-up
+	// classification SELECT (concurrent operator delete). The agent
+	// MUST still see the standard generic rejection envelope, not a
+	// 500. Codex review of PR #13 caught this gap — without an
+	// explicit ErrPackageNotFound case in the post-tx switch, the
+	// error would fall through and the HTTP layer would emit
+	// internal_error.
+	svc, packages, _, auditRec, _ := newTestService(t)
+	pkgOut, err := svc.CreatePackage(context.Background(), validCreateInput())
+	if err != nil {
+		t.Fatalf("CreatePackage: %v", err)
+	}
+	// Simulate the race: GetByBootstrapHash succeeds (we still have
+	// the in-memory entry), but IncrementUses fails as if the row
+	// were deleted mid-transaction.
+	packages.incrementErr = ErrPackageNotFound
+
+	_, err = svc.EnrollAgent(context.Background(), EnrollAgentInput{
+		BootstrapSecret: pkgOut.BootstrapSecret,
+		Hostname:        "ws-001",
+	})
+	if !errors.Is(err, ErrEnrollmentRejected) {
+		t.Fatalf("err = %v, want ErrEnrollmentRejected", err)
+	}
+
+	// The audit row must carry the specific reason so operators can
+	// see this case in the rejection feed.
+	var sawReason bool
+	for _, e := range auditRec.events {
+		if e.Action == "agent.enrollment_rejected" &&
+			strings.Contains(string(e.Metadata), `"reason":"package_concurrently_deleted"`) {
+			sawReason = true
+			break
+		}
+	}
+	if !sawReason {
+		t.Errorf("expected agent.enrollment_rejected audit with reason=package_concurrently_deleted; got events: %v", auditRec.events)
+	}
+}
+
 func TestEnrollAgentDuplicateInstallIDRejected(t *testing.T) {
 	svc, _, agents, _, _ := newTestService(t)
 	pkgOut, err := svc.CreatePackage(context.Background(), validCreateInput())
