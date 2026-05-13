@@ -920,3 +920,268 @@ func TestDeploymentPackageRevokeIdempotent(t *testing.T) {
 		t.Errorf("deployment_package.revoked audit count = %d, want 1 (idempotent)", revokeAuditCount)
 	}
 }
+
+// --- GET /agent/me (H-007) -----------------------------------------
+
+// agentMeDTO mirrors the handler's success body. Kept local to
+// this test file so the test does not depend on internal handler
+// types (CLAUDE.md §8.6 — integration tests treat the HTTP
+// boundary as opaque).
+type agentMeDTO struct {
+	AgentID             string   `json:"agent_id"`
+	OrganizationID      string   `json:"organization_id"`
+	Status              string   `json:"status"`
+	DeploymentPackageID string   `json:"deployment_package_id"`
+	AgentVersion        string   `json:"agent_version"`
+	GroupName           string   `json:"group_name"`
+	Labels              []string `json:"labels"`
+}
+
+// enrolledAgent walks through the full create-package + enroll
+// flow and returns the resulting agent id + plaintext credential
+// for use by /agent/me tests.
+func enrolledAgent(t *testing.T, srv string, adminClient *http.Client) (agentID, credential string) {
+	t.Helper()
+	pkg := adminCreatePackage(t, srv, adminClient, createPackageBody{
+		Name:             "auth-test",
+		PackageType:      "baseline",
+		AgentVersion:     "0.1.0",
+		TTLSeconds:       3600,
+		MaxUses:          5,
+		DefaultGroupName: "Default",
+		DefaultLabels:    []string{"baseline"},
+	})
+	resp, err := enrollAgent(srv, map[string]any{
+		"bootstrap_secret": pkg.BootstrapSecret,
+		"hostname":         "auth-host",
+		"agent_version":    "0.1.0",
+	})
+	if err != nil {
+		t.Fatalf("enroll: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("enroll status = %d; body=%s", resp.StatusCode, b)
+	}
+	var enrolled struct {
+		AgentID         string `json:"agent_id"`
+		AgentCredential string `json:"agent_credential"`
+	}
+	decodeJSON(t, resp.Body, &enrolled)
+	if enrolled.AgentCredential == "" {
+		t.Fatal("enroll returned empty credential")
+	}
+	return enrolled.AgentID, enrolled.AgentCredential
+}
+
+func TestAgentMeHappyPath(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	agentID, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/agent/me", nil)
+	req.Header.Set("Authorization", "Bearer "+credential)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("/agent/me: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("/agent/me status = %d; body=%s", resp.StatusCode, b)
+	}
+	var got agentMeDTO
+	decodeJSON(t, resp.Body, &got)
+	if got.AgentID != agentID {
+		t.Errorf("agent_id = %q, want %q", got.AgentID, agentID)
+	}
+	if got.Status != "active" {
+		t.Errorf("status = %q, want active", got.Status)
+	}
+	if got.GroupName != "Default" {
+		t.Errorf("group_name = %q, want Default", got.GroupName)
+	}
+	// Response MUST NOT echo the credential or any hash. The raw
+	// JSON body is reread from a fresh request below to assert
+	// absence-of-substrings.
+}
+
+func TestAgentMeRejectsMissingHeader(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, _ := testServer(t, db)
+
+	resp, err := http.Get(srv.URL + "/api/v1/agent/me")
+	if err != nil {
+		t.Fatalf("/agent/me: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", resp.StatusCode)
+	}
+
+	// Codex P2 fix: even missing/malformed headers must land in
+	// the security audit feed so probing patterns are visible.
+	// The middleware now passes HeaderRejection=header_missing
+	// through to AuthenticateAgent for exactly this purpose.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var count int
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT COUNT(*) FROM audit_events
+			  WHERE action = 'agent.authentication_failed'
+			    AND metadata::text LIKE '%header_missing%'`,
+		).Scan(&count)
+	}); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("audit rows with reason=header_missing = %d, want 1", count)
+	}
+}
+
+func TestAgentMeRejectsMalformedHeader(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, _ := testServer(t, db)
+
+	cases := []string{
+		"",                   // missing
+		"not-bearer-scheme",  // wrong scheme
+		"Bearer",             // bearer but no token
+		"Bearer ",            // bearer with empty token
+		"Basic dXNlcjpwYXNz", // wrong scheme entirely
+	}
+	for _, header := range cases {
+		req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/agent/me", nil)
+		if header != "" {
+			req.Header.Set("Authorization", header)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("header %q: %v", header, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("header %q: status = %d, want 401", header, resp.StatusCode)
+		}
+	}
+}
+
+func TestAgentMeRejectsUnknownCredential(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, _ := testServer(t, db)
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/agent/me", nil)
+	req.Header.Set("Authorization", "Bearer this-credential-was-never-issued")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("/agent/me: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestAgentMeRejectsDisabledAgent(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	// Flip agent status to disabled via direct SQL (the agent-
+	// revoke API is not part of this PR).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE agents SET status = 'disabled' WHERE credential_hash IS NOT NULL`)
+		return err
+	}); err != nil {
+		t.Fatalf("disable agent: %v", err)
+	}
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/agent/me", nil)
+	req.Header.Set("Authorization", "Bearer "+credential)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("/agent/me: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestAgentMeOperatorCookieIsRejected(t *testing.T) {
+	// An authenticated operator cookie MUST NOT grant access to
+	// /agent/me — the agent and operator identity axes are kept
+	// strictly separate (CLAUDE.md §8.6).
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/agent/me", nil)
+	resp, err := adminClient.Do(req)
+	if err != nil {
+		t.Fatalf("/agent/me: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("admin cookie reached /agent/me; status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestAuthMeAgentBearerIsRejected(t *testing.T) {
+	// Symmetric: an agent bearer MUST NOT authenticate to the
+	// operator /auth/me endpoint. /auth/me requires a session
+	// cookie.
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/auth/me", nil)
+	req.Header.Set("Authorization", "Bearer "+credential)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("/auth/me: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("agent bearer reached /auth/me; status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestAgentMeResponseDoesNotEchoCredential(t *testing.T) {
+	// Belt-and-braces: read the raw response body and assert that
+	// the plaintext credential string does not appear anywhere in
+	// it. The handler uses a typed struct that excludes the
+	// credential field, but a regression that inlined a debug
+	// dump would be caught here.
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/agent/me", nil)
+	req.Header.Set("Authorization", "Bearer "+credential)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("/agent/me: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), credential) {
+		t.Error("/agent/me response echoed the plaintext credential")
+	}
+}

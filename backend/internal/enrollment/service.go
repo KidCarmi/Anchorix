@@ -367,6 +367,138 @@ func (s *Service) EnrollAgent(ctx context.Context, in EnrollAgentInput) (*Enroll
 	}, nil
 }
 
+// AuthenticateAgentInput is what the agent-auth middleware passes
+// to the service when validating an Authorization: Bearer header.
+// Plaintext credential is hashed inside this method; the value
+// never reaches the repository or any storage layer.
+//
+// Vocabulary note: AgentCredential is the post-enrollment bearer
+// credential the control plane issued in
+// EnrollAgentOutput.AgentCredential — NOT the bootstrap secret
+// attached to the deployment package. The two have different
+// lifecycles (one-per-package vs. one-per-agent) and different
+// trust boundaries; do not conflate them.
+//
+// HeaderRejection is the middleware's signal that the
+// Authorization header itself was unusable before any credential
+// was extracted (missing entirely, wrong scheme, or empty token).
+// When non-empty, the service short-circuits the credential
+// lookup and records the rejection so probing patterns show up
+// in the security audit feed alongside unknown-credential and
+// disabled-agent failures (CLAUDE.md §9 — every auth failure
+// is auditable).
+type AuthenticateAgentInput struct {
+	AgentCredential string // the agent_credential issued at enrollment
+	HeaderRejection string // non-empty signals a pre-credential header failure
+	RequestID       string // for audit correlation on failure
+	RemoteAddr      string // for audit metadata only; never persisted as-is
+}
+
+// AuthenticateAgent verifies an agent's bearer credential and
+// returns a narrow AuthenticatedAgent principal on success. Every
+// failure mode collapses to ErrAgentAuthenticationFailed at the
+// outer boundary; the internal reason is recorded as an
+// agent.authentication_failed audit event tagged
+// severity:"security" so operators can diagnose attempts without
+// the caller being able to enumerate state.
+//
+// We do NOT update last_seen_at here. last_seen_at is the
+// heartbeat-endpoint's responsibility (Phase 3); writing it on
+// every authenticated read would generate one row-update per
+// authenticated request, which is the wrong cost model.
+func (s *Service) AuthenticateAgent(ctx context.Context, in AuthenticateAgentInput) (*AuthenticatedAgent, error) {
+	if in.HeaderRejection != "" {
+		// Middleware classified the Authorization header itself as
+		// unusable. Audit the rejection so probing patterns
+		// (missing header, wrong scheme, empty token) are visible
+		// in the security feed, then surface the same
+		// ErrAgentAuthenticationFailed sentinel as any other
+		// failure mode (CLAUDE.md §6 deterministic auth).
+		s.recordAuthFailure(ctx, "", "", in.HeaderRejection, in)
+		return nil, ErrAgentAuthenticationFailed
+	}
+	if strings.TrimSpace(in.AgentCredential) == "" {
+		s.recordAuthFailure(ctx, "", "", "credential_empty", in)
+		return nil, ErrAgentAuthenticationFailed
+	}
+
+	hash := hashBearerToken(in.AgentCredential)
+	agent, err := s.agents.FindByCredentialHash(ctx, hash)
+	if err != nil {
+		if errors.Is(err, ErrAgentNotFound) {
+			s.recordAuthFailure(ctx, "", "", "credential_unknown", in)
+			return nil, ErrAgentAuthenticationFailed
+		}
+		return nil, fmt.Errorf("enrollment: lookup agent by credential: %w", err)
+	}
+
+	if agent.Status != AgentStatusActive {
+		// status "disabled" or "revoked": fail closed, audit the
+		// rejection so operators can see attempted use of a
+		// disabled agent's credential.
+		s.recordAuthFailure(ctx, agent.OrganizationID, agent.ID, "agent_status_"+string(agent.Status), in)
+		return nil, ErrAgentAuthenticationFailed
+	}
+
+	return &AuthenticatedAgent{
+		AgentID:             agent.ID,
+		OrganizationID:      agent.OrganizationID,
+		Status:              agent.Status,
+		DeploymentPackageID: agent.DeploymentPackageID,
+		AgentVersion:        agent.AgentVersion,
+		GroupName:           agent.GroupName,
+		Labels:              append([]string(nil), agent.Labels...),
+	}, nil
+}
+
+// recordAuthFailure writes an audit row for a failed agent-auth
+// attempt. Best-effort (error ignored): failing the
+// authentication response because the audit write failed would
+// let an attacker DOS agent-side connectivity by probing
+// audit-storage failures. The redaction allow-list +
+// audit-metadata structure guarantee that the plaintext credential
+// is never recorded.
+//
+// For unknown-credential failures we have no org context except
+// the v0.1 single-tenant fallback ("anchorix") — same convention
+// as auth.login_failed and the enrollment-rejection audit path.
+func (s *Service) recordAuthFailure(ctx context.Context, orgID, agentID, reason string, in AuthenticateAgentInput) {
+	if orgID == "" {
+		orgID = fallbackRejectionOrg
+	}
+	// audit.Event.Actor and TargetID are NOT NULL at the schema
+	// level and the storage-layer AuditRecorder enforces this with
+	// non-empty checks (audit.Recorder rejects empty Actor /
+	// TargetID even before SQL touches the row). For pre-credential
+	// rejections we do not have a real agent id, so we surface
+	// stable placeholders that mirror auth.login_failed's
+	// convention (Actor="<email>", TargetID="(none)").
+	actor := agentID
+	targetID := agentID
+	if actor == "" {
+		actor = "unknown_agent"
+	}
+	if targetID == "" {
+		targetID = "(none)"
+	}
+	md, _ := json.Marshal(map[string]any{
+		"reason":      reason,
+		"severity":    "security",
+		"agent_id":    agentID,
+		"remote_addr": in.RemoteAddr,
+	})
+	_ = s.audit.Record(ctx, audit.Event{
+		OrganizationID: orgID,
+		Actor:          actor,
+		ActorType:      "agent",
+		Action:         "agent.authentication_failed",
+		TargetType:     "agent",
+		TargetID:       targetID,
+		RequestID:      in.RequestID,
+		Metadata:       md,
+	})
+}
+
 // ListAgents returns the agents enrolled in the organization. The
 // scoping check is the caller's responsibility — the HTTP handler
 // passes the authenticated operator's organization id, and the
@@ -545,13 +677,24 @@ func (s *Service) recordRejection(ctx context.Context, orgID, packageID, reason 
 		"has_install_id":        in.InstallID != "",
 		"has_machine_fp":        in.MachineFingerprint != "",
 	})
+	// audit.Event.TargetID is NOT NULL and the AuditRecorder
+	// rejects empty TargetID. For the "bootstrap_secret_unknown"
+	// path the package id is empty by definition, so we surface a
+	// stable placeholder that mirrors auth.login_failed's
+	// "(none)" convention. Without it the audit write would
+	// silently fail and the rejection would not show up in the
+	// security feed.
+	targetID := packageID
+	if targetID == "" {
+		targetID = "(none)"
+	}
 	return s.audit.Record(ctx, audit.Event{
 		OrganizationID: orgID,
 		Actor:          "unknown_agent",
 		ActorType:      "agent",
 		Action:         "agent.enrollment_rejected",
 		TargetType:     "deployment_package",
-		TargetID:       packageID,
+		TargetID:       targetID,
 		RequestID:      in.RequestID,
 		Metadata:       md,
 	})

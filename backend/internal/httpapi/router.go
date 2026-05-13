@@ -71,18 +71,27 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 		resolver(mw.RequireAdmin(handlers.DeploymentPackagesRevoke(deploymentDeps))))
 
 	// --- agents ---
-	// List is operator-only; enroll is anonymous (the bootstrap
-	// secret IS the auth). Heartbeat / inventory remain stubs for
-	// the agent-bearer credential pass in Phase 3. The legacy
+	// /agents/* is the operator-facing surface (list, enroll —
+	// enroll is anonymous because the bootstrap secret IS the auth).
+	// /agent/* (singular) is the AGENT-facing surface, gated by
+	// the agent-bearer credential middleware introduced in PR-013's
+	// follow-up. Operator session and agent bearer are independent
+	// axes — the resolver/RequireAuth combination guards operator
+	// endpoints, while RequireAuthenticatedAgent guards agent
+	// endpoints. CLAUDE.md §8.6: no mixed identity state.
+	//
+	// Heartbeat / inventory remain stubs for Phase 3. The legacy
 	// POST /agents/enrollment-tokens path is intentionally absent
 	// from this router: deployment packages
 	// (POST /deployment-packages) replace the concept (see
 	// docs/engineering/AGENT_ENROLLMENT.md). Requests to the old
 	// path now produce a 404, the same response any other unknown
 	// route gets.
+	agentAuth := mw.RequireAuthenticatedAgent(deps.EnrollmentService)
 	mux.Handle("GET /agents", resolver(mw.RequireAuth(handlers.AgentsList(agentsDeps))))
 	mux.HandleFunc("GET /agents/{id}", handlers.AgentsGet)
 	mux.Handle("POST /agents/enroll", handlers.AgentsEnroll(agentsDeps))
+	mux.Handle("GET /agent/me", agentAuth(handlers.AgentMe()))
 	mux.HandleFunc("POST /agents/{id}/heartbeat", handlers.AgentsHeartbeat)
 	mux.HandleFunc("POST /agents/{id}/inventory", handlers.AgentsInventory)
 

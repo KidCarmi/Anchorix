@@ -200,4 +200,18 @@ var (
 	// state — re-revoking a revoked package is a no-op, not an
 	// error.
 	ErrPackageAlreadyRevoked = errors.New("enrollment: deployment package already revoked")
+
+	// ErrAgentNotFound indicates a credential-hash lookup found no
+	// agent. Returned by AgentRepository.FindByCredentialHash and
+	// folded into ErrAgentAuthenticationFailed by the service
+	// before reaching the HTTP boundary.
+	ErrAgentNotFound = errors.New("enrollment: agent not found")
+
+	// ErrAgentAuthenticationFailed is the wire-safe outer error
+	// returned by AuthenticateAgent for any failure mode (unknown
+	// credential, malformed input, revoked/disabled agent). The
+	// internal reason is recorded in an audit event tagged
+	// severity:"security" but never surfaced to the caller
+	// (CLAUDE.md §6 deterministic auth).
+	ErrAgentAuthenticationFailed = errors.New("enrollment: agent authentication failed")
 )
