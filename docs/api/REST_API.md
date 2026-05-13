@@ -119,43 +119,184 @@ Failure responses:
 | 401    | `unauthorized`    | No session cookie, or session is unknown                   |
 | 401    | `session_expired` | Cookie validates but the session is revoked or expired     |
 
-## Agents
+## Deployment Packages
 
-| Method | Path                                  | Auth   | Purpose                                          |
-| ------ | ------------------------------------- | ------ | ------------------------------------------------ |
-| GET    | `/agents`                             | user   | List registered agents                           |
-| GET    | `/agents/{id}`                        | user   | Get a single agent                               |
-| POST   | `/agents/enrollment-tokens`           | user   | Issue a single-use enrollment token              |
-| POST   | `/agents/enroll`                      | token  | Agent enrollment (consumes token + pubkey)       |
-| POST   | `/agents/{id}/heartbeat`              | agent  | Liveness ping from the agent                     |
-| POST   | `/agents/{id}/inventory`              | agent  | Upload a batch of certificate observations       |
+An admin creates a **deployment package** that a fleet-management
+tool (SCCM, Intune, GPO, etc.) deploys silently to Windows endpoints.
+Each package carries a single bootstrap secret used by every agent
+the package enrolls. Lifecycle is bounded by `max_uses`,
+`expires_at`, and operator revocation; all three are checked
+atomically on every enrollment.
 
-### Enrollment
+> **Revocation in PR-013.** The `deployment_packages` table has
+> `revoked_at`, `revoked_by_user_id`, and `revoked_reason` columns,
+> and the enrollment endpoint refuses to enroll new agents through
+> a revoked package. **There is no operator-facing revoke endpoint
+> yet** — the v0.1 way to revoke a package is a direct
+> `UPDATE deployment_packages SET revoked_at = now()`. A
+> `POST /deployment-packages/{id}/revoke` endpoint is a Phase 2
+> follow-up; see `docs/engineering/AGENT_ENROLLMENT.md` non-goals.
 
-Enrollment tokens are returned **once** to the issuing operator. The server
-stores only `sha256(token)`. Tokens have a TTL of `ANCHORIX_ENROLLMENT_TOKEN_TTL`
-(default 15m).
+End-to-end design lives in
+[`docs/engineering/AGENT_ENROLLMENT.md`](../engineering/AGENT_ENROLLMENT.md).
 
-`POST /agents/enroll` body:
+| Method | Path                                  | Auth   | Purpose                                                 |
+| ------ | ------------------------------------- | ------ | ------------------------------------------------------- |
+| POST   | `/deployment-packages`                | admin  | Create a deployment package; bootstrap secret shown once |
+
+### `POST /deployment-packages`
+
+Request body:
 
 ```json
 {
-  "token": "<single-use enrollment token>",
-  "hostname": "ws-001.corp.example",
+  "name": "Baseline Windows 0.1.0",
+  "description": "Approved baseline build",
+  "package_type": "baseline",
   "agent_version": "0.1.0",
-  "public_key_pem": "-----BEGIN PUBLIC KEY-----\n..."
+  "ttl_seconds": 604800,
+  "max_uses": 500,
+  "default_group_name": "Default",
+  "default_labels": ["baseline", "win"]
 }
 ```
 
-Response:
+`package_type` is one of `baseline`, `bulk_sccm`, `technician`,
+`vip`, `lab`. `ttl_seconds` and `max_uses` must both be positive.
+
+Successful response — `201 Created`:
+
+```json
+{
+  "id": "...",
+  "organization_id": "anchorix",
+  "name": "Baseline Windows 0.1.0",
+  "package_type": "baseline",
+  "agent_version": "0.1.0",
+  "max_uses": 500,
+  "uses_count": 0,
+  "expires_at": "2026-06-08T12:00:00Z",
+  "created_at": "2026-06-01T12:00:00Z",
+  "default_group_name": "Default",
+  "default_labels": ["baseline", "win"],
+  "bootstrap_secret": "<base64-url, shown exactly once>",
+  "bootstrap_metadata": {
+    "control_plane_url": "https://anchorix.example.com",
+    "organization_id": "anchorix",
+    "package_id": "...",
+    "expires_at": "2026-06-08T12:00:00Z",
+    "max_uses": 500
+  }
+}
+```
+
+The `bootstrap_secret` field appears in this response **once**. It
+is never echoed by any other endpoint; the server stores only
+`sha256(bootstrap_secret)`. The `bootstrap_metadata` block carries
+the minimum installer-side configuration so a future installer
+generator (MSI / Intune profile / GPO) can pre-bake the values.
+
+Failure responses:
+
+| Status | `code`         | When                                                            |
+| ------ | -------------- | --------------------------------------------------------------- |
+| 400    | `bad_request`  | Body is malformed; `package_type` invalid; `ttl_seconds` or `max_uses` non-positive |
+| 401    | `unauthorized` | No session                                                      |
+| 403    | `forbidden`    | Authenticated user does not have the `admin` role               |
+
+## Agents
+
+| Method | Path                                  | Auth     | Purpose                                                |
+| ------ | ------------------------------------- | -------- | ------------------------------------------------------ |
+| GET    | `/agents`                             | user     | List registered agents (org-scoped)                    |
+| GET    | `/agents/{id}`                        | user     | Get a single agent *(stub — Phase 2 continuation)*     |
+| POST   | `/agents/enroll`                      | bootstrap| Agent enrollment (consumes bootstrap secret)           |
+| POST   | `/agents/{id}/heartbeat`              | agent    | *Stub — Phase 3.*                                      |
+| POST   | `/agents/{id}/inventory`              | agent    | *Stub — Phase 3.*                                      |
+
+The original v0.1 schema proposal included a
+`POST /agents/enrollment-tokens` endpoint for issuing single-use
+enrollment tokens. PR-013 supersedes that concept with deployment
+packages; the path is no longer routed and returns `404 not_found`.
+
+### `POST /agents/enroll`
+
+Anonymous endpoint. The bootstrap secret **is** the authentication;
+SCCM-style fleet rollouts call this endpoint silently on first boot
+of the agent service.
+
+Request body:
+
+```json
+{
+  "bootstrap_secret": "<from deployment package>",
+  "hostname": "ws-001.corp.example",
+  "agent_version": "0.1.0",
+  "machine_fingerprint": "<optional, hashed before storage>",
+  "install_id": "<optional, idempotent installer id>"
+}
+```
+
+`machine_fingerprint` and `install_id` are both optional but
+recommended for v0.1. `install_id` is unique per organization; a
+second enrollment with the same `install_id` is rejected (fail
+closed — re-issuing a credential without an explicit reinstall
+flow is out of scope for v0.1).
+
+Successful response — `201 Created`:
 
 ```json
 {
   "agent_id": "...",
-  "agent_token": "<bearer token, shown once>",
-  "control_plane_fingerprint_sha256": "..."
+  "organization_id": "anchorix",
+  "status": "active",
+  "agent_credential": "<bearer credential, shown exactly once>",
+  "enrolled_at": "2026-06-01T12:00:00Z"
 }
 ```
+
+`agent_credential` is the v0.1 bearer identity. mTLS replacement is
+deferred to Phase 6 (CLAUDE.md §6.4).
+
+Failure responses use a single deterministic envelope so the caller
+cannot enumerate package state:
+
+| Status | `code`                  | When                                                                    |
+| ------ | ----------------------- | ----------------------------------------------------------------------- |
+| 401    | `enrollment_rejected`   | Bootstrap secret unknown / expired package / revoked package / exhausted package / duplicate `install_id` / malformed body |
+
+The specific internal reason is recorded as an
+`agent.enrollment_rejected` audit event with `severity: "security"`
+so operators can diagnose rejections without leaking package state
+to the caller.
+
+### `GET /agents`
+
+Operator-only, organization-scoped. Returns the most-recently-enrolled
+agents first.
+
+```json
+{
+  "items": [
+    {
+      "id": "...",
+      "organization_id": "anchorix",
+      "hostname": "ws-001.corp.example",
+      "status": "active",
+      "agent_version": "0.1.0",
+      "enrolled_at": "2026-06-01T12:00:00Z",
+      "last_seen_at": "2026-06-01T12:00:00Z",
+      "deployment_package_id": "...",
+      "group_name": "Default",
+      "labels": ["baseline", "win"]
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+`next_cursor` is always `null` in v0.1; pagination lands when
+fleets grow large enough to need it.
 
 ### Inventory upload
 
@@ -254,6 +395,7 @@ land in later phases.
 | `rate_limited`           | 429  | Rate limit hit                                         |
 | `private_key_rejected`   | 400  | Inventory upload contained private key material        |
 | `enrollment_invalid`     | 400  | Token expired, consumed, or hostname mismatch          |
+| `enrollment_rejected`    | 401  | Agent enrollment failed for any reason (generic; see audit) |
 | `not_implemented`        | 501  | Endpoint exists in contract but not in this build      |
 | `internal_error`         | 500  | Unhandled server error                                 |
 

@@ -14,6 +14,7 @@ import (
 
 	"github.com/kidcarmi/anchorix/backend/internal/auth"
 	"github.com/kidcarmi/anchorix/backend/internal/config"
+	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
 )
 
@@ -21,8 +22,9 @@ import (
 // The composition root in cmd/anchorix constructs one of these and
 // passes it to NewServer (CLAUDE.md §8.8 constructor DI).
 type Dependencies struct {
-	AuthService  *auth.Service
-	CookieSigner *auth.SignedCookie
+	AuthService       *auth.Service
+	CookieSigner      *auth.SignedCookie
+	EnrollmentService *enrollment.Service
 }
 
 // Server owns the HTTP listener and graceful shutdown lifecycle.
@@ -47,8 +49,8 @@ func NewServer(cfg *config.Config, log *logger.Logger, deps Dependencies) (*Serv
 	if log == nil {
 		return nil, errors.New("nil logger")
 	}
-	if deps.AuthService == nil || deps.CookieSigner == nil {
-		return nil, errors.New("httpapi: incomplete Dependencies (AuthService + CookieSigner required)")
+	if deps.AuthService == nil || deps.CookieSigner == nil || deps.EnrollmentService == nil {
+		return nil, errors.New("httpapi: incomplete Dependencies (AuthService + CookieSigner + EnrollmentService required)")
 	}
 	readiness := NewReadiness()
 	router := newRouter(cfg, log, readiness, deps)

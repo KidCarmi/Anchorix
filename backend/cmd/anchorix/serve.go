@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 
 	"github.com/kidcarmi/anchorix/backend/internal/auth"
 	"github.com/kidcarmi/anchorix/backend/internal/clock"
 	"github.com/kidcarmi/anchorix/backend/internal/config"
+	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
 	"github.com/kidcarmi/anchorix/backend/internal/httpapi"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
 	"github.com/kidcarmi/anchorix/backend/internal/storage/postgres"
@@ -66,10 +68,20 @@ func cmdServe(ctx context.Context, cfg *config.Config, log *logger.Logger) error
 		return fmt.Errorf("auth service: %w", err)
 	}
 
+	deploymentPackagesRepo := postgres.NewDeploymentPackageRepository(db)
+	agentsRepo := postgres.NewAgentRepository(db)
+	enrollmentService, err := enrollment.NewService(
+		deploymentPackagesRepo, agentsRepo, auditRecorder, db, clock.System{}, rand.Reader,
+	)
+	if err != nil {
+		return fmt.Errorf("enrollment service: %w", err)
+	}
+
 	// HTTP layer.
 	srv, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{
-		AuthService:  authService,
-		CookieSigner: signer,
+		AuthService:       authService,
+		CookieSigner:      signer,
+		EnrollmentService: enrollmentService,
 	})
 	if err != nil {
 		return fmt.Errorf("init server: %w", err)

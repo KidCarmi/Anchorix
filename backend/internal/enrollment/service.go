@@ -1,0 +1,479 @@
+package enrollment
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strings"
+	"time"
+
+	"github.com/kidcarmi/anchorix/backend/internal/audit"
+	"github.com/kidcarmi/anchorix/backend/internal/clock"
+	"github.com/kidcarmi/anchorix/backend/internal/ids"
+)
+
+// Transactor runs fn inside a single transaction. The implementation
+// (storage/postgres.DB) binds a tx to the ctx so repository calls
+// made with that ctx automatically participate. The enrollment
+// service uses this to make package creation and agent enrollment
+// atomic with their audit events across multiple repository writes
+// without leaking pgx.Tx outside the storage layer (CLAUDE.md §8.6,
+// §18). The interface shape is identical to auth.Transactor on
+// purpose so the same *postgres.DB satisfies both.
+type Transactor interface {
+	WithTx(ctx context.Context, fn func(ctx context.Context) error) error
+}
+
+// Service is the enrollment domain entrypoint. HTTP handlers depend
+// on this struct, never on the Repository / Transactor types
+// directly (CLAUDE.md §8.6, §8.8).
+type Service struct {
+	packages DeploymentPackageRepository
+	agents   AgentRepository
+	audit    audit.Recorder
+	tx       Transactor
+	clock    clock.Clock
+	rng      io.Reader // crypto/rand.Reader in prod; deterministic in tests
+}
+
+// NewService wires the service. Constructor-based DI per CLAUDE.md
+// §8.8. Returns a validation error if any dependency is missing —
+// never panics (CLAUDE.md §18: no panic-driven business flow).
+func NewService(
+	packages DeploymentPackageRepository,
+	agents AgentRepository,
+	auditRec audit.Recorder,
+	tx Transactor,
+	clk clock.Clock,
+	rng io.Reader,
+) (*Service, error) {
+	switch {
+	case packages == nil:
+		return nil, errors.New("enrollment.NewService: deployment package repository required")
+	case agents == nil:
+		return nil, errors.New("enrollment.NewService: agent repository required")
+	case auditRec == nil:
+		return nil, errors.New("enrollment.NewService: audit recorder required")
+	case tx == nil:
+		return nil, errors.New("enrollment.NewService: transactor required")
+	case clk == nil:
+		return nil, errors.New("enrollment.NewService: clock required")
+	}
+	if rng == nil {
+		// crypto/rand.Reader is the production default; making it
+		// explicit keeps tests honest (a missing-rng test will
+		// still be deterministic).
+		return nil, errors.New("enrollment.NewService: rng required")
+	}
+	return &Service{
+		packages: packages,
+		agents:   agents,
+		audit:    auditRec,
+		tx:       tx,
+		clock:    clk,
+		rng:      rng,
+	}, nil
+}
+
+// CreatePackageInput is what an operator supplies when creating a
+// deployment package. All fields are validated by CreatePackage
+// before any state changes.
+type CreatePackageInput struct {
+	OrganizationID   string
+	CreatedByUserID  string
+	Name             string
+	Description      string
+	PackageType      PackageType
+	AgentVersion     string
+	TTL              time.Duration // expires_at = clock.Now() + TTL
+	MaxUses          int
+	DefaultGroupName string
+	DefaultLabels    []string
+}
+
+// CreatePackageOutput carries the freshly created package and the
+// plaintext bootstrap secret. The plaintext appears in exactly one
+// place in the application — this struct — and the HTTP handler
+// echoes it back to the operator once before discarding it.
+type CreatePackageOutput struct {
+	Package         *DeploymentPackage
+	BootstrapSecret string
+}
+
+// CreatePackage validates the input, generates a fresh high-entropy
+// bootstrap secret, and writes the package + an audit event in a
+// single transaction.
+//
+// Atomicity: the package row and the deployment_package.created
+// audit event are committed together. An audit-write failure rolls
+// the package insert back so the control plane can never reach a
+// state where a package exists without a matching audit row
+// (CLAUDE.md §9, §18). Proved by an integration test that injects
+// a failing audit recorder.
+func (s *Service) CreatePackage(ctx context.Context, in CreatePackageInput) (*CreatePackageOutput, error) {
+	if err := in.validate(); err != nil {
+		return nil, err
+	}
+
+	plaintext, hash, err := generateBearerToken(s.rng)
+	if err != nil {
+		return nil, err
+	}
+
+	now := s.clock.Now()
+	pkg := &DeploymentPackage{
+		ID:               ids.New(),
+		OrganizationID:   in.OrganizationID,
+		Name:             strings.TrimSpace(in.Name),
+		Description:      in.Description,
+		PackageType:      in.PackageType,
+		AgentVersion:     in.AgentVersion,
+		MaxUses:          in.MaxUses,
+		UsesCount:        0,
+		ExpiresAt:        now.Add(in.TTL),
+		CreatedByUserID:  in.CreatedByUserID,
+		CreatedAt:        now,
+		DefaultGroupName: in.DefaultGroupName,
+		DefaultLabels:    append([]string(nil), in.DefaultLabels...),
+	}
+
+	if err := s.tx.WithTx(ctx, func(ctx context.Context) error {
+		if err := s.packages.Create(ctx, pkg, hash); err != nil {
+			return fmt.Errorf("enrollment: create package: %w", err)
+		}
+		// Audit metadata captures the operator-visible knobs of the
+		// package but DELIBERATELY excludes the bootstrap secret and
+		// its hash — those must never appear in audit_events
+		// (CLAUDE.md §6.9). The hash is stored in the
+		// deployment_packages row only.
+		md, _ := json.Marshal(map[string]any{
+			"package_type":  string(in.PackageType),
+			"agent_version": in.AgentVersion,
+			"max_uses":      in.MaxUses,
+			"expires_at":    pkg.ExpiresAt.UTC().Format(time.RFC3339),
+			"group_name":    in.DefaultGroupName,
+			"label_count":   len(in.DefaultLabels),
+		})
+		return s.audit.Record(ctx, audit.Event{
+			OrganizationID: in.OrganizationID,
+			Actor:          in.CreatedByUserID,
+			ActorType:      "user",
+			Action:         "deployment_package.created",
+			TargetType:     "deployment_package",
+			TargetID:       pkg.ID,
+			Metadata:       md,
+		})
+	}); err != nil {
+		return nil, err
+	}
+
+	return &CreatePackageOutput{Package: pkg, BootstrapSecret: plaintext}, nil
+}
+
+// EnrollAgentInput is what a freshly installed agent supplies on
+// its first call to /api/v1/agents/enroll. The bootstrap secret is
+// the only credential; the rest are identity hints that help the
+// operator UI recognize the endpoint later.
+type EnrollAgentInput struct {
+	BootstrapSecret    string
+	Hostname           string
+	AgentVersion       string
+	MachineFingerprint string // raw fingerprint; hashed before storage
+	InstallID          string
+	RequestID          string // forwarded to the audit row for correlation
+}
+
+// EnrollAgentOutput is what the agent receives back. AgentCredential
+// is the plaintext bearer credential — it appears in exactly one
+// place in the application (this struct) and the HTTP handler
+// echoes it back once.
+type EnrollAgentOutput struct {
+	Agent           *Agent
+	AgentCredential string
+	OrganizationID  string
+}
+
+// EnrollAgent verifies the bootstrap secret, increments the
+// package's uses_count atomically, creates the agent row, and
+// records an audit event — all in a single transaction.
+//
+// Atomicity: package usage, agent row, and audit event all commit
+// together or all roll back. The atomic increment in
+// IncrementUses() is the choke point that makes concurrent
+// SCCM-style mass enrollment safe under MaxUses — if a thousand
+// devices race to enroll through a package with max_uses=500, no
+// more than 500 succeed.
+//
+// Rejection model: every failure mode (unknown secret, expired
+// package, revoked package, exhausted package, malformed input,
+// duplicate install_id) collapses to ErrEnrollmentRejected at the
+// outer boundary. The internal reason is recorded as an audit
+// event with severity:"security" so operators can diagnose
+// rejections without leaking package state to the caller
+// (CLAUDE.md §6: deterministic behavior; no enumeration).
+func (s *Service) EnrollAgent(ctx context.Context, in EnrollAgentInput) (*EnrollAgentOutput, error) {
+	if err := in.validate(); err != nil {
+		// Don't audit input validation failures — the request never
+		// even produced a package_id lookup, so there is nothing
+		// for an operator to investigate. The HTTP layer rejects
+		// the request with the same generic envelope as a bad
+		// bootstrap secret.
+		return nil, ErrEnrollmentRejected
+	}
+
+	hash := hashBearerToken(in.BootstrapSecret)
+	pkg, err := s.packages.GetByBootstrapHash(ctx, hash)
+	if err != nil {
+		if errors.Is(err, ErrPackageNotFound) {
+			// Bootstrap secret matched no package. We do not know
+			// which organization this attempt belongs to (or if it
+			// belongs to one at all), so the rejection is recorded
+			// under the v0.1 single-tenant scope and the audit
+			// write is best-effort: failing the response because of
+			// an audit-side issue when we do not even have a
+			// package id to attribute the rejection to would force
+			// callers to retry against an unknown-secret path, and
+			// that retry would itself be unauditable. Multi-tenant
+			// will need a different policy (CLAUDE.md §4 —
+			// multi-tenant org isolation is explicitly
+			// v0.1-out-of-scope).
+			_ = s.recordRejection(ctx, fallbackRejectionOrg, "", "bootstrap_secret_unknown", in)
+			return nil, ErrEnrollmentRejected
+		}
+		return nil, fmt.Errorf("enrollment: lookup package: %w", err)
+	}
+
+	now := s.clock.Now()
+	// Pre-check before opening the transaction. The authoritative
+	// check is the conditional UPDATE inside IncrementUses below;
+	// this early return saves us a tx round trip on the common
+	// "already revoked" / "already expired" cases without weakening
+	// the atomicity guarantee.
+	if err := pkg.activeAt(now); err != nil {
+		if auditErr := s.recordRejection(ctx, pkg.OrganizationID, pkg.ID, rejectionReason(err), in); auditErr != nil {
+			// Known-package rejection: failing to audit the security
+			// event is itself a security defect, surface as an
+			// internal error rather than silently dropping the
+			// rejection record (CLAUDE.md §9 — audit is not optional
+			// on security-significant flows).
+			return nil, fmt.Errorf("enrollment: record rejection: %w", auditErr)
+		}
+		return nil, ErrEnrollmentRejected
+	}
+
+	credPlain, credHash, err := generateBearerToken(s.rng)
+	if err != nil {
+		return nil, err
+	}
+
+	var fingerprintHash []byte
+	if in.MachineFingerprint != "" {
+		fingerprintHash = hashFingerprint(in.MachineFingerprint)
+	}
+
+	agent := &Agent{
+		ID:                     ids.New(),
+		OrganizationID:         pkg.OrganizationID,
+		Hostname:               strings.TrimSpace(in.Hostname),
+		DisplayName:            "",
+		Status:                 AgentStatusActive,
+		EnrolledAt:             now,
+		LastSeenAt:             now,
+		DeploymentPackageID:    pkg.ID,
+		AgentVersion:           in.AgentVersion,
+		MachineFingerprintHash: fingerprintHash,
+		InstallID:              strings.TrimSpace(in.InstallID),
+		GroupName:              pkg.DefaultGroupName,
+		Labels:                 append([]string(nil), pkg.DefaultLabels...),
+		UpdatedAt:              now,
+	}
+
+	if err := s.tx.WithTx(ctx, func(ctx context.Context) error {
+		// Atomic guard against the three lifecycle bounds. If a
+		// concurrent caller exhausts the package between our
+		// pre-check above and this UPDATE, IncrementUses returns
+		// ErrPackageExhausted (or ErrPackageRevoked / ErrPackageExpired)
+		// and the entire transaction rolls back.
+		if err := s.packages.IncrementUses(ctx, pkg.ID, now); err != nil {
+			return err
+		}
+		if err := s.agents.Create(ctx, agent, credHash); err != nil {
+			return err
+		}
+		md, _ := json.Marshal(map[string]any{
+			"deployment_package_id": pkg.ID,
+			"hostname":              agent.Hostname,
+			"agent_version":         agent.AgentVersion,
+			"group_name":            agent.GroupName,
+			"label_count":           len(agent.Labels),
+		})
+		return s.audit.Record(ctx, audit.Event{
+			OrganizationID: pkg.OrganizationID,
+			Actor:          agent.ID,
+			ActorType:      "agent",
+			Action:         "agent.enrolled",
+			TargetType:     "agent",
+			TargetID:       agent.ID,
+			RequestID:      in.RequestID,
+			Metadata:       md,
+		})
+	}); err != nil {
+		switch {
+		case errors.Is(err, ErrPackageRevoked),
+			errors.Is(err, ErrPackageExpired),
+			errors.Is(err, ErrPackageExhausted):
+			// Atomic-update race lost. The rejection MUST be audited
+			// — failure to audit a security event is itself a
+			// security defect (CLAUDE.md §9). Surface audit failure
+			// as an internal error rather than swallowing it.
+			if auditErr := s.recordRejection(ctx, pkg.OrganizationID, pkg.ID, rejectionReason(err), in); auditErr != nil {
+				return nil, fmt.Errorf("enrollment: record rejection: %w", auditErr)
+			}
+			return nil, ErrEnrollmentRejected
+		case errors.Is(err, ErrAgentAlreadyEnrolled):
+			if auditErr := s.recordRejection(ctx, pkg.OrganizationID, pkg.ID, "install_id_already_enrolled", in); auditErr != nil {
+				return nil, fmt.Errorf("enrollment: record rejection: %w", auditErr)
+			}
+			return nil, ErrEnrollmentRejected
+		case errors.Is(err, ErrPackageNotFound):
+			// IncrementUses returns ErrPackageNotFound when the
+			// package row disappeared between the conditional
+			// UPDATE and the follow-up classification SELECT —
+			// almost always a concurrent operator hard-delete of
+			// the package. The agent must still see the standard
+			// generic rejection envelope (CLAUDE.md §6: no
+			// enumeration via error code), so map this case to
+			// ErrEnrollmentRejected rather than letting it fall
+			// through to a 500.
+			//
+			// pkg.OrganizationID is the org we resolved BEFORE the
+			// transaction, so we can still scope the audit row
+			// correctly even though the package row itself is
+			// gone.
+			if auditErr := s.recordRejection(ctx, pkg.OrganizationID, pkg.ID, "package_concurrently_deleted", in); auditErr != nil {
+				return nil, fmt.Errorf("enrollment: record rejection: %w", auditErr)
+			}
+			return nil, ErrEnrollmentRejected
+		}
+		return nil, err
+	}
+
+	return &EnrollAgentOutput{
+		Agent:           agent,
+		AgentCredential: credPlain,
+		OrganizationID:  pkg.OrganizationID,
+	}, nil
+}
+
+// ListAgents returns the agents enrolled in the organization. The
+// scoping check is the caller's responsibility — the HTTP handler
+// passes the authenticated operator's organization id, and the
+// repository's SQL is keyed by organization_id.
+func (s *Service) ListAgents(ctx context.Context, organizationID string) ([]Agent, error) {
+	if strings.TrimSpace(organizationID) == "" {
+		return nil, errors.New("enrollment: list agents: organization id required")
+	}
+	return s.agents.List(ctx, organizationID)
+}
+
+// fallbackRejectionOrg is the v0.1 single-tenant organization scope
+// used for audit rows where the rejection happened before we could
+// identify the operator's organization (e.g. an unknown bootstrap
+// secret). Mirrors the convention used by auth.Service for
+// auth.login_failed when the email did not resolve to a user.
+const fallbackRejectionOrg = "anchorix"
+
+// recordRejection writes an audit row for a failed enrollment and
+// returns the audit-writer's error so callers can decide whether
+// to surface it.
+//
+// Policy split (callers enforce, not this function):
+//
+//   - Known-package rejections (revoked / expired / exhausted /
+//     duplicate install_id): the caller propagates a non-nil error
+//     as an internal-error response. Failing to audit a security
+//     event is itself a security defect (CLAUDE.md §9 — audit is
+//     not optional on security-significant flows).
+//   - Unknown-bootstrap-secret rejections: the caller discards the
+//     returned error and proceeds with ErrEnrollmentRejected.
+//     Without a package id we have no org context except the v0.1
+//     single-tenant fallback, and forcing the response to fail
+//     when audit cannot write would let attackers DOS the agent
+//     enrollment endpoint indirectly via audit-storage problems.
+//
+// Metadata never carries the bootstrap secret or any agent
+// credential.
+func (s *Service) recordRejection(ctx context.Context, orgID, packageID, reason string, in EnrollAgentInput) error {
+	md, _ := json.Marshal(map[string]any{
+		"reason":                reason,
+		"severity":              "security",
+		"deployment_package_id": packageID,
+		"hostname":              strings.TrimSpace(in.Hostname),
+		"agent_version":         in.AgentVersion,
+		"has_install_id":        in.InstallID != "",
+		"has_machine_fp":        in.MachineFingerprint != "",
+	})
+	return s.audit.Record(ctx, audit.Event{
+		OrganizationID: orgID,
+		Actor:          "unknown_agent",
+		ActorType:      "agent",
+		Action:         "agent.enrollment_rejected",
+		TargetType:     "deployment_package",
+		TargetID:       packageID,
+		RequestID:      in.RequestID,
+		Metadata:       md,
+	})
+}
+
+// rejectionReason maps the internal lifecycle errors to short
+// machine-stable strings used in audit metadata. These strings are
+// stable across releases — operators may grep them.
+func rejectionReason(err error) string {
+	switch {
+	case errors.Is(err, ErrPackageRevoked):
+		return "package_revoked"
+	case errors.Is(err, ErrPackageExpired):
+		return "package_expired"
+	case errors.Is(err, ErrPackageExhausted):
+		return "package_exhausted"
+	}
+	return "unknown"
+}
+
+// validate is the input-validation helper for CreatePackage. It
+// returns ErrInvalidPackageInput wrapped with a short reason so
+// tests can assert on errors.Is(err, ErrInvalidPackageInput) while
+// developers see the specific cause in the wrapped message.
+func (in CreatePackageInput) validate() error {
+	if strings.TrimSpace(in.OrganizationID) == "" {
+		return fmt.Errorf("%w: organization id required", ErrInvalidPackageInput)
+	}
+	if strings.TrimSpace(in.CreatedByUserID) == "" {
+		return fmt.Errorf("%w: creator user id required", ErrInvalidPackageInput)
+	}
+	if strings.TrimSpace(in.Name) == "" {
+		return fmt.Errorf("%w: name required", ErrInvalidPackageInput)
+	}
+	if !in.PackageType.Valid() {
+		return fmt.Errorf("%w: package_type %q invalid", ErrInvalidPackageInput, in.PackageType)
+	}
+	if in.TTL <= 0 {
+		return fmt.Errorf("%w: ttl must be positive", ErrInvalidPackageInput)
+	}
+	if in.MaxUses <= 0 {
+		return fmt.Errorf("%w: max_uses must be positive", ErrInvalidPackageInput)
+	}
+	return nil
+}
+
+func (in EnrollAgentInput) validate() error {
+	if strings.TrimSpace(in.BootstrapSecret) == "" {
+		return ErrInvalidEnrollmentInput
+	}
+	if strings.TrimSpace(in.Hostname) == "" {
+		return ErrInvalidEnrollmentInput
+	}
+	return nil
+}

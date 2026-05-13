@@ -51,6 +51,12 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 	}
 	resolver := mw.SessionResolver(deps.AuthService, deps.CookieSigner, cfg.SessionCookieName)
 
+	agentsDeps := handlers.AgentsDeps{Service: deps.EnrollmentService}
+	deploymentDeps := handlers.DeploymentPackageDeps{
+		Service:       deps.EnrollmentService,
+		PublicBaseURL: cfg.PublicBaseURL,
+	}
+
 	// --- auth ---
 	// Login is anonymous; the session resolver runs but does not block.
 	mux.Handle("POST /auth/login", resolver(handlers.AuthLogin(authDeps)))
@@ -58,13 +64,25 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 	mux.Handle("POST /auth/logout", resolver(mw.RequireAuth(handlers.AuthLogout(authDeps))))
 	mux.Handle("GET /auth/me", resolver(mw.RequireAuth(handlers.AuthMe())))
 
+	// --- deployment packages (admin-only) ---
+	mux.Handle("POST /deployment-packages",
+		resolver(mw.RequireAdmin(handlers.DeploymentPackagesCreate(deploymentDeps))))
+
 	// --- agents ---
-	mux.HandleFunc("GET /agents", handlers.AgentsList)
+	// List is operator-only; enroll is anonymous (the bootstrap
+	// secret IS the auth). Heartbeat / inventory remain stubs for
+	// the agent-bearer credential pass in Phase 3. The legacy
+	// POST /agents/enrollment-tokens path is intentionally absent
+	// from this router: deployment packages
+	// (POST /deployment-packages) replace the concept (see
+	// docs/engineering/AGENT_ENROLLMENT.md). Requests to the old
+	// path now produce a 404, the same response any other unknown
+	// route gets.
+	mux.Handle("GET /agents", resolver(mw.RequireAuth(handlers.AgentsList(agentsDeps))))
 	mux.HandleFunc("GET /agents/{id}", handlers.AgentsGet)
-	mux.HandleFunc("POST /agents/enroll", handlers.AgentsEnroll)
+	mux.Handle("POST /agents/enroll", handlers.AgentsEnroll(agentsDeps))
 	mux.HandleFunc("POST /agents/{id}/heartbeat", handlers.AgentsHeartbeat)
 	mux.HandleFunc("POST /agents/{id}/inventory", handlers.AgentsInventory)
-	mux.HandleFunc("POST /agents/enrollment-tokens", handlers.AgentsCreateEnrollmentToken)
 
 	// --- certificates ---
 	mux.HandleFunc("GET /certificates", handlers.CertificatesList)
