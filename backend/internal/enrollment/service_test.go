@@ -162,9 +162,11 @@ type fakeAgentRepo struct {
 	mu sync.Mutex
 
 	created      []agentCreateCall
+	heartbeats   []heartbeatCall
 	createErr    error
 	listErr      error
 	findErr      error
+	heartbeatErr error
 	listAgents   map[string][]Agent // orgID -> agents
 	byCredential map[string]*Agent  // string(hash) -> agent
 }
@@ -213,6 +215,43 @@ func (f *fakeAgentRepo) FindByCredentialHash(_ context.Context, hash []byte) (*A
 		return nil, ErrAgentNotFound
 	}
 	return a, nil
+}
+
+// heartbeatCalls records every UpdateHeartbeat invocation so the
+// heartbeat unit tests can assert on the arguments without
+// inspecting in-memory mutation directly.
+type heartbeatCall struct {
+	AgentID, OrganizationID, AgentVersion, Hostname string
+	At                                              time.Time
+}
+
+func (f *fakeAgentRepo) UpdateHeartbeat(_ context.Context, agentID, organizationID, agentVersion, hostname string, at time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.heartbeats = append(f.heartbeats, heartbeatCall{
+		AgentID: agentID, OrganizationID: organizationID,
+		AgentVersion: agentVersion, Hostname: hostname, At: at,
+	})
+	if f.heartbeatErr != nil {
+		return f.heartbeatErr
+	}
+	// Mirror the production conditional UPDATE: zero rows affected
+	// when id+org doesn't match anything in the map.
+	for _, a := range f.byCredential {
+		if a.ID != agentID || a.OrganizationID != organizationID {
+			continue
+		}
+		a.LastSeenAt = at
+		a.UpdatedAt = at
+		if agentVersion != "" {
+			a.AgentVersion = agentVersion
+		}
+		if hostname != "" {
+			a.Hostname = hostname
+		}
+		return nil
+	}
+	return ErrAgentNotFound
 }
 
 // fakeAuditRecorder records every audit event the service writes.
@@ -1181,4 +1220,135 @@ func hasAuthFailureWithReason(events []audit.Event, reason string) bool {
 		}
 	}
 	return false
+}
+
+// --- RecordHeartbeat (PR-017) ----------------------------------------------
+
+func TestRecordHeartbeatRequiresAgentAndOrg(t *testing.T) {
+	svc, _, _, _, _ := newTestService(t)
+	cases := []RecordHeartbeatInput{
+		{OrganizationID: "anchorix"},
+		{AgentID: "a"},
+		{},
+	}
+	for _, in := range cases {
+		if err := svc.RecordHeartbeat(context.Background(), in); err == nil {
+			t.Errorf("expected error for input %+v, got nil", in)
+		}
+	}
+}
+
+func TestRecordHeartbeatHappyPath(t *testing.T) {
+	svc, _, agents, auditRec, _ := newTestService(t)
+	plaintext, agentID := enrollOneAgent(t, svc, agents)
+	_ = plaintext
+
+	// Pre-state: capture last_seen_at before the heartbeat so we
+	// can assert it bumps forward.
+	agents.mu.Lock()
+	var before time.Time
+	for _, a := range agents.byCredential {
+		if a.ID == agentID {
+			before = a.LastSeenAt
+		}
+	}
+	agents.mu.Unlock()
+
+	if err := svc.RecordHeartbeat(context.Background(), RecordHeartbeatInput{
+		AgentID:        agentID,
+		OrganizationID: "anchorix",
+		AgentVersion:   "0.1.1",
+		Hostname:       "renamed-host",
+	}); err != nil {
+		t.Fatalf("RecordHeartbeat: %v", err)
+	}
+
+	// last_seen_at, agent_version, hostname all updated.
+	agents.mu.Lock()
+	defer agents.mu.Unlock()
+	var after *Agent
+	for _, a := range agents.byCredential {
+		if a.ID == agentID {
+			after = a
+		}
+	}
+	if after == nil {
+		t.Fatal("agent disappeared")
+	}
+	if !after.LastSeenAt.After(before) && !after.LastSeenAt.Equal(before) {
+		t.Errorf("last_seen_at = %v, want >= %v", after.LastSeenAt, before)
+	}
+	if after.AgentVersion != "0.1.1" {
+		t.Errorf("AgentVersion = %q, want 0.1.1", after.AgentVersion)
+	}
+	if after.Hostname != "renamed-host" {
+		t.Errorf("Hostname = %q, want renamed-host", after.Hostname)
+	}
+
+	// Audit policy: heartbeat is operational telemetry, NOT an
+	// audit stream. No deployment_package.* / agent.* event
+	// should fire for a successful heartbeat. (The setup did emit
+	// deployment_package.created + agent.enrolled from
+	// enrollOneAgent; this assertion ensures no NEW row above
+	// those count.)
+	for _, e := range auditRec.events {
+		if e.Action == "agent.heartbeat" || e.Action == "agent.heartbeat_received" {
+			t.Errorf("unexpected heartbeat audit row: %v", e.Action)
+		}
+	}
+}
+
+func TestRecordHeartbeatPreservesValuesWhenEmpty(t *testing.T) {
+	svc, _, agents, _, _ := newTestService(t)
+	plaintext, agentID := enrollOneAgent(t, svc, agents)
+	_ = plaintext
+
+	// Set known starting values via a first heartbeat.
+	if err := svc.RecordHeartbeat(context.Background(), RecordHeartbeatInput{
+		AgentID:        agentID,
+		OrganizationID: "anchorix",
+		AgentVersion:   "0.1.0",
+		Hostname:       "ws-original",
+	}); err != nil {
+		t.Fatalf("seed heartbeat: %v", err)
+	}
+
+	// Send a heartbeat with EMPTY agent_version and hostname; the
+	// stored values should be preserved.
+	if err := svc.RecordHeartbeat(context.Background(), RecordHeartbeatInput{
+		AgentID:        agentID,
+		OrganizationID: "anchorix",
+	}); err != nil {
+		t.Fatalf("second heartbeat: %v", err)
+	}
+
+	agents.mu.Lock()
+	defer agents.mu.Unlock()
+	for _, a := range agents.byCredential {
+		if a.ID != agentID {
+			continue
+		}
+		if a.AgentVersion != "0.1.0" {
+			t.Errorf("AgentVersion = %q; want preserved 0.1.0", a.AgentVersion)
+		}
+		if a.Hostname != "ws-original" {
+			t.Errorf("Hostname = %q; want preserved ws-original", a.Hostname)
+		}
+	}
+}
+
+func TestRecordHeartbeatRejectsCrossOrg(t *testing.T) {
+	svc, _, agents, _, _ := newTestService(t)
+	_, agentID := enrollOneAgent(t, svc, agents)
+
+	// Different org id → no match → ErrAgentNotFound. The HTTP
+	// layer surfaces this as a generic 401 so cross-org probing
+	// looks identical to "deleted mid-request" or "never existed".
+	err := svc.RecordHeartbeat(context.Background(), RecordHeartbeatInput{
+		AgentID:        agentID,
+		OrganizationID: "neighbor-org",
+	})
+	if !errors.Is(err, ErrAgentNotFound) {
+		t.Fatalf("err = %v, want ErrAgentNotFound", err)
+	}
 }

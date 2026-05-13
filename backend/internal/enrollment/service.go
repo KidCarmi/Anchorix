@@ -510,6 +510,46 @@ func (s *Service) ListAgents(ctx context.Context, organizationID string) ([]Agen
 	return s.agents.List(ctx, organizationID)
 }
 
+// RecordHeartbeatInput carries the agent-supplied fields for a
+// liveness heartbeat. The caller (the HTTP handler) MUST supply
+// the AgentID and OrganizationID from the authenticated
+// AuthenticatedAgent principal — never from the request body.
+type RecordHeartbeatInput struct {
+	AgentID        string
+	OrganizationID string
+	AgentVersion   string // optional; if empty, the stored value is kept
+	Hostname       string // optional; if empty, the stored value is kept
+}
+
+// RecordHeartbeat updates the agent's last_seen_at (and optionally
+// agent_version / hostname). This is the canonical owner of the
+// last_seen_at column — no other code path bumps it in v0.1.
+//
+// Audit policy: heartbeat traffic is operational telemetry, NOT an
+// audit event stream (CLAUDE.md §9 — audits record state changes
+// significant enough to investigate; "agent still alive" is not
+// one of them). Failed authentication is already audited by H-007's
+// recordAuthFailure path. No audit row is emitted for successful
+// heartbeats regardless of whether agent_version / hostname drift.
+// Operators who need version-drift visibility query the agents
+// table directly.
+//
+// Atomicity: a single UPDATE statement. No transaction needed —
+// there is no second write to keep in sync.
+func (s *Service) RecordHeartbeat(ctx context.Context, in RecordHeartbeatInput) error {
+	if strings.TrimSpace(in.AgentID) == "" || strings.TrimSpace(in.OrganizationID) == "" {
+		return errors.New("enrollment: record heartbeat: agent and organization required")
+	}
+	return s.agents.UpdateHeartbeat(
+		ctx,
+		in.AgentID,
+		in.OrganizationID,
+		strings.TrimSpace(in.AgentVersion),
+		strings.TrimSpace(in.Hostname),
+		s.clock.Now(),
+	)
+}
+
 // RevokePackageInput carries the operator's revoke request. The
 // org id MUST be the authenticated admin's org (the HTTP handler
 // derives it from the session). PackageID is the URL path

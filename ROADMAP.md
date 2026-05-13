@@ -110,12 +110,16 @@ Still to come in Phase 2:
 UI, deploy the resulting installer artifact, and watch agents appear
 in the UI as they enroll.
 
-## Phase 3 — Inventory & Heartbeat
+## Phase 3 — Inventory & Heartbeat (in progress)
 
 **Goal:** agents continuously upload certificate inventory.
 
-- [ ] Heartbeat endpoint (`POST /agents/{id}/heartbeat`)
-- [ ] Inventory endpoint (`POST /agents/{id}/inventory`)
+- [x] Heartbeat endpoint (`POST /api/v1/agent/heartbeat`) — agent-
+      keyed, bearer-authenticated, owns `agents.last_seen_at`.
+      Operational telemetry only, no audit-row spam.
+- [ ] Inventory endpoint (`POST /api/v1/agent/inventory`) — agent-
+      keyed, bearer-authenticated, accepts a batch of certificate
+      observations.
 - [ ] Windows discovery: enumerate `LocalMachine\My`, `WebHosting`, etc.
 - [ ] Public-cert metadata only — explicit check that no private key
       material is included in payloads

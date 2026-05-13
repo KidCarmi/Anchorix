@@ -279,7 +279,7 @@ primitive.
 | GET    | `/agents/{id}`                        | user     | Get a single agent *(stub — Phase 2 continuation)*     |
 | POST   | `/agents/enroll`                      | bootstrap| Agent enrollment (consumes bootstrap secret)           |
 | GET    | `/agent/me`                           | agent    | Authenticated agent identity (bearer credential)       |
-| POST   | `/agents/{id}/heartbeat`              | agent    | *Stub — Phase 3.*                                      |
+| POST   | `/agent/heartbeat`                    | agent    | Liveness heartbeat (bumps `last_seen_at`)              |
 | POST   | `/agents/{id}/inventory`              | agent    | *Stub — Phase 3.*                                      |
 
 The original v0.1 schema proposal included a
@@ -404,6 +404,64 @@ the caller cannot enumerate identity state:
 The internal reason is recorded in an `agent.authentication_failed`
 audit event tagged `severity: "security"` so operators can diagnose
 attempts without surfacing the reason on the wire.
+
+### `POST /agent/heartbeat`
+
+**Agent-authenticated** endpoint. The agent reports liveness on a
+fixed cadence. The handler bumps `last_seen_at` and (optionally)
+refreshes `version` and `hostname` if the body supplies non-empty
+values.
+
+Heartbeat is **operational telemetry, not an audit event stream**.
+No `audit_events` row is written for a successful heartbeat
+regardless of whether `agent_version` or `hostname` drifted —
+operators who want drift visibility query the `agents` table
+directly. Failed authentication is already audited by the H-007
+`agent.authentication_failed` path.
+
+Request body (all fields optional; empty body is valid):
+
+```json
+{
+  "agent_version": "0.1.0",
+  "hostname": "HOST-01"
+}
+```
+
+The agent id is taken from the authenticated context (never from
+the request body) — an agent cannot heartbeat as another agent.
+
+Successful response — `200 OK`:
+
+```json
+{
+  "status": "ok",
+  "server_time": "2026-06-01T12:00:00Z",
+  "next_heartbeat_seconds": 300
+}
+```
+
+`next_heartbeat_seconds` is a cadence hint (5 minutes in v0.1).
+Future revisions may compute it dynamically; clients should treat
+the field as authoritative for their next scheduled heartbeat.
+
+The endpoint is **idempotent** — multiple heartbeats from the same
+agent simply bump `last_seen_at` repeatedly. No row is ever
+created by heartbeat. An agent that does not yet exist (deleted
+between auth and update) gets the same `401 agent_unauthorized`
+envelope as any other rejected auth.
+
+Failure responses:
+
+| Status | `code`               | When                                                        |
+| ------ | -------------------- | ----------------------------------------------------------- |
+| 400    | `bad_request`        | Body is malformed JSON                                      |
+| 401    | `agent_unauthorized` | Bearer missing, malformed, unknown, or agent revoked/disabled |
+
+Offline state is derived externally: an agent is "offline" if
+`now() - last_seen_at` exceeds a deployment-specific threshold.
+v0.1 does NOT ship a stale-agent sweeper, automatic state
+transitions, or alerting — those are future work.
 
 ### Inventory upload
 
