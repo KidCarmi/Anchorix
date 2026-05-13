@@ -155,9 +155,13 @@ func AgentsHeartbeat(w http.ResponseWriter, _ *http.Request) { notImplemented(w)
 // AgentsInventory remains stub (inventory lands in Phase 3).
 func AgentsInventory(w http.ResponseWriter, _ *http.Request) { notImplemented(w) }
 
-// AgentsCreateEnrollmentToken remains stub — replaced by
-// POST /api/v1/deployment-packages in PR-013. Kept as a
-// not-implemented stub so the router file does not need a
-// breaking-change removal in this PR; the router still exposes
-// the old path with a 501.
+// AgentsCreateEnrollmentToken was the original single-use-token
+// enrollment endpoint from the v0.1 schema proposal. It is
+// REMOVED in PR-013 — deployment packages
+// (POST /api/v1/deployment-packages) replace the concept. The
+// router no longer exposes the legacy path, so unknown-URL
+// requests now return the canonical 404 envelope instead of a
+// confusing 501 stub. The handler is retained in this file as a
+// no-op only because external callers might still import the
+// package symbol; remove on the next handler-package cleanup PR.
 func AgentsCreateEnrollmentToken(w http.ResponseWriter, _ *http.Request) { notImplemented(w) }

@@ -128,6 +128,15 @@ the package enrolls. Lifecycle is bounded by `max_uses`,
 `expires_at`, and operator revocation; all three are checked
 atomically on every enrollment.
 
+> **Revocation in PR-013.** The `deployment_packages` table has
+> `revoked_at`, `revoked_by_user_id`, and `revoked_reason` columns,
+> and the enrollment endpoint refuses to enroll new agents through
+> a revoked package. **There is no operator-facing revoke endpoint
+> yet** — the v0.1 way to revoke a package is a direct
+> `UPDATE deployment_packages SET revoked_at = now()`. A
+> `POST /deployment-packages/{id}/revoke` endpoint is a Phase 2
+> follow-up; see `docs/engineering/AGENT_ENROLLMENT.md` non-goals.
+
 End-to-end design lives in
 [`docs/engineering/AGENT_ENROLLMENT.md`](../engineering/AGENT_ENROLLMENT.md).
 
@@ -204,7 +213,11 @@ Failure responses:
 | POST   | `/agents/enroll`                      | bootstrap| Agent enrollment (consumes bootstrap secret)           |
 | POST   | `/agents/{id}/heartbeat`              | agent    | *Stub — Phase 3.*                                      |
 | POST   | `/agents/{id}/inventory`              | agent    | *Stub — Phase 3.*                                      |
-| POST   | `/agents/enrollment-tokens`           | n/a      | *Deprecated stub — superseded by `POST /deployment-packages`.* |
+
+The original v0.1 schema proposal included a
+`POST /agents/enrollment-tokens` endpoint for issuing single-use
+enrollment tokens. PR-013 supersedes that concept with deployment
+packages; the path is no longer routed and returns `404 not_found`.
 
 ### `POST /agents/enroll`
 

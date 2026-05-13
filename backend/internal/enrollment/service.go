@@ -230,10 +230,16 @@ func (s *Service) EnrollAgent(ctx context.Context, in EnrollAgentInput) (*Enroll
 			// Bootstrap secret matched no package. We do not know
 			// which organization this attempt belongs to (or if it
 			// belongs to one at all), so the rejection is recorded
-			// under the v0.1 single-tenant scope. Multi-tenant will
-			// need a different policy (CLAUDE.md §4 — multi-tenant
-			// org isolation is explicitly v0.1-out-of-scope).
-			s.recordRejection(ctx, fallbackRejectionOrg, "", "bootstrap_secret_unknown", in)
+			// under the v0.1 single-tenant scope and the audit
+			// write is best-effort: failing the response because of
+			// an audit-side issue when we do not even have a
+			// package id to attribute the rejection to would force
+			// callers to retry against an unknown-secret path, and
+			// that retry would itself be unauditable. Multi-tenant
+			// will need a different policy (CLAUDE.md §4 —
+			// multi-tenant org isolation is explicitly
+			// v0.1-out-of-scope).
+			_ = s.recordRejection(ctx, fallbackRejectionOrg, "", "bootstrap_secret_unknown", in)
 			return nil, ErrEnrollmentRejected
 		}
 		return nil, fmt.Errorf("enrollment: lookup package: %w", err)
@@ -246,7 +252,14 @@ func (s *Service) EnrollAgent(ctx context.Context, in EnrollAgentInput) (*Enroll
 	// "already revoked" / "already expired" cases without weakening
 	// the atomicity guarantee.
 	if err := pkg.activeAt(now); err != nil {
-		s.recordRejection(ctx, pkg.OrganizationID, pkg.ID, rejectionReason(err), in)
+		if auditErr := s.recordRejection(ctx, pkg.OrganizationID, pkg.ID, rejectionReason(err), in); auditErr != nil {
+			// Known-package rejection: failing to audit the security
+			// event is itself a security defect, surface as an
+			// internal error rather than silently dropping the
+			// rejection record (CLAUDE.md §9 — audit is not optional
+			// on security-significant flows).
+			return nil, fmt.Errorf("enrollment: record rejection: %w", auditErr)
+		}
 		return nil, ErrEnrollmentRejected
 	}
 
@@ -311,13 +324,18 @@ func (s *Service) EnrollAgent(ctx context.Context, in EnrollAgentInput) (*Enroll
 		case errors.Is(err, ErrPackageRevoked),
 			errors.Is(err, ErrPackageExpired),
 			errors.Is(err, ErrPackageExhausted):
-			// Atomic-update race lost. Record the reason on the
-			// server side so operators can see why an enrollment
-			// was rejected without surfacing it to the agent.
-			s.recordRejection(ctx, pkg.OrganizationID, pkg.ID, rejectionReason(err), in)
+			// Atomic-update race lost. The rejection MUST be audited
+			// — failure to audit a security event is itself a
+			// security defect (CLAUDE.md §9). Surface audit failure
+			// as an internal error rather than swallowing it.
+			if auditErr := s.recordRejection(ctx, pkg.OrganizationID, pkg.ID, rejectionReason(err), in); auditErr != nil {
+				return nil, fmt.Errorf("enrollment: record rejection: %w", auditErr)
+			}
 			return nil, ErrEnrollmentRejected
 		case errors.Is(err, ErrAgentAlreadyEnrolled):
-			s.recordRejection(ctx, pkg.OrganizationID, pkg.ID, "install_id_already_enrolled", in)
+			if auditErr := s.recordRejection(ctx, pkg.OrganizationID, pkg.ID, "install_id_already_enrolled", in); auditErr != nil {
+				return nil, fmt.Errorf("enrollment: record rejection: %w", auditErr)
+			}
 			return nil, ErrEnrollmentRejected
 		}
 		return nil, err
@@ -348,19 +366,27 @@ func (s *Service) ListAgents(ctx context.Context, organizationID string) ([]Agen
 // auth.login_failed when the email did not resolve to a user.
 const fallbackRejectionOrg = "anchorix"
 
-// recordRejection writes an audit row for a failed enrollment.
-// Failures must not surface internal reasons to the caller, but
-// operators NEED them for diagnosis — the audit trail is the
-// trusted internal channel.
+// recordRejection writes an audit row for a failed enrollment and
+// returns the audit-writer's error so callers can decide whether
+// to surface it.
 //
-// We deliberately use a best-effort Record (ignored error) here:
-// the request is already on its way to ErrEnrollmentRejected, and
-// failing the rejection because the audit write failed would be a
-// worse outcome (the operator gets an opaque internal error
-// instead of the documented "rejected" envelope). The miss is
-// rare; if it ever becomes common, surface it via metrics.
-func (s *Service) recordRejection(ctx context.Context, orgID, packageID, reason string, in EnrollAgentInput) {
-	// Best-effort metadata. Never include the bootstrap secret.
+// Policy split (callers enforce, not this function):
+//
+//   - Known-package rejections (revoked / expired / exhausted /
+//     duplicate install_id): the caller propagates a non-nil error
+//     as an internal-error response. Failing to audit a security
+//     event is itself a security defect (CLAUDE.md §9 — audit is
+//     not optional on security-significant flows).
+//   - Unknown-bootstrap-secret rejections: the caller discards the
+//     returned error and proceeds with ErrEnrollmentRejected.
+//     Without a package id we have no org context except the v0.1
+//     single-tenant fallback, and forcing the response to fail
+//     when audit cannot write would let attackers DOS the agent
+//     enrollment endpoint indirectly via audit-storage problems.
+//
+// Metadata never carries the bootstrap secret or any agent
+// credential.
+func (s *Service) recordRejection(ctx context.Context, orgID, packageID, reason string, in EnrollAgentInput) error {
 	md, _ := json.Marshal(map[string]any{
 		"reason":                reason,
 		"severity":              "security",
@@ -370,7 +396,7 @@ func (s *Service) recordRejection(ctx context.Context, orgID, packageID, reason 
 		"has_install_id":        in.InstallID != "",
 		"has_machine_fp":        in.MachineFingerprint != "",
 	})
-	_ = s.audit.Record(ctx, audit.Event{
+	return s.audit.Record(ctx, audit.Event{
 		OrganizationID: orgID,
 		Actor:          "unknown_agent",
 		ActorType:      "agent",

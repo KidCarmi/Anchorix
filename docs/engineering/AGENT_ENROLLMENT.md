@@ -121,6 +121,18 @@ enrolled agents are unaffected** — revoking a package is a future
 gate, not a fleet teardown. To disable an already-enrolled agent
 the operator revokes the agent itself (Phase 3+ UI).
 
+> **Revocation surface in PR-013.** The `deployment_packages`
+> schema has `revoked_at`, `revoked_by_user_id`, and
+> `revoked_reason` columns, and the enrollment service / SQL
+> `IncrementUses` enforce the revoked state atomically. There is
+> **no operator-facing revoke API** in this PR — to mark a package
+> revoked today, run `UPDATE deployment_packages SET revoked_at =
+> now() WHERE id = '...'` (the integration tests use exactly this
+> path). A `POST /api/v1/deployment-packages/{id}/revoke` endpoint
+> (admin-only, atomic with a `deployment_package.revoked` audit
+> event) is a Phase 2 follow-up — see the "Still to come in Phase
+> 2" list in `ROADMAP.md`.
+
 ### Typical lifecycle: baseline + version bump
 
 ```
@@ -299,6 +311,11 @@ on the foundation but is reserved for a focused later PR.
 - **Heartbeat / inventory ingest.** Phase 3 (`POST /agents/{id}/heartbeat`,
   `POST /agents/{id}/inventory`).
 - **Findings / risk-rule evaluation.** Phase 4.
+- **Package revocation API + UI.** Phase 2 follow-up. Schema
+  columns (`revoked_at`, `revoked_by_user_id`, `revoked_reason`)
+  and enrollment-side enforcement ship in PR-013; the admin-facing
+  endpoint and audit event (`deployment_package.revoked`) land in
+  a later PR.
 - **Agent revocation UI / API.** Phase 3+; today revocation requires a
   direct DB UPDATE.
 - **Reinstall idempotency that returns the existing agent.** v0.1 fails

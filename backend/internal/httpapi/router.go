@@ -71,16 +71,18 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 	// --- agents ---
 	// List is operator-only; enroll is anonymous (the bootstrap
 	// secret IS the auth). Heartbeat / inventory remain stubs for
-	// the agent-bearer credential pass in Phase 3.
+	// the agent-bearer credential pass in Phase 3. The legacy
+	// POST /agents/enrollment-tokens path is intentionally absent
+	// from this router: deployment packages
+	// (POST /deployment-packages) replace the concept (see
+	// docs/engineering/AGENT_ENROLLMENT.md). Requests to the old
+	// path now produce a 404, the same response any other unknown
+	// route gets.
 	mux.Handle("GET /agents", resolver(mw.RequireAuth(handlers.AgentsList(agentsDeps))))
 	mux.HandleFunc("GET /agents/{id}", handlers.AgentsGet)
 	mux.Handle("POST /agents/enroll", handlers.AgentsEnroll(agentsDeps))
 	mux.HandleFunc("POST /agents/{id}/heartbeat", handlers.AgentsHeartbeat)
 	mux.HandleFunc("POST /agents/{id}/inventory", handlers.AgentsInventory)
-	// Legacy enrollment-token endpoint. Deployment packages
-	// supersede it (PR-013); kept as a 501 stub so router-level
-	// tests do not break.
-	mux.HandleFunc("POST /agents/enrollment-tokens", handlers.AgentsCreateEnrollmentToken)
 
 	// --- certificates ---
 	mux.HandleFunc("GET /certificates", handlers.CertificatesList)

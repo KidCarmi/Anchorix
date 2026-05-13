@@ -508,6 +508,121 @@ func TestEnrollAgentExhaustedPackageRejected(t *testing.T) {
 	}
 }
 
+func TestEnrollAgentKnownPackageRejectionPropagatesAuditFailure(t *testing.T) {
+	// Pre-PR review fix: when the rejection is for a KNOWN package
+	// (revoked / expired / exhausted / duplicate install_id), an
+	// audit-write failure MUST surface as a non-rejected error so
+	// the caller does not silently lose the security audit record.
+	// Only the unknown-bootstrap-secret path stays best-effort.
+	cases := []struct {
+		name  string
+		setup func(t *testing.T) (*Service, EnrollAgentInput)
+	}{
+		{
+			name: "revoked package + audit failure",
+			setup: func(t *testing.T) (*Service, EnrollAgentInput) {
+				svc, packages, _, auditRec, _ := newTestService(t)
+				pkgOut, err := svc.CreatePackage(context.Background(), validCreateInput())
+				if err != nil {
+					t.Fatalf("CreatePackage: %v", err)
+				}
+				now := time.Now()
+				packages.byHash[string(hashBearerToken(pkgOut.BootstrapSecret))].RevokedAt = &now
+				auditRec.failOnAction = "agent.enrollment_rejected"
+				return svc, EnrollAgentInput{
+					BootstrapSecret: pkgOut.BootstrapSecret,
+					Hostname:        "ws-001",
+				}
+			},
+		},
+		{
+			name: "expired package + audit failure",
+			setup: func(t *testing.T) (*Service, EnrollAgentInput) {
+				svc, packages, _, auditRec, _ := newTestService(t)
+				pkgOut, err := svc.CreatePackage(context.Background(), validCreateInput())
+				if err != nil {
+					t.Fatalf("CreatePackage: %v", err)
+				}
+				packages.byHash[string(hashBearerToken(pkgOut.BootstrapSecret))].ExpiresAt = time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+				auditRec.failOnAction = "agent.enrollment_rejected"
+				return svc, EnrollAgentInput{
+					BootstrapSecret: pkgOut.BootstrapSecret,
+					Hostname:        "ws-001",
+				}
+			},
+		},
+		{
+			name: "exhausted package + audit failure",
+			setup: func(t *testing.T) (*Service, EnrollAgentInput) {
+				svc, packages, _, auditRec, _ := newTestService(t)
+				in := validCreateInput()
+				in.MaxUses = 1
+				pkgOut, err := svc.CreatePackage(context.Background(), in)
+				if err != nil {
+					t.Fatalf("CreatePackage: %v", err)
+				}
+				packages.byHash[string(hashBearerToken(pkgOut.BootstrapSecret))].UsesCount = 1
+				auditRec.failOnAction = "agent.enrollment_rejected"
+				return svc, EnrollAgentInput{
+					BootstrapSecret: pkgOut.BootstrapSecret,
+					Hostname:        "ws-001",
+				}
+			},
+		},
+		{
+			name: "duplicate install_id + audit failure",
+			setup: func(t *testing.T) (*Service, EnrollAgentInput) {
+				svc, _, agents, auditRec, _ := newTestService(t)
+				pkgOut, err := svc.CreatePackage(context.Background(), validCreateInput())
+				if err != nil {
+					t.Fatalf("CreatePackage: %v", err)
+				}
+				agents.createErr = ErrAgentAlreadyEnrolled
+				auditRec.failOnAction = "agent.enrollment_rejected"
+				return svc, EnrollAgentInput{
+					BootstrapSecret: pkgOut.BootstrapSecret,
+					Hostname:        "ws-001",
+					InstallID:       "dup",
+				}
+			},
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			svc, in := c.setup(t)
+			_, err := svc.EnrollAgent(context.Background(), in)
+			if err == nil {
+				t.Fatal("expected non-nil error")
+			}
+			// Crucial: the caller MUST NOT see ErrEnrollmentRejected
+			// here, because the security audit failed to land. The
+			// HTTP layer maps non-ErrEnrollmentRejected to 500
+			// internal_error, which is what we want operators to
+			// see when audit is broken.
+			if errors.Is(err, ErrEnrollmentRejected) {
+				t.Errorf("err = %v (ErrEnrollmentRejected); want propagated audit failure", err)
+			}
+		})
+	}
+}
+
+func TestEnrollAgentUnknownSecretAuditFailureStaysBestEffort(t *testing.T) {
+	// The unknown-bootstrap-secret path deliberately keeps audit
+	// best-effort. Document the contract: an audit-storage failure
+	// on this path still produces ErrEnrollmentRejected so an
+	// attacker cannot probe audit health by guessing secrets.
+	svc, _, _, auditRec, _ := newTestService(t)
+	auditRec.failOnAction = "agent.enrollment_rejected"
+
+	_, err := svc.EnrollAgent(context.Background(), EnrollAgentInput{
+		BootstrapSecret: "definitely-not-real",
+		Hostname:        "ws-001",
+	})
+	if !errors.Is(err, ErrEnrollmentRejected) {
+		t.Fatalf("err = %v, want ErrEnrollmentRejected (best-effort policy)", err)
+	}
+}
+
 func TestEnrollAgentDuplicateInstallIDRejected(t *testing.T) {
 	svc, _, agents, _, _ := newTestService(t)
 	pkgOut, err := svc.CreatePackage(context.Background(), validCreateInput())
