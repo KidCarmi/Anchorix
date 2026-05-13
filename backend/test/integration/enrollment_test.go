@@ -794,7 +794,13 @@ func TestDeploymentPackageRevokeHappyPath(t *testing.T) {
 					t.Errorf("audit metadata leaked bootstrap secret")
 				}
 			case "agent.enrollment_rejected":
-				if strings.Contains(meta, `"reason":"package_revoked"`) {
+				// PostgreSQL renders jsonb::text with a single space
+				// after each colon and comma, so an exact
+				// `"reason":"package_revoked"` substring search would
+				// miss the stored form `"reason": "package_revoked"`.
+				// The bare `package_revoked` substring is unique
+				// enough — no other audit reason contains it.
+				if strings.Contains(meta, "package_revoked") {
 					sawRevokeRejected = true
 				}
 			}

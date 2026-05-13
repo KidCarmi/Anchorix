@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -195,13 +196,18 @@ func DeploymentPackagesRevoke(deps DeploymentPackageDeps) http.HandlerFunc {
 			return
 		}
 
-		// Reason is optional. An empty body is valid.
+		// Reason is optional. An empty body is valid. We do NOT
+		// guard the decode with r.ContentLength because that breaks
+		// chunked-transfer requests (ContentLength = -1) — proxies
+		// and streaming clients commonly use chunked encoding, so
+		// the guard would silently accept malformed JSON instead of
+		// returning the documented 400 bad_request envelope. The
+		// EOF check below covers the truly-empty-body case
+		// (Content-Length: 0 or no body sent at all).
 		var body revokeRequest
-		if r.ContentLength > 0 {
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil {
-				envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
-				return
-			}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+			return
 		}
 
 		out, err := deps.Service.RevokePackage(r.Context(), enrollment.RevokePackageInput{
