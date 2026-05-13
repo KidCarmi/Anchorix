@@ -665,6 +665,37 @@ func TestEnrollAgentPackageConcurrentlyDeletedSurfacesAsRejection(t *testing.T) 
 	}
 }
 
+func TestEnrollAgentAuditFailureRollsBack(t *testing.T) {
+	// Symmetric to TestCreatePackageAuditFailureRollsBack. EnrollAgent
+	// runs IncrementUses + agents.Create + audit.Record (agent.enrolled)
+	// inside one WithTx. If the agent.enrolled audit fails — and this
+	// audit is NOT the agent.enrollment_rejected event, it is the
+	// state-change event — the entire tx must roll back: no agent
+	// row should persist and the caller MUST receive a
+	// non-ErrEnrollmentRejected error so the HTTP layer maps it to
+	// 500 internal_error rather than 401 enrollment_rejected (which
+	// would be misleading: enrollment WAS valid, audit storage was
+	// the failure).
+	svc, _, _, auditRec, _ := newTestService(t)
+	pkgOut, err := svc.CreatePackage(context.Background(), validCreateInput())
+	if err != nil {
+		t.Fatalf("CreatePackage: %v", err)
+	}
+	auditRec.failOnAction = "agent.enrolled"
+
+	_, err = svc.EnrollAgent(context.Background(), EnrollAgentInput{
+		BootstrapSecret: pkgOut.BootstrapSecret,
+		Hostname:        "ws-001",
+	})
+	if err == nil {
+		t.Fatal("expected non-nil error from audit failure")
+	}
+	if errors.Is(err, ErrEnrollmentRejected) {
+		t.Errorf("err = %v (ErrEnrollmentRejected); want a non-rejection error "+
+			"from audit failure on a valid enrollment", err)
+	}
+}
+
 func TestEnrollAgentDuplicateInstallIDRejected(t *testing.T) {
 	svc, _, agents, _, _ := newTestService(t)
 	pkgOut, err := svc.CreatePackage(context.Background(), validCreateInput())
