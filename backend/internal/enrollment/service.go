@@ -378,6 +378,136 @@ func (s *Service) ListAgents(ctx context.Context, organizationID string) ([]Agen
 	return s.agents.List(ctx, organizationID)
 }
 
+// RevokePackageInput carries the operator's revoke request. The
+// org id MUST be the authenticated admin's org (the HTTP handler
+// derives it from the session). PackageID is the URL path
+// parameter. RevokedByUserID is the admin's user id. Reason is
+// optional operator-supplied text.
+type RevokePackageInput struct {
+	OrganizationID  string
+	PackageID       string
+	RevokedByUserID string
+	Reason          string
+}
+
+// RevokePackageOutput is what the service returns after a
+// revocation attempt. Package always carries the row's current
+// state (with revoked_at populated). AlreadyRevoked is true when
+// this call did NOT change the revoked state — the operator was
+// re-revoking a package that was already revoked, and we returned
+// the idempotent 200 path without a duplicate audit row.
+type RevokePackageOutput struct {
+	Package        *DeploymentPackage
+	AlreadyRevoked bool
+}
+
+// RevokePackage marks a deployment package as revoked. Future
+// enrollments through this package's bootstrap secret are
+// rejected by IncrementUses (revoked_at IS NULL is part of the
+// conditional UPDATE — see CLAUDE.md §6 + AGENT_ENROLLMENT.md
+// "Package lifecycle"). Already enrolled agents are unaffected.
+//
+// Idempotency: revoking an already-revoked package is a no-op
+// success. The current row is returned, the audit event is NOT
+// re-emitted (the original revoke's audit row is the source of
+// truth), and the HTTP layer responds 200 with AlreadyRevoked: true
+// in the model. The contract is documented in REST_API.md +
+// AGENT_ENROLLMENT.md.
+//
+// Atomicity: the UPDATE and the deployment_package.revoked audit
+// row commit together. An audit-write failure rolls the UPDATE
+// back so the control plane can never reach a state where a
+// package is marked revoked without a matching audit row
+// (CLAUDE.md §9).
+//
+// Org scoping: the package MUST belong to in.OrganizationID. A
+// cross-org id returns ErrPackageNotFound — the same envelope a
+// truly-missing id would produce, so admins cannot enumerate
+// packages in neighboring tenants.
+func (s *Service) RevokePackage(ctx context.Context, in RevokePackageInput) (*RevokePackageOutput, error) {
+	if err := in.validate(); err != nil {
+		return nil, err
+	}
+
+	var (
+		current        *DeploymentPackage
+		alreadyRevoked bool
+	)
+	if err := s.tx.WithTx(ctx, func(ctx context.Context) error {
+		pkg, err := s.packages.GetByIDAndOrg(ctx, in.PackageID, in.OrganizationID)
+		if err != nil {
+			return err
+		}
+		if pkg.RevokedAt != nil {
+			// Idempotent path. No UPDATE, no audit. The original
+			// revoke's audit row is already in the trail; emitting
+			// a second one for a no-op would only add noise.
+			current = pkg
+			alreadyRevoked = true
+			return nil
+		}
+
+		now := s.clock.Now()
+		if err := s.packages.Revoke(ctx, pkg.ID, in.OrganizationID, in.RevokedByUserID, in.Reason, now); err != nil {
+			// Concurrent revoke race: another admin revoked between
+			// our GetByIDAndOrg and our UPDATE. Treat as idempotent.
+			if errors.Is(err, ErrPackageAlreadyRevoked) {
+				// Re-read for the current revoked metadata so the
+				// response reflects the actual revoker.
+				latest, getErr := s.packages.GetByIDAndOrg(ctx, in.PackageID, in.OrganizationID)
+				if getErr != nil {
+					return getErr
+				}
+				current = latest
+				alreadyRevoked = true
+				return nil
+			}
+			return err
+		}
+
+		// Mutate the in-memory copy so the response reflects the
+		// new state without a follow-up SELECT.
+		pkg.RevokedAt = &now
+		pkg.RevokedByUserID = in.RevokedByUserID
+		pkg.RevokedReason = in.Reason
+		current = pkg
+
+		md, _ := json.Marshal(map[string]any{
+			"package_type":  string(pkg.PackageType),
+			"agent_version": pkg.AgentVersion,
+			"uses_count":    pkg.UsesCount,
+			"max_uses":      pkg.MaxUses,
+			"has_reason":    in.Reason != "",
+			"reason_length": len(in.Reason),
+		})
+		return s.audit.Record(ctx, audit.Event{
+			OrganizationID: in.OrganizationID,
+			Actor:          in.RevokedByUserID,
+			ActorType:      "user",
+			Action:         "deployment_package.revoked",
+			TargetType:     "deployment_package",
+			TargetID:       pkg.ID,
+			Metadata:       md,
+		})
+	}); err != nil {
+		return nil, err
+	}
+	return &RevokePackageOutput{Package: current, AlreadyRevoked: alreadyRevoked}, nil
+}
+
+func (in RevokePackageInput) validate() error {
+	if strings.TrimSpace(in.OrganizationID) == "" {
+		return fmt.Errorf("%w: organization id required", ErrInvalidPackageInput)
+	}
+	if strings.TrimSpace(in.PackageID) == "" {
+		return fmt.Errorf("%w: package id required", ErrInvalidPackageInput)
+	}
+	if strings.TrimSpace(in.RevokedByUserID) == "" {
+		return fmt.Errorf("%w: revoking user id required", ErrInvalidPackageInput)
+	}
+	return nil
+}
+
 // fallbackRejectionOrg is the v0.1 single-tenant organization scope
 // used for audit rows where the rejection happened before we could
 // identify the operator's organization (e.g. an unknown bootstrap

@@ -16,36 +16,6 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
 
 ## Open Items
 
-### H-005 — Operator-facing deployment-package revoke endpoint
-
-- **Title:** `feat(backend): POST /api/v1/deployment-packages/{id}/revoke`
-- **Risk:** medium (operational, not security). The
-  `deployment_packages` schema has `revoked_at`,
-  `revoked_by_user_id`, and `revoked_reason` columns, and
-  enrollment refuses revoked packages atomically. There is **no
-  operator-facing API** to set those columns in PR-013, so the
-  v0.1 workflow for revoking a package is a direct
-  `UPDATE deployment_packages SET revoked_at = now() WHERE id =
-  '...'`. That works in single-tenant labs but is unacceptable
-  for any production install — it bypasses the audit trail and
-  bypasses admin-role gating.
-- **Scope:** small. Admin-only handler
-  (`mw.RequireAdmin` per CLAUDE.md §6.3), atomic UPDATE +
-  `deployment_package.revoked` audit event in the same
-  transaction (no future enrollments cite this package
-  thereafter). One integration test: revoke via API, then
-  attempt enrollment, expect generic `enrollment_rejected` and an
-  `agent.enrollment_rejected` audit row with
-  `reason: "package_revoked"`. REST_API.md table updated.
-- **Recommended PR:** `feat(backend): operator-facing deployment-package revocation (H-005)`
-- **Reason not fixed now:** PR-013's scope was explicitly the
-  enrollment foundation. The revoke surface is well-documented as
-  a follow-up in `docs/engineering/AGENT_ENROLLMENT.md`
-  ("Revocation surface in PR-013") and in the Phase 2 remainder
-  list in ROADMAP.md.
-- **References:** CLAUDE.md §6.3 (admin role), §9 (audit
-  atomicity), `docs/engineering/AGENT_ENROLLMENT.md` non-goals.
-
 ### H-006 — Reinstall / rebind / credential rotation design
 
 - **Title:** `design(enrollment): reinstall flow + credential rotation`

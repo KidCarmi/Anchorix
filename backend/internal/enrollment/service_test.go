@@ -44,11 +44,13 @@ type fakePackageRepo struct {
 
 	createCalls    []packageCreateCall
 	incrementCalls []packageIncrementCall
+	revokeCalls    []packageRevokeCall
 
 	// Error overrides. Zero-value means "no error".
 	createErr    error
 	getErr       error
 	incrementErr error
+	revokeErr    error
 }
 
 type packageCreateCall struct {
@@ -87,6 +89,53 @@ func (f *fakePackageRepo) GetByBootstrapHash(_ context.Context, hash []byte) (*D
 		return nil, ErrPackageNotFound
 	}
 	return pkg, nil
+}
+
+func (f *fakePackageRepo) GetByIDAndOrg(_ context.Context, id, organizationID string) (*DeploymentPackage, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	for _, pkg := range f.byHash {
+		if pkg.ID == id && pkg.OrganizationID == organizationID {
+			return pkg, nil
+		}
+	}
+	return nil, ErrPackageNotFound
+}
+
+// revokeCalls records every Revoke invocation; tests inspect this
+// list to assert idempotency and ordering.
+type packageRevokeCall struct {
+	ID, OrganizationID, RevokedByUserID, Reason string
+	At                                          time.Time
+}
+
+func (f *fakePackageRepo) Revoke(_ context.Context, id, organizationID, revokedByUserID, reason string, at time.Time) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revokeCalls = append(f.revokeCalls, packageRevokeCall{
+		ID: id, OrganizationID: organizationID,
+		RevokedByUserID: revokedByUserID, Reason: reason, At: at,
+	})
+	if f.revokeErr != nil {
+		return f.revokeErr
+	}
+	for _, pkg := range f.byHash {
+		if pkg.ID != id || pkg.OrganizationID != organizationID {
+			continue
+		}
+		if pkg.RevokedAt != nil {
+			return ErrPackageAlreadyRevoked
+		}
+		t := at
+		pkg.RevokedAt = &t
+		pkg.RevokedByUserID = revokedByUserID
+		pkg.RevokedReason = reason
+		return nil
+	}
+	return ErrPackageNotFound
 }
 
 func (f *fakePackageRepo) IncrementUses(_ context.Context, id string, at time.Time) error {
@@ -754,6 +803,194 @@ func TestPackageTypeValid(t *testing.T) {
 	for _, invalid := range []PackageType{"", "unknown", "Baseline", "BULK_SCCM"} {
 		if PackageType(invalid).Valid() {
 			t.Errorf("PackageType %q reported valid", invalid)
+		}
+	}
+}
+
+// --- RevokePackage (H-005) -------------------------------------------------
+
+func TestRevokePackageRejectsInvalidInput(t *testing.T) {
+	svc, _, _, _, _ := newTestService(t)
+	cases := []struct {
+		name string
+		in   RevokePackageInput
+	}{
+		{"empty org", RevokePackageInput{PackageID: "p", RevokedByUserID: "u"}},
+		{"empty pkg id", RevokePackageInput{OrganizationID: "anchorix", RevokedByUserID: "u"}},
+		{"empty user", RevokePackageInput{OrganizationID: "anchorix", PackageID: "p"}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := svc.RevokePackage(context.Background(), c.in)
+			if !errors.Is(err, ErrInvalidPackageInput) {
+				t.Fatalf("err = %v, want ErrInvalidPackageInput", err)
+			}
+		})
+	}
+}
+
+func TestRevokePackageHappyPath(t *testing.T) {
+	svc, packages, _, auditRec, _ := newTestService(t)
+	pkgOut, err := svc.CreatePackage(context.Background(), validCreateInput())
+	if err != nil {
+		t.Fatalf("CreatePackage: %v", err)
+	}
+
+	out, err := svc.RevokePackage(context.Background(), RevokePackageInput{
+		OrganizationID:  "anchorix",
+		PackageID:       pkgOut.Package.ID,
+		RevokedByUserID: "admin-1",
+		Reason:          "rotating to 0.1.1",
+	})
+	if err != nil {
+		t.Fatalf("RevokePackage: %v", err)
+	}
+	if out.AlreadyRevoked {
+		t.Errorf("AlreadyRevoked = true on first revoke")
+	}
+	if out.Package.RevokedAt == nil {
+		t.Fatal("Package.RevokedAt not set")
+	}
+	if out.Package.RevokedByUserID != "admin-1" {
+		t.Errorf("RevokedByUserID = %q, want admin-1", out.Package.RevokedByUserID)
+	}
+	if out.Package.RevokedReason != "rotating to 0.1.1" {
+		t.Errorf("RevokedReason = %q", out.Package.RevokedReason)
+	}
+	if got := len(packages.revokeCalls); got != 1 {
+		t.Errorf("Revoke calls = %d, want 1", got)
+	}
+	// The audit row must land alongside the UPDATE. Look for the
+	// specific action; metadata must not contain the bootstrap secret.
+	var sawRevoke bool
+	for _, e := range auditRec.events {
+		if e.Action == "deployment_package.revoked" {
+			sawRevoke = true
+			if strings.Contains(string(e.Metadata), pkgOut.BootstrapSecret) {
+				t.Error("audit metadata leaked the bootstrap secret")
+			}
+		}
+	}
+	if !sawRevoke {
+		t.Error("missing deployment_package.revoked audit event")
+	}
+}
+
+func TestRevokePackageOrgScopedRejection(t *testing.T) {
+	svc, _, _, _, _ := newTestService(t)
+	pkgOut, err := svc.CreatePackage(context.Background(), validCreateInput())
+	if err != nil {
+		t.Fatalf("CreatePackage: %v", err)
+	}
+
+	// An admin from a different org calling revoke on this package
+	// must see ErrPackageNotFound (HTTP 404), NOT a generic forbidden
+	// or success — anything that surfaces the package's existence
+	// would leak cross-org information.
+	_, err = svc.RevokePackage(context.Background(), RevokePackageInput{
+		OrganizationID:  "neighbor-org",
+		PackageID:       pkgOut.Package.ID,
+		RevokedByUserID: "neighbor-admin",
+	})
+	if !errors.Is(err, ErrPackageNotFound) {
+		t.Fatalf("err = %v, want ErrPackageNotFound", err)
+	}
+}
+
+func TestRevokePackageNotFound(t *testing.T) {
+	svc, _, _, _, _ := newTestService(t)
+	_, err := svc.RevokePackage(context.Background(), RevokePackageInput{
+		OrganizationID:  "anchorix",
+		PackageID:       "no-such-package",
+		RevokedByUserID: "admin-1",
+	})
+	if !errors.Is(err, ErrPackageNotFound) {
+		t.Fatalf("err = %v, want ErrPackageNotFound", err)
+	}
+}
+
+func TestRevokePackageIdempotentOnAlreadyRevoked(t *testing.T) {
+	svc, _, _, auditRec, _ := newTestService(t)
+	pkgOut, err := svc.CreatePackage(context.Background(), validCreateInput())
+	if err != nil {
+		t.Fatalf("CreatePackage: %v", err)
+	}
+	if _, err := svc.RevokePackage(context.Background(), RevokePackageInput{
+		OrganizationID:  "anchorix",
+		PackageID:       pkgOut.Package.ID,
+		RevokedByUserID: "admin-1",
+		Reason:          "first revoke",
+	}); err != nil {
+		t.Fatalf("first revoke: %v", err)
+	}
+	firstAuditCount := 0
+	for _, e := range auditRec.events {
+		if e.Action == "deployment_package.revoked" {
+			firstAuditCount++
+		}
+	}
+	if firstAuditCount != 1 {
+		t.Fatalf("first revoke audit count = %d, want 1", firstAuditCount)
+	}
+
+	// Second revoke: idempotent success, no new audit row.
+	out, err := svc.RevokePackage(context.Background(), RevokePackageInput{
+		OrganizationID:  "anchorix",
+		PackageID:       pkgOut.Package.ID,
+		RevokedByUserID: "admin-2",
+		Reason:          "second revoke ignored",
+	})
+	if err != nil {
+		t.Fatalf("second revoke: %v", err)
+	}
+	if !out.AlreadyRevoked {
+		t.Error("AlreadyRevoked = false on second revoke; want true")
+	}
+	// The response still carries the FIRST revoker's metadata —
+	// re-revoking does NOT overwrite revoked_by_user_id.
+	if out.Package.RevokedByUserID != "admin-1" {
+		t.Errorf("RevokedByUserID after second revoke = %q, want admin-1 (first revoker preserved)",
+			out.Package.RevokedByUserID)
+	}
+	// No duplicate audit row.
+	secondAuditCount := 0
+	for _, e := range auditRec.events {
+		if e.Action == "deployment_package.revoked" {
+			secondAuditCount++
+		}
+	}
+	if secondAuditCount != 1 {
+		t.Errorf("audit count after second revoke = %d, want 1 (idempotent)", secondAuditCount)
+	}
+}
+
+func TestRevokePackageAuditFailureRollsBack(t *testing.T) {
+	svc, _, _, auditRec, _ := newTestService(t)
+	pkgOut, err := svc.CreatePackage(context.Background(), validCreateInput())
+	if err != nil {
+		t.Fatalf("CreatePackage: %v", err)
+	}
+	auditRec.failOnAction = "deployment_package.revoked"
+
+	_, err = svc.RevokePackage(context.Background(), RevokePackageInput{
+		OrganizationID:  "anchorix",
+		PackageID:       pkgOut.Package.ID,
+		RevokedByUserID: "admin-1",
+	})
+	if err == nil {
+		t.Fatal("expected non-nil error from audit failure")
+	}
+	// The HTTP layer maps any non-known error to 500 internal_error,
+	// which is the right outcome here: the operator action did not
+	// commit, so the response should NOT be 200.
+	if errors.Is(err, ErrPackageNotFound) {
+		t.Errorf("err = %v (ErrPackageNotFound); want a raw audit failure", err)
+	}
+
+	// No deployment_package.revoked audit row should have landed.
+	for _, e := range auditRec.events {
+		if e.Action == "deployment_package.revoked" {
+			t.Error("audit row recorded despite failure (rollback contract violated)")
 		}
 	}
 }

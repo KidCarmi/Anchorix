@@ -128,21 +128,13 @@ the package enrolls. Lifecycle is bounded by `max_uses`,
 `expires_at`, and operator revocation; all three are checked
 atomically on every enrollment.
 
-> **Revocation in PR-013.** The `deployment_packages` table has
-> `revoked_at`, `revoked_by_user_id`, and `revoked_reason` columns,
-> and the enrollment endpoint refuses to enroll new agents through
-> a revoked package. **There is no operator-facing revoke endpoint
-> yet** — the v0.1 way to revoke a package is a direct
-> `UPDATE deployment_packages SET revoked_at = now()`. A
-> `POST /deployment-packages/{id}/revoke` endpoint is a Phase 2
-> follow-up; see `docs/engineering/AGENT_ENROLLMENT.md` non-goals.
-
 End-to-end design lives in
 [`docs/engineering/AGENT_ENROLLMENT.md`](../engineering/AGENT_ENROLLMENT.md).
 
-| Method | Path                                  | Auth   | Purpose                                                 |
-| ------ | ------------------------------------- | ------ | ------------------------------------------------------- |
-| POST   | `/deployment-packages`                | admin  | Create a deployment package; bootstrap secret shown once |
+| Method | Path                                          | Auth   | Purpose                                                 |
+| ------ | --------------------------------------------- | ------ | ------------------------------------------------------- |
+| POST   | `/deployment-packages`                        | admin  | Create a deployment package; bootstrap secret shown once |
+| POST   | `/deployment-packages/{id}/revoke`            | admin  | Revoke a deployment package; no future enrollments      |
 
 ### `POST /deployment-packages`
 
@@ -203,6 +195,65 @@ Failure responses:
 | 400    | `bad_request`  | Body is malformed; `package_type` invalid; `ttl_seconds` or `max_uses` non-positive |
 | 401    | `unauthorized` | No session                                                      |
 | 403    | `forbidden`    | Authenticated user does not have the `admin` role               |
+
+### `POST /deployment-packages/{id}/revoke`
+
+Admin-only. Marks the deployment package as revoked: future
+enrollments through its bootstrap secret are rejected with the
+generic `enrollment_rejected` envelope. **Already enrolled agents
+are unaffected** — agent revocation is a separate action (Phase 3+).
+
+Organization-scoped: a package belonging to a different
+organization returns `404 not_found`, the same envelope a
+truly-missing id would produce, so admins cannot enumerate
+packages in neighboring tenants.
+
+Request body (all fields optional; an empty body is valid):
+
+```json
+{ "reason": "version superseded by 0.1.1" }
+```
+
+Successful response — `200 OK`:
+
+```json
+{
+  "id": "...",
+  "organization_id": "anchorix",
+  "name": "Baseline Windows 0.1.0",
+  "package_type": "baseline",
+  "revoked_at": "2026-06-01T12:00:00Z",
+  "revoked_by_user_id": "...",
+  "revoked_reason": "version superseded by 0.1.1",
+  "already_revoked": false
+}
+```
+
+The response **never** includes `bootstrap_secret`; the plaintext
+secret only ever appears in the original create call.
+
+**Idempotency.** Re-revoking an already-revoked package returns
+`200 OK` with `already_revoked: true` and the **existing** revoked
+metadata (the original revoker's `revoked_by_user_id`,
+`revoked_at`, and `revoked_reason` — the second call does NOT
+overwrite them). The server does NOT emit a duplicate
+`deployment_package.revoked` audit row in that case — the
+original revoke's audit row is the source of truth.
+
+Audit: a single `deployment_package.revoked` event is written
+in the same transaction as the row UPDATE. Metadata carries
+`package_type`, `agent_version`, `uses_count`, `max_uses`,
+`has_reason`, and `reason_length` — never the plaintext
+bootstrap secret or its hash.
+
+Failure responses:
+
+| Status | `code`           | When                                                            |
+| ------ | ---------------- | --------------------------------------------------------------- |
+| 400    | `bad_request`    | URL has no id, body is malformed JSON, or service input invalid |
+| 401    | `unauthorized`   | No session                                                      |
+| 403    | `forbidden`      | Authenticated user does not have the `admin` role               |
+| 404    | `not_found`      | No package with this id exists in the caller's organization     |
 
 ## Agents
 

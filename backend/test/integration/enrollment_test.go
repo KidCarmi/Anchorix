@@ -678,3 +678,239 @@ func itoa(i int) string {
 	}
 	return string(buf[pos:])
 }
+
+// --- POST /deployment-packages/{id}/revoke (H-005) -----------------
+
+// revokedResponseDTO mirrors the handler's success body. Kept local
+// to this test file so the test does not depend on internal handler
+// types (CLAUDE.md §8.6 — integration tests treat the HTTP boundary
+// as opaque).
+type revokedResponseDTO struct {
+	ID              string `json:"id"`
+	OrganizationID  string `json:"organization_id"`
+	Name            string `json:"name"`
+	PackageType     string `json:"package_type"`
+	RevokedAt       string `json:"revoked_at"`
+	RevokedByUserID string `json:"revoked_by_user_id"`
+	RevokedReason   string `json:"revoked_reason,omitempty"`
+	AlreadyRevoked  bool   `json:"already_revoked"`
+	BootstrapSecret string `json:"bootstrap_secret"` // MUST stay empty
+}
+
+// adminRevokePackage posts a revoke for the given package id and
+// returns the parsed response. The status code is asserted equal
+// to wantStatus; tests pass http.StatusOK for the happy path or
+// http.StatusForbidden / http.StatusUnauthorized / http.StatusNotFound
+// for negative cases.
+func adminRevokePackage(t *testing.T, srv string, client *http.Client, pkgID, reason string, wantStatus int) revokedResponseDTO {
+	t.Helper()
+	bodyBytes, _ := json.Marshal(map[string]string{"reason": reason})
+	req, _ := http.NewRequest(http.MethodPost, srv+"/api/v1/deployment-packages/"+pkgID+"/revoke", bytes.NewReader(bodyBytes))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != wantStatus {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("revoke status = %d, want %d; body=%s", resp.StatusCode, wantStatus, b)
+	}
+	if wantStatus != http.StatusOK {
+		return revokedResponseDTO{}
+	}
+	var out revokedResponseDTO
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode revoke: %v", err)
+	}
+	return out
+}
+
+func TestDeploymentPackageRevokeHappyPath(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	client := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	pkg := adminCreatePackage(t, srv.URL, client, createPackageBody{
+		Name:         "Baseline-revoke",
+		PackageType:  "baseline",
+		TTLSeconds:   3600,
+		MaxUses:      10,
+		AgentVersion: "0.1.0",
+	})
+
+	got := adminRevokePackage(t, srv.URL, client, pkg.ID, "version superseded", http.StatusOK)
+	if got.RevokedAt == "" {
+		t.Error("revoked_at missing from response")
+	}
+	if got.RevokedReason != "version superseded" {
+		t.Errorf("revoked_reason = %q, want 'version superseded'", got.RevokedReason)
+	}
+	if got.AlreadyRevoked {
+		t.Error("already_revoked = true on first revoke")
+	}
+	// Critical: the revoke response must NOT echo a bootstrap secret.
+	if got.BootstrapSecret != "" {
+		t.Errorf("bootstrap_secret leaked into revoke response: %q", got.BootstrapSecret)
+	}
+
+	// Subsequent enrollment through the revoked package must fail.
+	enrollResp, err := enrollAgent(srv.URL, map[string]any{
+		"bootstrap_secret": pkg.BootstrapSecret,
+		"hostname":         "post-revoke",
+	})
+	if err != nil {
+		t.Fatalf("enroll post-revoke: %v", err)
+	}
+	enrollResp.Body.Close()
+	if enrollResp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("enroll-after-revoke status = %d, want 401", enrollResp.StatusCode)
+	}
+
+	// Audit row: deployment_package.revoked must exist;
+	// agent.enrollment_rejected with reason package_revoked must exist.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var (
+		sawRevoke         bool
+		sawRevokeRejected bool
+	)
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `SELECT action, metadata::text FROM audit_events WHERE target_id = $1`, pkg.ID)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var action, meta string
+			if err := rows.Scan(&action, &meta); err != nil {
+				return err
+			}
+			switch action {
+			case "deployment_package.revoked":
+				sawRevoke = true
+				if strings.Contains(meta, pkg.BootstrapSecret) {
+					t.Errorf("audit metadata leaked bootstrap secret")
+				}
+			case "agent.enrollment_rejected":
+				if strings.Contains(meta, `"reason":"package_revoked"`) {
+					sawRevokeRejected = true
+				}
+			}
+		}
+		return rows.Err()
+	}); err != nil {
+		t.Fatalf("audit read: %v", err)
+	}
+	if !sawRevoke {
+		t.Error("missing deployment_package.revoked audit row")
+	}
+	if !sawRevokeRejected {
+		t.Error("missing agent.enrollment_rejected (reason=package_revoked) audit row")
+	}
+}
+
+func TestDeploymentPackageRevokeRequiresAdmin(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	// Seed an admin so the org row + a real package exist, but do
+	// NOT log in as admin for the anonymous + operator-role tests
+	// below.
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	pkg := adminCreatePackage(t, srv.URL, adminClient, createPackageBody{
+		Name: "RBAC", PackageType: "baseline", TTLSeconds: 3600, MaxUses: 5,
+	})
+
+	// Anonymous → 401.
+	anonReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/deployment-packages/"+pkg.ID+"/revoke", strings.NewReader(`{}`))
+	anonReq.Header.Set("Content-Type", "application/json")
+	anonResp, err := http.DefaultClient.Do(anonReq)
+	if err != nil {
+		t.Fatalf("anon: %v", err)
+	}
+	anonResp.Body.Close()
+	if anonResp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("anon status = %d, want 401", anonResp.StatusCode)
+	}
+
+	// Operator role → 403.
+	if _, err := svc.CreateUser(context.Background(), "anchorix", operatorEmail, "Op", testPassword, auth.RoleOperator); err != nil {
+		t.Fatalf("create operator: %v", err)
+	}
+	jar, _ := cookiejar.New(nil)
+	opClient := &http.Client{Jar: jar, Timeout: 5 * time.Second}
+	loginBody := strings.NewReader(`{"email":"` + operatorEmail + `","password":"` + testPassword + `"}`)
+	loginReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/auth/login", loginBody)
+	loginReq.Header.Set("Content-Type", "application/json")
+	loginResp, err := opClient.Do(loginReq)
+	if err != nil {
+		t.Fatalf("operator login: %v", err)
+	}
+	loginResp.Body.Close()
+	if loginResp.StatusCode != http.StatusOK {
+		t.Fatalf("operator login status = %d, want 200", loginResp.StatusCode)
+	}
+	opReq, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/deployment-packages/"+pkg.ID+"/revoke", strings.NewReader(`{}`))
+	opReq.Header.Set("Content-Type", "application/json")
+	opResp, err := opClient.Do(opReq)
+	if err != nil {
+		t.Fatalf("operator revoke: %v", err)
+	}
+	opResp.Body.Close()
+	if opResp.StatusCode != http.StatusForbidden {
+		t.Errorf("operator status = %d, want 403", opResp.StatusCode)
+	}
+}
+
+func TestDeploymentPackageRevokeNotFound(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	client := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	adminRevokePackage(t, srv.URL, client, "no-such-id", "", http.StatusNotFound)
+}
+
+func TestDeploymentPackageRevokeIdempotent(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	client := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	pkg := adminCreatePackage(t, srv.URL, client, createPackageBody{
+		Name: "Idem", PackageType: "baseline", TTLSeconds: 3600, MaxUses: 5,
+	})
+
+	first := adminRevokePackage(t, srv.URL, client, pkg.ID, "first", http.StatusOK)
+	if first.AlreadyRevoked {
+		t.Error("first revoke reported already_revoked=true")
+	}
+
+	second := adminRevokePackage(t, srv.URL, client, pkg.ID, "second", http.StatusOK)
+	if !second.AlreadyRevoked {
+		t.Error("second revoke did NOT report already_revoked=true")
+	}
+	// The response reflects the original revoker's reason — re-revoke
+	// must NOT overwrite the existing revoke metadata.
+	if second.RevokedReason != "first" {
+		t.Errorf("revoked_reason after re-revoke = %q, want 'first' (preserved)", second.RevokedReason)
+	}
+
+	// Audit table must contain exactly ONE deployment_package.revoked
+	// row for this package — the idempotent second call writes none.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var revokeAuditCount int
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT COUNT(*) FROM audit_events WHERE action = 'deployment_package.revoked' AND target_id = $1`,
+			pkg.ID,
+		).Scan(&revokeAuditCount)
+	}); err != nil {
+		t.Fatalf("audit count: %v", err)
+	}
+	if revokeAuditCount != 1 {
+		t.Errorf("deployment_package.revoked audit count = %d, want 1 (idempotent)", revokeAuditCount)
+	}
+}
