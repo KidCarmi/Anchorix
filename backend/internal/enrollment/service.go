@@ -466,6 +466,21 @@ func (s *Service) recordAuthFailure(ctx context.Context, orgID, agentID, reason 
 	if orgID == "" {
 		orgID = fallbackRejectionOrg
 	}
+	// audit.Event.Actor and TargetID are NOT NULL at the schema
+	// level and the storage-layer AuditRecorder enforces this with
+	// non-empty checks (audit.Recorder rejects empty Actor /
+	// TargetID even before SQL touches the row). For pre-credential
+	// rejections we do not have a real agent id, so we surface
+	// stable placeholders that mirror auth.login_failed's
+	// convention (Actor="<email>", TargetID="(none)").
+	actor := agentID
+	targetID := agentID
+	if actor == "" {
+		actor = "unknown_agent"
+	}
+	if targetID == "" {
+		targetID = "(none)"
+	}
 	md, _ := json.Marshal(map[string]any{
 		"reason":      reason,
 		"severity":    "security",
@@ -474,11 +489,11 @@ func (s *Service) recordAuthFailure(ctx context.Context, orgID, agentID, reason 
 	})
 	_ = s.audit.Record(ctx, audit.Event{
 		OrganizationID: orgID,
-		Actor:          agentID,
+		Actor:          actor,
 		ActorType:      "agent",
 		Action:         "agent.authentication_failed",
 		TargetType:     "agent",
-		TargetID:       agentID,
+		TargetID:       targetID,
 		RequestID:      in.RequestID,
 		Metadata:       md,
 	})
@@ -662,13 +677,24 @@ func (s *Service) recordRejection(ctx context.Context, orgID, packageID, reason 
 		"has_install_id":        in.InstallID != "",
 		"has_machine_fp":        in.MachineFingerprint != "",
 	})
+	// audit.Event.TargetID is NOT NULL and the AuditRecorder
+	// rejects empty TargetID. For the "bootstrap_secret_unknown"
+	// path the package id is empty by definition, so we surface a
+	// stable placeholder that mirrors auth.login_failed's
+	// "(none)" convention. Without it the audit write would
+	// silently fail and the rejection would not show up in the
+	// security feed.
+	targetID := packageID
+	if targetID == "" {
+		targetID = "(none)"
+	}
 	return s.audit.Record(ctx, audit.Event{
 		OrganizationID: orgID,
 		Actor:          "unknown_agent",
 		ActorType:      "agent",
 		Action:         "agent.enrollment_rejected",
 		TargetType:     "deployment_package",
-		TargetID:       packageID,
+		TargetID:       targetID,
 		RequestID:      in.RequestID,
 		Metadata:       md,
 	})
