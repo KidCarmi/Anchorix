@@ -60,6 +60,52 @@ enrollment response **once** and is never reissued. The control
 plane persists only `sha256(agent_credential)`. mTLS replaces the
 bearer credential in Phase 6 (CLAUDE.md §6.4).
 
+### Bearer authentication (PR-016 / H-007)
+
+After enrollment, the agent authenticates every subsequent call by
+presenting the credential in the standard HTTP scheme:
+
+```
+Authorization: Bearer <agent_credential>
+```
+
+The control plane:
+
+1. Reads the `Authorization` header.
+2. Requires the `Bearer` scheme (case-insensitive per RFC 6750
+   §2.1).
+3. Hashes the supplied token with SHA-256.
+4. Looks up the agent by `credential_hash` in `agents`.
+5. Verifies `status = "active"` (rejects `disabled` / `revoked`).
+6. Attaches an `AuthenticatedAgent` principal to the request
+   context.
+
+The `AuthenticatedAgent` view is deliberately narrow — id, org id,
+status, deployment package id, agent version, group name, labels.
+It does **not** carry the credential, the hash, or the machine
+fingerprint; handlers downstream of the agent-auth middleware
+should never need those.
+
+The middleware is in `internal/httpapi/middleware/agent_auth.go`
+and is independent of the operator session resolver. Operator
+cookies are NOT consulted on agent endpoints, and a successful
+agent auth does NOT populate the operator session context. The
+two identity axes are kept strictly separate (CLAUDE.md §8.6).
+
+The single authenticated endpoint in this PR is
+`GET /api/v1/agent/me`. Heartbeat (`POST /agents/{id}/heartbeat`)
+and inventory (`POST /agents/{id}/inventory`) are still stubs;
+both will move behind `RequireAuthenticatedAgent` when Phase 3
+implements them.
+
+Every failure mode (missing header / malformed scheme / empty
+token / unknown credential / disabled or revoked agent) returns
+the same `401 agent_unauthorized` envelope. The specific reason is
+recorded in an `agent.authentication_failed` audit row tagged
+`severity: "security"` — operators can diagnose attempts in the
+audit feed without the failure mode being exposed on the wire
+(CLAUDE.md §6 deterministic auth).
+
 ## End-to-end flow
 
 ```
@@ -363,7 +409,9 @@ on the foundation but is reserved for a focused later PR.
   hardening.
 - **mTLS between agent and control plane.** Phase 6.
 - **Heartbeat / inventory ingest.** Phase 3 (`POST /agents/{id}/heartbeat`,
-  `POST /agents/{id}/inventory`).
+  `POST /agents/{id}/inventory`). Both endpoints will move behind
+  the bearer-auth middleware that landed alongside `GET /agent/me`
+  (H-007).
 - **Findings / risk-rule evaluation.** Phase 4.
 - **Package revocation UI.** The operator-facing **API**
   (`POST /deployment-packages/{id}/revoke`) shipped in PR #15

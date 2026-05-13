@@ -82,4 +82,28 @@ type AgentRepository interface {
 	// result is ordered by EnrolledAt DESC so the operator UI
 	// shows the most recent enrollment first.
 	List(ctx context.Context, organizationID string) ([]Agent, error)
+
+	// FindByCredentialHash looks up an agent by the SHA-256 of the
+	// bearer credential it was issued at enrollment. Returns
+	// ErrAgentNotFound if no agent matches the hash. The lookup
+	// is by hash only — the plaintext credential never touches
+	// storage.
+	FindByCredentialHash(ctx context.Context, hash []byte) (*Agent, error)
+}
+
+// AuthenticatedAgent is the principal type attached to a request's
+// context after a successful agent-credential auth. It is
+// deliberately a narrow view of Agent — credential_hash and the
+// machine fingerprint are not part of this struct because no
+// downstream handler should ever need them. CLAUDE.md §8.4: the
+// type expresses domain purpose (this is an agent that has just
+// proven its identity), not a database row.
+type AuthenticatedAgent struct {
+	AgentID             string
+	OrganizationID      string
+	Status              AgentStatus
+	DeploymentPackageID string
+	AgentVersion        string
+	GroupName           string
+	Labels              []string
 }

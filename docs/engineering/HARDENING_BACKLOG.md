@@ -46,39 +46,6 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
 - **References:** CLAUDE.md §6, §19; `docs/engineering/
   AGENT_ENROLLMENT.md` "Reinstall behavior in v0.1".
 
-### H-007 — Agent-credential authentication middleware
-
-- **Title:** `feat(backend): agent-bearer authentication middleware`
-- **Risk:** high (security). PR-013 issues
-  `agent_credential` at enrollment and stores it as SHA-256.
-  Nothing **uses** the credential yet — the heartbeat and
-  inventory endpoints are still 501 stubs. Phase 3 wires them up,
-  and the first thing they need is an `Authorization: Bearer
-  <agent_credential>` middleware that:
-    - reads the header,
-    - hashes the supplied value,
-    - looks up the agent by `credential_hash`,
-    - validates the agent's `status`,
-    - attaches `*enrollment.Agent` to ctx for the handlers.
-  Without this middleware, no real agent-side endpoint can ship,
-  and the bearer credential issued today is unused.
-- **Scope:** small-medium. New file
-  `internal/httpapi/middleware/agent_auth.go` consuming an
-  `AgentAuthenticator` interface from `internal/enrollment` (the
-  service looks up the credential hash via a new repo method).
-  Constant-time-equal not strictly required for SHA-256 of
-  32-byte random tokens (negligible timing surface) but cheap to
-  add. Routes for `POST /agents/{id}/heartbeat` and
-  `POST /agents/{id}/inventory` move behind it in the same PR or
-  the next one (Phase 3 work).
-- **Recommended PR:** `feat(backend): agent-credential auth middleware (H-007)`
-- **Reason not fixed now:** PR-013's scope was issuing the
-  credential. Consuming it requires at least one real agent
-  endpoint, which begins Phase 3.
-- **References:** CLAUDE.md §6 (auth), §8.6 (decoupling — the
-  middleware sits at httpapi, depends on a domain interface
-  owned by enrollment).
-
 ### H-008 — Future mTLS / device crypto identity hardening
 
 - **Title:** `design(security): Phase 6 mTLS migration for agent identity`

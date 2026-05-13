@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -76,6 +77,36 @@ func (r *AgentRepository) Create(
 		return fmt.Errorf("postgres: create agent: %w", err)
 	}
 	return nil
+}
+
+// FindByCredentialHash returns the agent whose credential_hash
+// matches the supplied SHA-256. The lookup is by hash only — the
+// plaintext credential never reaches storage. The credential_hash
+// column itself is NOT included in the result; the agent-auth
+// middleware uses the returned struct only to construct an
+// AuthenticatedAgent principal.
+//
+// Returns enrollment.ErrAgentNotFound on no match.
+func (r *AgentRepository) FindByCredentialHash(
+	ctx context.Context,
+	hash []byte,
+) (*enrollment.Agent, error) {
+	const q = `
+		SELECT id, organization_id, hostname, display_name, version, status,
+		       enrolled_at, last_seen_at,
+		       deployment_package_id, machine_fingerprint_hash, install_id,
+		       group_name, labels, updated_at
+		  FROM agents
+		 WHERE credential_hash = $1`
+	row := r.db.querierFor(ctx).QueryRow(ctx, q, hash)
+	agent, err := scanAgent(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, enrollment.ErrAgentNotFound
+		}
+		return nil, fmt.Errorf("postgres: find agent by credential hash: %w", err)
+	}
+	return agent, nil
 }
 
 // List returns enrolled agents for the organization, most-recently

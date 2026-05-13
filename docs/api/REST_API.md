@@ -257,11 +257,28 @@ Failure responses:
 
 ## Agents
 
+Two separate identity surfaces share the `/agents` / `/agent`
+prefixes:
+
+- **Operator** (session cookie) — uses `/agents/*` to list and
+  manage agents from the admin UI.
+- **Agent bearer** (Authorization: Bearer) — uses `/agent/*`
+  (singular) to authenticate the agent itself. The bearer is the
+  `agent_credential` returned exactly once by
+  `POST /agents/enroll`. Cookies are NOT consulted by these
+  endpoints; operator and agent identity are independent axes
+  (CLAUDE.md §8.6).
+
+mTLS replaces the bearer credential in Phase 6 (CLAUDE.md §6.4);
+until then, the bearer credential is the v0.1 agent identity
+primitive.
+
 | Method | Path                                  | Auth     | Purpose                                                |
 | ------ | ------------------------------------- | -------- | ------------------------------------------------------ |
 | GET    | `/agents`                             | user     | List registered agents (org-scoped)                    |
 | GET    | `/agents/{id}`                        | user     | Get a single agent *(stub — Phase 2 continuation)*     |
 | POST   | `/agents/enroll`                      | bootstrap| Agent enrollment (consumes bootstrap secret)           |
+| GET    | `/agent/me`                           | agent    | Authenticated agent identity (bearer credential)       |
 | POST   | `/agents/{id}/heartbeat`              | agent    | *Stub — Phase 3.*                                      |
 | POST   | `/agents/{id}/inventory`              | agent    | *Stub — Phase 3.*                                      |
 
@@ -348,6 +365,45 @@ agents first.
 
 `next_cursor` is always `null` in v0.1; pagination lands when
 fleets grow large enough to need it.
+
+### `GET /agent/me`
+
+**Agent-authenticated** endpoint. The request MUST carry the
+`Authorization: Bearer <agent_credential>` header. Operator session
+cookies are NOT honored on this path; an operator wishing to view
+their own user profile uses `GET /auth/me`.
+
+Purpose: prove the agent-auth model works end-to-end so a freshly
+enrolled agent can sanity-check its own identity before any
+state-changing call.
+
+Successful response — `200 OK`:
+
+```json
+{
+  "agent_id": "...",
+  "organization_id": "anchorix",
+  "status": "active",
+  "deployment_package_id": "...",
+  "agent_version": "0.1.0",
+  "group_name": "Finance",
+  "labels": ["sccm", "finance"]
+}
+```
+
+The response **never** echoes the bearer credential, the
+credential hash, or the machine fingerprint.
+
+Failure responses collapse to a single deterministic envelope so
+the caller cannot enumerate identity state:
+
+| Status | `code`                | When                                                                  |
+| ------ | --------------------- | --------------------------------------------------------------------- |
+| 401    | `agent_unauthorized`  | Missing `Authorization` header, scheme is not `Bearer`, token is empty, credential unknown, or agent status is not `active` |
+
+The internal reason is recorded in an `agent.authentication_failed`
+audit event tagged `severity: "security"` so operators can diagnose
+attempts without surfacing the reason on the wire.
 
 ### Inventory upload
 
@@ -447,6 +503,7 @@ land in later phases.
 | `private_key_rejected`   | 400  | Inventory upload contained private key material        |
 | `enrollment_invalid`     | 400  | Token expired, consumed, or hostname mismatch          |
 | `enrollment_rejected`    | 401  | Agent enrollment failed for any reason (generic; see audit) |
+| `agent_unauthorized`     | 401  | Agent-credential auth missing, malformed, unknown, or revoked |
 | `not_implemented`        | 501  | Endpoint exists in contract but not in this build      |
 | `internal_error`         | 500  | Unhandled server error                                 |
 

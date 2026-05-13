@@ -161,10 +161,12 @@ func (f *fakePackageRepo) IncrementUses(_ context.Context, id string, at time.Ti
 type fakeAgentRepo struct {
 	mu sync.Mutex
 
-	created    []agentCreateCall
-	createErr  error
-	listErr    error
-	listAgents map[string][]Agent // orgID -> agents
+	created      []agentCreateCall
+	createErr    error
+	listErr      error
+	findErr      error
+	listAgents   map[string][]Agent // orgID -> agents
+	byCredential map[string]*Agent  // string(hash) -> agent
 }
 
 type agentCreateCall struct {
@@ -173,7 +175,10 @@ type agentCreateCall struct {
 }
 
 func newFakeAgentRepo() *fakeAgentRepo {
-	return &fakeAgentRepo{listAgents: map[string][]Agent{}}
+	return &fakeAgentRepo{
+		listAgents:   map[string][]Agent{},
+		byCredential: map[string]*Agent{},
+	}
 }
 
 func (f *fakeAgentRepo) Create(_ context.Context, a *Agent, credentialHash []byte) error {
@@ -184,6 +189,7 @@ func (f *fakeAgentRepo) Create(_ context.Context, a *Agent, credentialHash []byt
 	}
 	f.created = append(f.created, agentCreateCall{Agent: a, CredentialHash: append([]byte(nil), credentialHash...)})
 	f.listAgents[a.OrganizationID] = append(f.listAgents[a.OrganizationID], *a)
+	f.byCredential[string(credentialHash)] = a
 	return nil
 }
 
@@ -194,6 +200,19 @@ func (f *fakeAgentRepo) List(_ context.Context, orgID string) ([]Agent, error) {
 		return nil, f.listErr
 	}
 	return f.listAgents[orgID], nil
+}
+
+func (f *fakeAgentRepo) FindByCredentialHash(_ context.Context, hash []byte) (*Agent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.findErr != nil {
+		return nil, f.findErr
+	}
+	a, ok := f.byCredential[string(hash)]
+	if !ok {
+		return nil, ErrAgentNotFound
+	}
+	return a, nil
 }
 
 // fakeAuditRecorder records every audit event the service writes.
@@ -993,4 +1012,149 @@ func TestRevokePackageAuditFailureRollsBack(t *testing.T) {
 			t.Error("audit row recorded despite failure (rollback contract violated)")
 		}
 	}
+}
+
+// --- AuthenticateAgent (H-007) ---------------------------------------------
+
+// enrollOneAgent runs the full create-package + enroll-agent flow
+// and returns the plaintext credential. The other auth tests need
+// a real credential whose hash is in the fake repo.
+func enrollOneAgent(t *testing.T, svc *Service, agents *fakeAgentRepo) (plaintext string, agentID string) {
+	t.Helper()
+	pkgOut, err := svc.CreatePackage(context.Background(), validCreateInput())
+	if err != nil {
+		t.Fatalf("CreatePackage: %v", err)
+	}
+	out, err := svc.EnrollAgent(context.Background(), EnrollAgentInput{
+		BootstrapSecret: pkgOut.BootstrapSecret,
+		Hostname:        "ws-auth",
+	})
+	if err != nil {
+		t.Fatalf("EnrollAgent: %v", err)
+	}
+	if out.AgentCredential == "" {
+		t.Fatal("EnrollAgent returned empty credential")
+	}
+	return out.AgentCredential, out.Agent.ID
+}
+
+func TestAuthenticateAgentHappyPath(t *testing.T) {
+	svc, _, agents, _, _ := newTestService(t)
+	plaintext, agentID := enrollOneAgent(t, svc, agents)
+
+	got, err := svc.AuthenticateAgent(context.Background(), AuthenticateAgentInput{
+		BootstrapCredential: plaintext,
+	})
+	if err != nil {
+		t.Fatalf("AuthenticateAgent: %v", err)
+	}
+	if got.AgentID != agentID {
+		t.Errorf("AgentID = %q, want %q", got.AgentID, agentID)
+	}
+	if got.OrganizationID != "anchorix" {
+		t.Errorf("OrganizationID = %q, want anchorix", got.OrganizationID)
+	}
+	if got.Status != AgentStatusActive {
+		t.Errorf("Status = %q, want active", got.Status)
+	}
+}
+
+func TestAuthenticateAgentRejectsEmptyCredential(t *testing.T) {
+	svc, _, _, auditRec, _ := newTestService(t)
+	_, err := svc.AuthenticateAgent(context.Background(), AuthenticateAgentInput{
+		BootstrapCredential: "",
+	})
+	if !errors.Is(err, ErrAgentAuthenticationFailed) {
+		t.Fatalf("err = %v, want ErrAgentAuthenticationFailed", err)
+	}
+	// Failed auth attempt should be recorded with severity:security
+	// and the credential_empty reason.
+	if !hasAuthFailureWithReason(auditRec.events, "credential_empty") {
+		t.Errorf("missing agent.authentication_failed audit with reason=credential_empty")
+	}
+}
+
+func TestAuthenticateAgentRejectsUnknownCredential(t *testing.T) {
+	svc, _, _, auditRec, _ := newTestService(t)
+	_, err := svc.AuthenticateAgent(context.Background(), AuthenticateAgentInput{
+		BootstrapCredential: "not-a-real-credential",
+	})
+	if !errors.Is(err, ErrAgentAuthenticationFailed) {
+		t.Fatalf("err = %v, want ErrAgentAuthenticationFailed", err)
+	}
+	if !hasAuthFailureWithReason(auditRec.events, "credential_unknown") {
+		t.Errorf("missing agent.authentication_failed audit with reason=credential_unknown")
+	}
+}
+
+func TestAuthenticateAgentRejectsDisabledAgent(t *testing.T) {
+	svc, _, agents, auditRec, _ := newTestService(t)
+	plaintext, agentID := enrollOneAgent(t, svc, agents)
+
+	// Disable the agent in the fake repo, bypassing any UI.
+	agents.mu.Lock()
+	for _, a := range agents.byCredential {
+		if a.ID == agentID {
+			a.Status = AgentStatusDisabled
+		}
+	}
+	agents.mu.Unlock()
+
+	_, err := svc.AuthenticateAgent(context.Background(), AuthenticateAgentInput{
+		BootstrapCredential: plaintext,
+	})
+	if !errors.Is(err, ErrAgentAuthenticationFailed) {
+		t.Fatalf("err = %v, want ErrAgentAuthenticationFailed", err)
+	}
+	if !hasAuthFailureWithReason(auditRec.events, "agent_status_disabled") {
+		t.Errorf("missing audit row with reason=agent_status_disabled")
+	}
+}
+
+func TestAuthenticateAgentLookupErrorPropagates(t *testing.T) {
+	svc, _, agents, _, _ := newTestService(t)
+	agents.findErr = errors.New("synthetic repository failure")
+
+	_, err := svc.AuthenticateAgent(context.Background(), AuthenticateAgentInput{
+		BootstrapCredential: "anything",
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if errors.Is(err, ErrAgentAuthenticationFailed) {
+		t.Errorf("repository error must NOT collapse to ErrAgentAuthenticationFailed (HTTP would map to 401 instead of 500); got %v", err)
+	}
+}
+
+func TestAuthenticateAgentAuditFailureStaysBestEffort(t *testing.T) {
+	svc, _, _, auditRec, _ := newTestService(t)
+	auditRec.failOnAction = "agent.authentication_failed"
+
+	_, err := svc.AuthenticateAgent(context.Background(), AuthenticateAgentInput{
+		BootstrapCredential: "not-real",
+	})
+	// Audit failure must NOT cause the auth response to flip to
+	// 500 — otherwise an attacker can DOS agent connectivity by
+	// probing audit-storage health. Authentication-failed audit
+	// is best-effort by design (matches the rejection-audit policy
+	// on enrollment unknown-bootstrap-secret).
+	if !errors.Is(err, ErrAgentAuthenticationFailed) {
+		t.Fatalf("err = %v, want ErrAgentAuthenticationFailed (best-effort audit)", err)
+	}
+}
+
+// hasAuthFailureWithReason scans recorded audit events for an
+// agent.authentication_failed row whose metadata contains the
+// supplied reason string. Substring match (not exact JSON) so the
+// helper tolerates jsonb-style formatting.
+func hasAuthFailureWithReason(events []audit.Event, reason string) bool {
+	for _, e := range events {
+		if e.Action != "agent.authentication_failed" {
+			continue
+		}
+		if strings.Contains(string(e.Metadata), reason) {
+			return true
+		}
+	}
+	return false
 }

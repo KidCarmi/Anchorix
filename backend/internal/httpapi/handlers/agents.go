@@ -154,3 +154,50 @@ func AgentsHeartbeat(w http.ResponseWriter, _ *http.Request) { notImplemented(w)
 
 // AgentsInventory remains stub (inventory lands in Phase 3).
 func AgentsInventory(w http.ResponseWriter, _ *http.Request) { notImplemented(w) }
+
+// agentMeResponse is the JSON shape returned by GET /api/v1/agent/me.
+// Deliberately minimal: no credential, no credential hash, no
+// machine fingerprint. The handler echoes only the identity facts
+// the agent already knows about itself.
+type agentMeResponse struct {
+	AgentID             string   `json:"agent_id"`
+	OrganizationID      string   `json:"organization_id"`
+	Status              string   `json:"status"`
+	DeploymentPackageID string   `json:"deployment_package_id,omitempty"`
+	AgentVersion        string   `json:"agent_version,omitempty"`
+	GroupName           string   `json:"group_name,omitempty"`
+	Labels              []string `json:"labels,omitempty"`
+}
+
+// AgentMe handles GET /api/v1/agent/me. Authenticated-agent only.
+// The endpoint exists primarily to prove the agent-auth model
+// works end-to-end: an agent that successfully exchanges its
+// bearer credential gets a deterministic identity payload it can
+// log against its own state.
+//
+// The route is wrapped with middleware.RequireAuthenticatedAgent
+// in the router, so this handler is only ever invoked with a
+// non-nil AgentFromContext.
+func AgentMe() http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		agent := middleware.AgentFromContext(r.Context())
+		if agent == nil {
+			// Defensive: RequireAuthenticatedAgent should have
+			// blocked this case. If we somehow got here, fail
+			// closed with the same envelope the middleware would
+			// have written.
+			envelope.WriteError(w, http.StatusUnauthorized,
+				"agent_unauthorized", "agent authentication required")
+			return
+		}
+		envelope.WriteJSON(w, http.StatusOK, agentMeResponse{
+			AgentID:             agent.AgentID,
+			OrganizationID:      agent.OrganizationID,
+			Status:              string(agent.Status),
+			DeploymentPackageID: agent.DeploymentPackageID,
+			AgentVersion:        agent.AgentVersion,
+			GroupName:           agent.GroupName,
+			Labels:              agent.Labels,
+		})
+	}
+}
