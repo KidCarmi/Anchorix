@@ -533,7 +533,7 @@ Failure responses:
 
 | Status | `code`               | When                                                        |
 | ------ | -------------------- | ----------------------------------------------------------- |
-| 400    | `bad_request`        | Body is malformed JSON, has trailing JSON / garbage, exceeds the per-field byte caps, or has too many `local_ips` entries |
+| 400    | `bad_request`        | Body is malformed JSON, has trailing JSON / garbage after the first object, exceeds the per-field byte caps, has more than 32 `local_ips` entries, has a `local_ips` entry longer than 64 bytes, or has a `local_ips` entry that is empty after whitespace trimming |
 | 401    | `agent_unauthorized` | Bearer missing, malformed, unknown, or agent revoked/disabled |
 
 ### `GET /agents/{id}/inventory`

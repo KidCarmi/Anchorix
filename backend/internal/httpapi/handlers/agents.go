@@ -146,8 +146,20 @@ func AgentsList(deps AgentsDeps) http.HandlerFunc {
 	}
 }
 
-// AgentsGet remains stub (single-agent detail page arrives in a
-// later phase).
+// AgentsHeartbeat and AgentsInventory used to live here as
+// unrouted operator-keyed stubs (POST /agents/{id}/heartbeat,
+// POST /agents/{id}/inventory) carried over from the original v0.1
+// schema proposal. PR-017 (heartbeat) and PR-018 (inventory)
+// replaced both with the agent-bearer-keyed singular-prefix
+// endpoints (POST /agent/heartbeat, POST /agent/inventory). The
+// stubs were unrouted at the time of those PRs but kept as
+// exported symbols out of caution around external imports — a
+// caution that turned out to be unwarranted (no other package
+// imports them). PR-019 deletes them under CLAUDE.md §8.5 (no
+// dead code) and §19 (no TODO-driven architecture).
+//
+// AgentsGet remains stub: the operator-side single-agent detail
+// page is real Phase 2 continuation work, not a deprecated path.
 func AgentsGet(w http.ResponseWriter, _ *http.Request) { notImplemented(w) }
 
 // nextHeartbeatSeconds is the cadence hint returned to agents.
@@ -253,28 +265,6 @@ func AgentHeartbeat(deps AgentsDeps) http.HandlerFunc {
 		})
 	}
 }
-
-// AgentsHeartbeat is the LEGACY operator-keyed heartbeat path
-// (POST /agents/{id}/heartbeat) carried over from the original
-// v0.1 schema proposal. PR-017 introduces the agent-keyed
-// equivalent (POST /agent/heartbeat) wrapped behind
-// RequireAuthenticatedAgent. The legacy path is no longer routed
-// in router.go; this stub remains only because external imports
-// of the package symbol would break if it were removed in the
-// same PR. A follow-up handler-cleanup PR can delete it.
-func AgentsHeartbeat(w http.ResponseWriter, _ *http.Request) { notImplemented(w) }
-
-// AgentsInventory is the LEGACY operator-keyed inventory stub
-// (POST /agents/{id}/inventory) carried over from the original
-// v0.1 schema proposal. PR-018 introduces the agent-keyed
-// equivalent (POST /agent/inventory) for the machine-inventory
-// snapshot — see handlers.AgentInventorySubmit / .AgentInventoryGet
-// in agent_inventory.go — wrapped behind RequireAuthenticatedAgent.
-// The legacy path is no longer routed in router.go; this stub
-// remains only because external imports of the package symbol
-// would break if it were removed in the same PR. A follow-up
-// handler-cleanup PR can delete it.
-func AgentsInventory(w http.ResponseWriter, _ *http.Request) { notImplemented(w) }
 
 // agentMeResponse is the JSON shape returned by GET /api/v1/agent/me.
 // Deliberately minimal: no credential, no credential hash, no

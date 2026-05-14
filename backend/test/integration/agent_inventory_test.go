@@ -583,3 +583,152 @@ func TestOperatorGetAgentInventoryRequiresSession(t *testing.T) {
 		t.Errorf("anon status = %d, want 401", resp.StatusCode)
 	}
 }
+
+// TestAgentInventoryInstalledAtNullPersistsAsDBNull confirms that an
+// agent which omits installed_at (or sends explicit null) results in
+// a real SQL NULL in the column, not a synthetic zero timestamp. The
+// optional-pointer handling lives across three boundaries — the JSON
+// decoder, the service.buildSnapshot copy, and the repository's
+// `var installedAt any` translation — so the end-to-end assertion is
+// the only one that catches a regression in any of those layers.
+func TestAgentInventoryInstalledAtNullPersistsAsDBNull(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	agentID, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	// Body omits installed_at; the DTO uses omitempty + pointer so
+	// the marshalled JSON simply doesn't carry the key.
+	submitInventory(t, srv.URL, credential, inventoryReqDTO{
+		Hostname: "no-installed-at",
+	}, http.StatusOK)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var isNull bool
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT installed_at IS NULL FROM agent_inventory_snapshots WHERE agent_id = $1`,
+			agentID,
+		).Scan(&isNull)
+	}); err != nil {
+		t.Fatalf("read installed_at: %v", err)
+	}
+	if !isNull {
+		t.Error("installed_at is not NULL; want NULL for omitted field")
+	}
+}
+
+// TestAgentInventoryRejectsOversizeOSName covers a length-validated
+// field OTHER than hostname so the integration test suite asserts the
+// full validateField call chain for at least two distinct fields. A
+// regression that only broke os_name (e.g. a typo in the cap
+// constant) would not be caught by the hostname test alone.
+func TestAgentInventoryRejectsOversizeOSName(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	submitInventory(t, srv.URL, credential, inventoryReqDTO{
+		// 101 bytes — one over MaxOSNameLength.
+		OSName: strings.Repeat("o", 101),
+	}, http.StatusBadRequest)
+}
+
+// TestAgentInventoryRejectsOversizeLocalIPEntry covers the per-entry
+// length cap, which is a separate code path from the total-count cap
+// (TestAgentInventoryRejectsTooManyLocalIPs covers the count). The
+// integration boundary did not previously assert the per-entry cap
+// end-to-end.
+func TestAgentInventoryRejectsOversizeLocalIPEntry(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	submitInventory(t, srv.URL, credential, inventoryReqDTO{
+		Hostname: "host",
+		// 65 bytes — one over MaxLocalIPLength. Only one entry, so
+		// the total-count cap is not triggered; the rejection MUST
+		// be from the per-entry length validation.
+		LocalIPs: []string{strings.Repeat("a", 65)},
+	}, http.StatusBadRequest)
+}
+
+// TestOperatorGetAgentInventoryCrossOrgReturns404 hardens the
+// org-scoping promise: an admin in org A reading an agent enrolled
+// in org B must get 404, not 200 with the other-org snapshot, and
+// not 403 (which would leak the existence of the cross-org agent).
+//
+// The existing TestOperatorGetAgentInventoryNotFound only exercises
+// the "agent doesn't exist anywhere" case. This test seeds a real
+// agent + snapshot in a second org and proves the admin's GET sees
+// none of it.
+func TestOperatorGetAgentInventoryCrossOrgReturns404(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Stand up a second org with its own agent + snapshot via raw
+	// SQL. We bypass the enrollment service deliberately — the
+	// product flow can't produce a foreign-org agent through the
+	// HTTP surface, so we go around it to construct exactly the
+	// state we want to test the scoping against.
+	const foreignAgentID = "foreign-agent-id-hardening"
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO organizations (id, name) VALUES ('other-org', 'Other Org')`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO agents
+				(id, organization_id, hostname, version, status, enrolled_at, last_seen_at)
+			 VALUES ($1, 'other-org', 'foreign-host', '', 'active', now(), now())`,
+			foreignAgentID); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx,
+			`INSERT INTO agent_inventory_snapshots
+				(organization_id, agent_id, hostname, received_at, updated_at)
+			 VALUES ('other-org', $1, 'foreign-snapshot', now(), now())`,
+			foreignAgentID)
+		return err
+	}); err != nil {
+		t.Fatalf("seed foreign org/agent/snapshot: %v", err)
+	}
+
+	// Admin (in 'anchorix') GETs the foreign agent's inventory. The
+	// handler scopes by user.OrganizationID, so the SELECT returns
+	// no rows and the response is 404 not_found — deliberately
+	// indistinguishable from a truly-missing id.
+	req, _ := http.NewRequest(http.MethodGet,
+		srv.URL+"/api/v1/agents/"+foreignAgentID+"/inventory", nil)
+	resp, err := adminClient.Do(req)
+	if err != nil {
+		t.Fatalf("cross-org GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("cross-org GET status = %d; want 404; body=%s", resp.StatusCode, b)
+	}
+
+	// Response body MUST NOT carry any of the foreign snapshot's
+	// fields — a regression that returned 200 with the wrong row
+	// would still be a leak even if the wire envelope looked right.
+	body, _ := io.ReadAll(resp.Body)
+	if strings.Contains(string(body), "foreign-snapshot") {
+		t.Errorf("response body leaks foreign hostname: %s", body)
+	}
+	if strings.Contains(string(body), foreignAgentID) {
+		t.Errorf("response body leaks foreign agent id: %s", body)
+	}
+}
