@@ -1,9 +1,7 @@
 package handlers
 
 import (
-	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"time"
 
@@ -81,27 +79,14 @@ func AgentInventorySubmit(deps AgentInventoryDeps) http.HandlerFunc {
 			return
 		}
 
-		// Body parsing follows the same two-Decode-must-EOF idiom as
-		// /agent/heartbeat: a missing body is valid (a no-op
-		// snapshot of empty fields), a single JSON object is valid,
-		// and ANY trailing bytes after the first object are rejected
-		// (a second object, garbage, etc.). dec.More() is for
-		// elements inside an open array/object, not for top-level
-		// trailing data — only a second Decode returning io.EOF
-		// proves the body terminated cleanly.
-		//
-		// http.MaxBytesReader caps the request body at 64 KiB. The
-		// limit is more than enough for the documented fields and a
-		// 32-entry local_ips list; oversize bodies are rejected at
-		// the reader level and surface as a generic 400.
+		// Body is OPTIONAL — every field is optional, so a `{}` (or
+		// empty body) is a valid no-op snapshot. The strict decoder
+		// enforces: empty body OK, single JSON object OK, anything
+		// else (malformed, trailing JSON, trailing garbage, oversize
+		// body) → ErrInvalidJSONBody → 400. See envelope/decode.go
+		// for the full behavior contract.
 		var body agentInventoryRequest
-		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
-		if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
-			return
-		}
-		var extra any
-		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err := envelope.DecodeStrictOptionalJSON(w, r, &body); err != nil {
 			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
 			return
 		}
