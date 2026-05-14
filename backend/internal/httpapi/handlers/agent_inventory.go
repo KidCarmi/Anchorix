@@ -3,6 +3,7 @@ package handlers
 import (
 	"errors"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/kidcarmi/anchorix/backend/internal/agentinventory"
@@ -194,4 +195,134 @@ func AgentInventoryGet(deps AgentInventoryDeps) http.HandlerFunc {
 			UpdatedAt:      snapshot.UpdatedAt.UTC().Format(time.RFC3339),
 		})
 	}
+}
+
+// inventorySummaryItem is one row of the operator-side list
+// response. It is deliberately slimmer than operatorInventoryResponse:
+//
+//   - LocalIPs is reported as a count, not the full list, so the
+//     list payload stays small at fleet scale. Operators wanting
+//     the full snapshot use GET /agents/{id}/inventory.
+//   - No credential, hash, or fingerprint fields appear here — same
+//     as the per-agent GET. The list endpoint MUST NOT broaden the
+//     leak surface beyond what the per-agent endpoint already
+//     exposes (CLAUDE.md §6.9 redaction, AGENT_ENROLLMENT.md
+//     "Security properties").
+type inventorySummaryItem struct {
+	AgentID       string     `json:"agent_id"`
+	Hostname      string     `json:"hostname"`
+	OSName        string     `json:"os_name"`
+	OSVersion     string     `json:"os_version"`
+	AgentVersion  string     `json:"agent_version"`
+	MachineArch   string     `json:"machine_arch"`
+	LocalIPsCount int        `json:"local_ips_count"`
+	InstalledAt   *time.Time `json:"installed_at"`
+	ReceivedAt    string     `json:"received_at"`
+	UpdatedAt     string     `json:"updated_at"`
+}
+
+// inventoryListResponse follows the documented v0.1 list envelope:
+// `{items: [...], next_cursor: null|string}` (see REST_API.md
+// "Pagination"). NextCursor is *string so an empty cursor encodes
+// as JSON null — clients use the truthiness of the field to decide
+// whether to fetch another page.
+type inventoryListResponse struct {
+	Items      []inventorySummaryItem `json:"items"`
+	NextCursor *string                `json:"next_cursor"`
+}
+
+// AgentInventoryList handles GET /api/v1/agent-inventory.
+//
+// Operator-only — the route is wrapped with middleware.RequireAuth
+// in the router. Agent bearer credentials are NOT honored on this
+// path (operator and agent identity remain separate axes per
+// CLAUDE.md §8.6); a misrouted agent request lands on the operator
+// resolver and is rejected as 401 unauthorized.
+//
+// Org scoping: organization_id comes from the authenticated
+// operator session, NEVER from a query param. The repository's
+// SQL WHERE clause filters on the same id, so cross-org rows
+// cannot surface.
+//
+// Pagination: cursor-based, with `limit` (default 50, max 200)
+// and opaque `cursor`. Non-positive `limit`, an oversize `limit`,
+// a non-integer `limit`, or a malformed `cursor` all surface as
+// 400 bad_request. See agentinventory.ListSummaries for the full
+// contract.
+//
+// Audit policy: read-only, operator-side. No audit row is emitted
+// (CLAUDE.md §9 — audits record state changes; a list call does
+// not change state). Failed authentication is already audited by
+// the operator session resolver.
+func AgentInventoryList(deps AgentInventoryDeps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := middleware.UserFromContext(r.Context())
+		if user == nil {
+			envelope.WriteError(w, http.StatusUnauthorized,
+				"unauthorized", "authentication required")
+			return
+		}
+
+		limit, err := parseLimitQuery(r.URL.Query().Get("limit"))
+		if err != nil {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request",
+				"invalid limit query parameter")
+			return
+		}
+
+		out, err := deps.Service.ListSummaries(r.Context(), agentinventory.ListSummariesInput{
+			OrganizationID: user.OrganizationID,
+			Limit:          limit,
+			Cursor:         r.URL.Query().Get("cursor"),
+		})
+		if err != nil {
+			if errors.Is(err, agentinventory.ErrInvalidListInput) {
+				envelope.WriteError(w, http.StatusBadRequest, "bad_request",
+					"invalid agent inventory list request")
+				return
+			}
+			envelope.WriteError(w, http.StatusInternalServerError,
+				"internal_error", "could not list agent inventory")
+			return
+		}
+
+		items := make([]inventorySummaryItem, 0, len(out.Items))
+		for _, row := range out.Items {
+			items = append(items, inventorySummaryItem{
+				AgentID:       row.AgentID,
+				Hostname:      row.Hostname,
+				OSName:        row.OSName,
+				OSVersion:     row.OSVersion,
+				AgentVersion:  row.AgentVersion,
+				MachineArch:   row.MachineArch,
+				LocalIPsCount: row.LocalIPsCount,
+				InstalledAt:   row.InstalledAt,
+				ReceivedAt:    row.ReceivedAt.UTC().Format(time.RFC3339),
+				UpdatedAt:     row.UpdatedAt.UTC().Format(time.RFC3339),
+			})
+		}
+		var nextCursor *string
+		if out.NextCursor != "" {
+			c := out.NextCursor
+			nextCursor = &c
+		}
+		envelope.WriteJSON(w, http.StatusOK, inventoryListResponse{
+			Items:      items,
+			NextCursor: nextCursor,
+		})
+	}
+}
+
+// parseLimitQuery converts a raw `limit` query parameter into the
+// integer the service expects. An empty value is "use the service
+// default"; a non-integer is rejected. Out-of-bounds limits are
+// validated by the service itself (ErrInvalidListInput) so the
+// rule lives in one place — this helper only catches non-numeric
+// input, which the service can't usefully diagnose because it
+// arrives pre-typed.
+func parseLimitQuery(raw string) (int, error) {
+	if raw == "" {
+		return 0, nil
+	}
+	return strconv.Atoi(raw)
 }

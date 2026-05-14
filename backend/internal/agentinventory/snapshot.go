@@ -67,6 +67,18 @@ type SnapshotRepository interface {
 	// a cross-org id surfaces as "not found" rather than letting an
 	// operator enumerate snapshots in neighboring tenants.
 	GetByAgentAndOrg(ctx context.Context, agentID, organizationID string) (*Snapshot, error)
+
+	// ListSummaries returns a page of slim Summary rows for the
+	// organization, ordered by received_at DESC, agent_id ASC.
+	//
+	// The repository fetches AT MOST q.Limit rows (the service has
+	// already added a +1 sentinel to detect a next page without an
+	// extra COUNT). When q.CursorReceivedAt is the zero value, no
+	// after-bound is applied (first page). When it is set, the SQL
+	// WHERE clause filters to rows strictly after
+	// (q.CursorReceivedAt, q.CursorAgentID) in the documented sort
+	// order.
+	ListSummaries(ctx context.Context, q SummaryRepositoryQuery) ([]Summary, error)
 }
 
 // Sentinel errors. Centralized so domain and storage agree on the
