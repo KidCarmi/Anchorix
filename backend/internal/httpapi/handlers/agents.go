@@ -3,6 +3,7 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -149,7 +150,118 @@ func AgentsList(deps AgentsDeps) http.HandlerFunc {
 // later phase).
 func AgentsGet(w http.ResponseWriter, _ *http.Request) { notImplemented(w) }
 
-// AgentsHeartbeat remains stub (heartbeat lands in Phase 3).
+// nextHeartbeatSeconds is the cadence hint returned to agents.
+// v0.1 hard-codes 5 minutes; future revisions can read this from
+// config or compute it from server load. Keeping it as a named
+// constant centralizes the value so docs, tests, and operators
+// have a single source of truth.
+const nextHeartbeatSeconds = 300
+
+// heartbeatRequest is the JSON body for POST /api/v1/agent/heartbeat.
+// Both fields are optional — the agent may omit them when neither
+// has changed since the last heartbeat. The agent ID is taken
+// from the authenticated context, NEVER from the request body.
+type heartbeatRequest struct {
+	AgentVersion string `json:"agent_version"`
+	Hostname     string `json:"hostname"`
+}
+
+// heartbeatResponse is the JSON returned on a successful heartbeat.
+// Deliberately minimal: a status sentinel for client-side
+// readability, the server's current time so the agent can detect
+// clock drift, and a cadence hint so the agent knows when to
+// heartbeat next without consulting external configuration.
+type heartbeatResponse struct {
+	Status               string `json:"status"`
+	ServerTime           string `json:"server_time"`
+	NextHeartbeatSeconds int    `json:"next_heartbeat_seconds"`
+}
+
+// AgentHeartbeat handles POST /api/v1/agent/heartbeat.
+//
+// Authenticated-agent only — the route is wrapped with
+// middleware.RequireAuthenticatedAgent in the router.
+//
+// On every successful heartbeat the agent's last_seen_at is bumped
+// and (optionally) agent_version / hostname are refreshed when the
+// agent reports a non-empty value. No audit row is emitted; see
+// the audit-policy comment on enrollment.Service.RecordHeartbeat
+// for the rationale (heartbeat is telemetry, not an audit stream).
+func AgentHeartbeat(deps AgentsDeps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		agent := middleware.AgentFromContext(r.Context())
+		if agent == nil {
+			// Defensive: RequireAuthenticatedAgent should have
+			// blocked unauthenticated requests. Fail closed.
+			envelope.WriteError(w, http.StatusUnauthorized,
+				"agent_unauthorized", "agent authentication required")
+			return
+		}
+
+		// Empty body is valid (agent has nothing to report). We do
+		// NOT guard the decode with r.ContentLength because that
+		// breaks chunked-transfer requests (ContentLength = -1),
+		// which proxies and streaming clients commonly use. The
+		// EOF check on the first Decode covers the truly-empty-body
+		// case (Content-Length: 0 or no body sent at all); any
+		// other decode error means malformed JSON.
+		//
+		// A second Decode follows: it MUST hit io.EOF, otherwise
+		// the body had trailing bytes after the first JSON value
+		// (a second object, garbage, etc.) and we reject with the
+		// documented 400 bad_request envelope. This is the
+		// documented Go idiom for asserting a single-document body;
+		// dec.More() is for detecting elements inside the current
+		// array/object being parsed, not top-level trailing data.
+		var body heartbeatRequest
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
+		if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+			return
+		}
+		var extra any
+		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+			return
+		}
+
+		if err := deps.Service.RecordHeartbeat(r.Context(), enrollment.RecordHeartbeatInput{
+			AgentID:        agent.AgentID,
+			OrganizationID: agent.OrganizationID,
+			AgentVersion:   body.AgentVersion,
+			Hostname:       body.Hostname,
+		}); err != nil {
+			if errors.Is(err, enrollment.ErrAgentNotFound) {
+				// The agent disappeared between auth and update.
+				// Surface the same 401 envelope the auth path
+				// would have produced so the client cannot
+				// distinguish "deleted mid-request" from "never
+				// existed".
+				envelope.WriteError(w, http.StatusUnauthorized,
+					"agent_unauthorized", "agent authentication required")
+				return
+			}
+			envelope.WriteError(w, http.StatusInternalServerError,
+				"internal_error", "could not record heartbeat")
+			return
+		}
+
+		envelope.WriteJSON(w, http.StatusOK, heartbeatResponse{
+			Status:               "ok",
+			ServerTime:           time.Now().UTC().Format(time.RFC3339),
+			NextHeartbeatSeconds: nextHeartbeatSeconds,
+		})
+	}
+}
+
+// AgentsHeartbeat is the LEGACY operator-keyed heartbeat path
+// (POST /agents/{id}/heartbeat) carried over from the original
+// v0.1 schema proposal. PR-017 introduces the agent-keyed
+// equivalent (POST /agent/heartbeat) wrapped behind
+// RequireAuthenticatedAgent. The legacy path is no longer routed
+// in router.go; this stub remains only because external imports
+// of the package symbol would break if it were removed in the
+// same PR. A follow-up handler-cleanup PR can delete it.
 func AgentsHeartbeat(w http.ResponseWriter, _ *http.Request) { notImplemented(w) }
 
 // AgentsInventory remains stub (inventory lands in Phase 3).

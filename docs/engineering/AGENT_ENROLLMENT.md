@@ -92,11 +92,35 @@ cookies are NOT consulted on agent endpoints, and a successful
 agent auth does NOT populate the operator session context. The
 two identity axes are kept strictly separate (CLAUDE.md §8.6).
 
-The single authenticated endpoint in this PR is
-`GET /api/v1/agent/me`. Heartbeat (`POST /agents/{id}/heartbeat`)
-and inventory (`POST /agents/{id}/inventory`) are still stubs;
-both will move behind `RequireAuthenticatedAgent` when Phase 3
-implements them.
+The first authenticated endpoint was `GET /api/v1/agent/me`
+(H-007). PR-017 adds `POST /api/v1/agent/heartbeat` behind the
+same middleware. Inventory (`POST /agent/inventory`) remains
+deferred to a later Phase 3 PR.
+
+### Heartbeat (PR-017)
+
+`POST /api/v1/agent/heartbeat` is the canonical owner of the
+`agents.last_seen_at` column — no other code path in v0.1 mutates
+it. The handler runs a single conditional UPDATE keyed on
+`(agent_id, organization_id)`, refreshes `last_seen_at` +
+`updated_at`, and optionally bumps `version` / `hostname` when
+the agent reports non-empty values.
+
+**Heartbeat is operational telemetry, not an audit event stream.**
+Successful heartbeats do NOT emit `audit_events` rows — at the
+default 5-minute cadence a fleet of 10,000 agents would generate
+~2.9 million rows/day, which is the wrong cost model for an
+audit table that downstream tools tail in real time. Operators
+who want version-drift or hostname-rename visibility query the
+`agents` table directly. Failed authentication is still audited
+by the H-007 `agent.authentication_failed` path.
+
+**Offline state is derived externally.** v0.1 does not ship a
+stale-agent sweeper, an automatic `status` transition to
+"offline", or any alerting based on `last_seen_at`. Operator
+tooling (and the future agents UI) compute offline as
+`now() - last_seen_at > threshold` against whatever cadence the
+deployment expects.
 
 Every failure mode (missing header / malformed scheme / empty
 token / unknown credential / disabled or revoked agent) returns

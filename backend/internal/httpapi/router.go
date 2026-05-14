@@ -91,8 +91,15 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 	mux.Handle("GET /agents", resolver(mw.RequireAuth(handlers.AgentsList(agentsDeps))))
 	mux.HandleFunc("GET /agents/{id}", handlers.AgentsGet)
 	mux.Handle("POST /agents/enroll", handlers.AgentsEnroll(agentsDeps))
+	// Agent-facing endpoints (/agent/*) all sit behind the
+	// bearer-credential middleware. The agent identifies itself
+	// via Authorization: Bearer <agent_credential>; the path
+	// carries no agent id.
 	mux.Handle("GET /agent/me", agentAuth(handlers.AgentMe()))
-	mux.HandleFunc("POST /agents/{id}/heartbeat", handlers.AgentsHeartbeat)
+	mux.Handle("POST /agent/heartbeat", agentAuth(handlers.AgentHeartbeat(agentsDeps)))
+	// Inventory remains a 501 stub at the legacy operator-keyed
+	// path; Phase 3 will introduce the agent-keyed equivalent
+	// (POST /agent/inventory) wrapped behind the same middleware.
 	mux.HandleFunc("POST /agents/{id}/inventory", handlers.AgentsInventory)
 
 	// --- certificates ---

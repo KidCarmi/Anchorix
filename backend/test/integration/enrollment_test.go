@@ -1185,3 +1185,279 @@ func TestAgentMeResponseDoesNotEchoCredential(t *testing.T) {
 		t.Error("/agent/me response echoed the plaintext credential")
 	}
 }
+
+// --- POST /agent/heartbeat (PR-017) -----------------------------------
+
+type heartbeatRespDTO struct {
+	Status               string `json:"status"`
+	ServerTime           string `json:"server_time"`
+	NextHeartbeatSeconds int    `json:"next_heartbeat_seconds"`
+}
+
+// agentHeartbeat performs an authenticated heartbeat request and
+// returns the parsed response. Status code is asserted equal to
+// wantStatus.
+func agentHeartbeat(t *testing.T, srv, credential string, body any, wantStatus int) heartbeatRespDTO {
+	t.Helper()
+	var raw []byte
+	if body != nil {
+		var err error
+		raw, err = json.Marshal(body)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+	}
+	req, _ := http.NewRequest(http.MethodPost, srv+"/api/v1/agent/heartbeat", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	if credential != "" {
+		req.Header.Set("Authorization", "Bearer "+credential)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != wantStatus {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("heartbeat status = %d, want %d; body=%s", resp.StatusCode, wantStatus, b)
+	}
+	if wantStatus != http.StatusOK {
+		return heartbeatRespDTO{}
+	}
+	var out heartbeatRespDTO
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode heartbeat: %v", err)
+	}
+	return out
+}
+
+func TestAgentHeartbeatUpdatesLastSeenAt(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	agentID, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var before, after time.Time
+	readLastSeen := func() time.Time {
+		var ts time.Time
+		if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx, `SELECT last_seen_at FROM agents WHERE id = $1`, agentID).Scan(&ts)
+		}); err != nil {
+			t.Fatalf("read last_seen_at: %v", err)
+		}
+		return ts
+	}
+	before = readLastSeen()
+
+	resp := agentHeartbeat(t, srv.URL, credential, map[string]string{
+		"agent_version": "0.1.1",
+		"hostname":      "renamed",
+	}, http.StatusOK)
+	if resp.Status != "ok" {
+		t.Errorf("status = %q, want ok", resp.Status)
+	}
+	if resp.NextHeartbeatSeconds <= 0 {
+		t.Errorf("next_heartbeat_seconds = %d, want > 0", resp.NextHeartbeatSeconds)
+	}
+	if resp.ServerTime == "" {
+		t.Error("server_time missing")
+	}
+
+	after = readLastSeen()
+	if !after.After(before) {
+		t.Errorf("last_seen_at = %v; want strictly after %v", after, before)
+	}
+
+	// agent_version and hostname columns must have been refreshed
+	// from the request body.
+	var version, hostname string
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT version, hostname FROM agents WHERE id = $1`, agentID).
+			Scan(&version, &hostname)
+	}); err != nil {
+		t.Fatalf("read drift columns: %v", err)
+	}
+	if version != "0.1.1" {
+		t.Errorf("version = %q, want 0.1.1", version)
+	}
+	if hostname != "renamed" {
+		t.Errorf("hostname = %q, want renamed", hostname)
+	}
+
+	// Audit policy: heartbeats are operational telemetry, not an
+	// audit stream. No new audit row should land for this heartbeat
+	// beyond what enrollment already wrote.
+	var heartbeatAudits int
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT COUNT(*) FROM audit_events
+			  WHERE target_id = $1
+			    AND action LIKE 'agent.heartbeat%'`,
+			agentID,
+		).Scan(&heartbeatAudits)
+	}); err != nil {
+		t.Fatalf("audit count: %v", err)
+	}
+	if heartbeatAudits != 0 {
+		t.Errorf("heartbeat audit count = %d, want 0 (operational telemetry, not audit)", heartbeatAudits)
+	}
+
+	// And exactly one agent row exists — heartbeat MUST NOT create
+	// a duplicate.
+	var rowCount int
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM agents`).Scan(&rowCount)
+	}); err != nil {
+		t.Fatalf("agents count: %v", err)
+	}
+	if rowCount != 1 {
+		t.Errorf("agents row count = %d, want 1 (heartbeat must not create rows)", rowCount)
+	}
+}
+
+func TestAgentHeartbeatRejectsUnauthenticated(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, _ := testServer(t, db)
+
+	// Anonymous — no Authorization header.
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/agent/heartbeat", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("anon: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("anon status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestAgentHeartbeatRejectsOperatorCookie(t *testing.T) {
+	// Operator session cookies must not authenticate /agent/*.
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/agent/heartbeat", strings.NewReader(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := adminClient.Do(req)
+	if err != nil {
+		t.Fatalf("operator: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("operator cookie reached heartbeat; status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestAgentHeartbeatRejectsDisabledAgent(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	// Flip status to disabled via direct SQL (agent-revoke API is
+	// not part of this PR).
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx, `UPDATE agents SET status = 'disabled' WHERE credential_hash IS NOT NULL`)
+		return err
+	}); err != nil {
+		t.Fatalf("disable agent: %v", err)
+	}
+
+	// Disabled agent → middleware short-circuits before the
+	// heartbeat handler runs.
+	agentHeartbeat(t, srv.URL, credential, map[string]string{}, http.StatusUnauthorized)
+}
+
+// TestAgentHeartbeatBodyShapes covers the full documented 400
+// bad_request contract for the heartbeat body parser:
+//
+//   - empty body accepted
+//   - valid single JSON object accepted
+//   - valid object + trailing whitespace accepted
+//   - two JSON objects rejected
+//   - valid object + trailing garbage rejected
+//   - malformed JSON rejected
+//
+// The trailing-content cases are the substantive guard: without a
+// second Decode that hits io.EOF, the handler would silently
+// consume the first JSON value and swallow the rest, hiding client
+// serialization bugs in production.
+func TestAgentHeartbeatBodyShapes(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	cases := []struct {
+		name       string
+		body       string
+		wantStatus int
+	}{
+		{"empty body", "", http.StatusOK},
+		{"valid object", `{"hostname":"h"}`, http.StatusOK},
+		{"valid object + trailing whitespace", `{"hostname":"h"}` + "\n  \t", http.StatusOK},
+		{"two objects", `{"hostname":"h"}{"extra":1}`, http.StatusBadRequest},
+		{"trailing garbage", `{"hostname":"h"}abc`, http.StatusBadRequest},
+		{"malformed JSON", `{"hostname":`, http.StatusBadRequest},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/agent/heartbeat", bytes.NewReader([]byte(tc.body)))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+credential)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("heartbeat: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				b, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d; body=%s", resp.StatusCode, tc.wantStatus, b)
+			}
+		})
+	}
+}
+
+func TestAgentHeartbeatPreservesValuesOnEmptyBody(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	agentID, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	// Seed known starting values via one heartbeat carrying both.
+	agentHeartbeat(t, srv.URL, credential, map[string]string{
+		"agent_version": "0.1.0",
+		"hostname":      "ws-original",
+	}, http.StatusOK)
+
+	// Empty body — both fields preserved.
+	agentHeartbeat(t, srv.URL, credential, map[string]string{}, http.StatusOK)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var version, hostname string
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT version, hostname FROM agents WHERE id = $1`, agentID).
+			Scan(&version, &hostname)
+	}); err != nil {
+		t.Fatalf("read drift: %v", err)
+	}
+	if version != "0.1.0" {
+		t.Errorf("version = %q after empty heartbeat; want preserved 0.1.0", version)
+	}
+	if hostname != "ws-original" {
+		t.Errorf("hostname = %q after empty heartbeat; want preserved ws-original", hostname)
+	}
+}

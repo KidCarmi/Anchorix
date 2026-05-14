@@ -89,6 +89,19 @@ type AgentRepository interface {
 	// is by hash only — the plaintext credential never touches
 	// storage.
 	FindByCredentialHash(ctx context.Context, hash []byte) (*Agent, error)
+
+	// UpdateHeartbeat bumps last_seen_at + updated_at and
+	// conditionally refreshes agent_version / hostname when the
+	// agent reports a non-empty value. A single UPDATE keeps the
+	// heartbeat path fast — heartbeats are the hottest write in
+	// the agent lifecycle.
+	//
+	// Returns ErrAgentNotFound if no row matches the
+	// (id, organization_id) pair. The org column is part of the
+	// WHERE clause for defense in depth even though the caller
+	// (the service, invoked by the agent-auth middleware) has
+	// already proven the credential belongs to this org.
+	UpdateHeartbeat(ctx context.Context, agentID, organizationID, agentVersion, hostname string, at time.Time) error
 }
 
 // AuthenticatedAgent is the principal type attached to a request's

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -107,6 +108,49 @@ func (r *AgentRepository) FindByCredentialHash(
 		return nil, fmt.Errorf("postgres: find agent by credential hash: %w", err)
 	}
 	return agent, nil
+}
+
+// UpdateHeartbeat bumps last_seen_at + updated_at and conditionally
+// refreshes version / hostname when the agent reports a non-empty
+// value that differs from the stored one. A single UPDATE
+// statement keeps the heartbeat path fast — heartbeats are the
+// hottest write in the agent lifecycle.
+//
+// The WHERE clause includes organization_id as defense in depth:
+// the middleware already proved the credential belongs to this
+// org, but pinning the org on the UPDATE means a bug elsewhere
+// cannot cause a cross-org write.
+//
+// Returns enrollment.ErrAgentNotFound if zero rows match (id +
+// org mismatch). The service surfaces that as a generic
+// authentication failure at the HTTP boundary.
+func (r *AgentRepository) UpdateHeartbeat(
+	ctx context.Context,
+	agentID, organizationID, agentVersion, hostname string,
+	at time.Time,
+) error {
+	// COALESCE(NULLIF($x, ''), <column>) keeps the existing value
+	// when the agent omits the field from the heartbeat body.
+	// Agents that never change their version / hostname can send
+	// a body with only those fields blank.
+	const q = `
+		UPDATE agents
+		   SET last_seen_at = $3,
+		       updated_at   = $3,
+		       version      = COALESCE(NULLIF($4, ''), version),
+		       hostname     = COALESCE(NULLIF($5, ''), hostname)
+		 WHERE id = $1
+		   AND organization_id = $2`
+	tag, err := r.db.querierFor(ctx).Exec(ctx, q,
+		agentID, organizationID, at, agentVersion, hostname,
+	)
+	if err != nil {
+		return fmt.Errorf("postgres: update agent heartbeat: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return enrollment.ErrAgentNotFound
+	}
+	return nil
 }
 
 // List returns enrolled agents for the organization, most-recently
