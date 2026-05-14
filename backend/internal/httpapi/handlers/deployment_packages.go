@@ -3,7 +3,6 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -196,16 +195,18 @@ func DeploymentPackagesRevoke(deps DeploymentPackageDeps) http.HandlerFunc {
 			return
 		}
 
-		// Reason is optional. An empty body is valid. We do NOT
-		// guard the decode with r.ContentLength because that breaks
-		// chunked-transfer requests (ContentLength = -1) — proxies
-		// and streaming clients commonly use chunked encoding, so
-		// the guard would silently accept malformed JSON instead of
-		// returning the documented 400 bad_request envelope. The
-		// EOF check below covers the truly-empty-body case
-		// (Content-Length: 0 or no body sent at all).
+		// Body is OPTIONAL — every field is optional, so an empty
+		// body or `{}` is a valid revoke with no reason. The strict
+		// decoder enforces: empty body OK, single JSON object OK,
+		// anything else (malformed, trailing JSON, trailing garbage,
+		// oversize body) → ErrInvalidJSONBody → 400. PR-019 H-009
+		// migration: this site previously only ran the first Decode,
+		// which silently accepted trailing JSON / garbage after the
+		// reason object. Tightening to match heartbeat / inventory's
+		// posture; no documented contract previously promised lenient
+		// trailing-bytes acceptance.
 		var body revokeRequest
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		if err := envelope.DecodeStrictOptionalJSON(w, r, &body); err != nil {
 			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
 			return
 		}

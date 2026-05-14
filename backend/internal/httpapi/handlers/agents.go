@@ -3,7 +3,6 @@ package handlers
 import (
 	"encoding/json"
 	"errors"
-	"io"
 	"net/http"
 	"strings"
 	"time"
@@ -210,29 +209,15 @@ func AgentHeartbeat(deps AgentsDeps) http.HandlerFunc {
 			return
 		}
 
-		// Empty body is valid (agent has nothing to report). We do
-		// NOT guard the decode with r.ContentLength because that
-		// breaks chunked-transfer requests (ContentLength = -1),
-		// which proxies and streaming clients commonly use. The
-		// EOF check on the first Decode covers the truly-empty-body
-		// case (Content-Length: 0 or no body sent at all); any
-		// other decode error means malformed JSON.
-		//
-		// A second Decode follows: it MUST hit io.EOF, otherwise
-		// the body had trailing bytes after the first JSON value
-		// (a second object, garbage, etc.) and we reject with the
-		// documented 400 bad_request envelope. This is the
-		// documented Go idiom for asserting a single-document body;
-		// dec.More() is for detecting elements inside the current
-		// array/object being parsed, not top-level trailing data.
+		// Body is OPTIONAL — agents that have nothing to report send
+		// an empty body. envelope.DecodeStrictOptionalJSON enforces
+		// the canonical contract: empty body OK, single JSON object
+		// OK, anything else (malformed, trailing JSON, trailing
+		// garbage, oversize) → ErrInvalidJSONBody → 400. See
+		// envelope/decode.go for the full behavior contract and the
+		// rationale for the second-Decode check.
 		var body heartbeatRequest
-		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
-		if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
-			return
-		}
-		var extra any
-		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err := envelope.DecodeStrictOptionalJSON(w, r, &body); err != nil {
 			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
 			return
 		}

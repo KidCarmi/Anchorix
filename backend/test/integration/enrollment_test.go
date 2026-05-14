@@ -921,6 +921,84 @@ func TestDeploymentPackageRevokeIdempotent(t *testing.T) {
 	}
 }
 
+// TestDeploymentPackageRevokeBodyShapes locks in the strict
+// optional-JSON-body contract enforced by
+// envelope.DecodeStrictOptionalJSON (H-009). Before H-009 this
+// handler ran only the first Decode and would silently accept
+// trailing JSON / garbage; the migrated handler now rejects them
+// with the same 400 bad_request envelope heartbeat and inventory
+// have always used. The wire shape (success 200, error 400 with
+// `bad_request` code) does not change for any contract this PR
+// is intentionally tightening; it changes ONLY the previously
+// silent-accept paths.
+func TestDeploymentPackageRevokeBodyShapes(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	client := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	doRevoke := func(t *testing.T, pkgID, rawBody string) *http.Response {
+		t.Helper()
+		req, _ := http.NewRequest(http.MethodPost,
+			srv.URL+"/api/v1/deployment-packages/"+pkgID+"/revoke",
+			strings.NewReader(rawBody))
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("revoke: %v", err)
+		}
+		return resp
+	}
+
+	// Each subcase gets its own package because the success cases
+	// actually revoke. The negative cases reuse a single fresh
+	// package since they are expected to fail before any state
+	// change.
+	cases := []struct {
+		name       string
+		body       string
+		wantStatus int
+		isSuccess  bool
+	}{
+		{"empty body accepted", "", http.StatusOK, true},
+		{"valid object accepted", `{"reason":"v1 superseded"}`, http.StatusOK, true},
+		{"valid object + trailing whitespace", `{"reason":"x"}` + "\n  \t", http.StatusOK, true},
+		{"two objects rejected", `{"reason":"x"}{"reason":"y"}`, http.StatusBadRequest, false},
+		{"trailing garbage rejected", `{"reason":"x"}abc`, http.StatusBadRequest, false},
+		{"malformed JSON rejected", `{"reason":`, http.StatusBadRequest, false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pkg := adminCreatePackage(t, srv.URL, client, createPackageBody{
+				Name:        "RevokeBodyShapes:" + tc.name,
+				PackageType: "baseline",
+				TTLSeconds:  3600,
+				MaxUses:     5,
+			})
+			resp := doRevoke(t, pkg.ID, tc.body)
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				b, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d; body=%s",
+					resp.StatusCode, tc.wantStatus, b)
+			}
+			// On the rejection path the package MUST NOT have been
+			// revoked. We probe by attempting a real revoke and
+			// expecting the not-already-revoked path (AlreadyRevoked
+			// == false), which proves the body-rejected attempt did
+			// not commit.
+			if !tc.isSuccess {
+				follow := adminRevokePackage(t, srv.URL, client, pkg.ID,
+					"real-revoke", http.StatusOK)
+				if follow.AlreadyRevoked {
+					t.Errorf("rejected body still revoked the package; AlreadyRevoked=true")
+				}
+			}
+		})
+	}
+}
+
 // --- GET /agent/me (H-007) -----------------------------------------
 
 // agentMeDTO mirrors the handler's success body. Kept local to
