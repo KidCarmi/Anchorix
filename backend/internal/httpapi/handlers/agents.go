@@ -198,16 +198,18 @@ func AgentHeartbeat(deps AgentsDeps) http.HandlerFunc {
 			return
 		}
 
+		// Empty body is valid (agent has nothing to report). We do
+		// NOT guard the decode with r.ContentLength because that
+		// breaks chunked-transfer requests (ContentLength = -1),
+		// which proxies and streaming clients commonly use. The
+		// EOF check below covers the truly-empty-body case
+		// (Content-Length: 0 or no body sent at all); any other
+		// decode error means malformed JSON. This mirrors the
+		// revoke handler's parsing pattern.
 		var body heartbeatRequest
-		if r.ContentLength != 0 {
-			// Empty body is valid (agent has nothing to report);
-			// io.EOF on an empty body would be the only acceptable
-			// decode error. Anything else means the agent sent
-			// malformed JSON.
-			if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
-				envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
-				return
-			}
+		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+			return
 		}
 
 		if err := deps.Service.RecordHeartbeat(r.Context(), enrollment.RecordHeartbeatInput{
