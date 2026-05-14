@@ -17,6 +17,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/kidcarmi/anchorix/backend/internal/agentinventory"
 	"github.com/kidcarmi/anchorix/backend/internal/auth"
 	"github.com/kidcarmi/anchorix/backend/internal/clock"
 	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
@@ -101,11 +102,11 @@ func TestNoPlaintextSecretsInLogs(t *testing.T) {
 		t.Fatalf("auth.NewService: %v", err)
 	}
 
-	// EnrollmentService is required by httpapi.NewServer's
-	// Dependencies (PR-013). The redaction sweep does not exercise
-	// enrollment routes, but the server constructor validates every
-	// dep at construction time — wire a real service so the gate
-	// passes.
+	// EnrollmentService + AgentInventoryService are required by
+	// httpapi.NewServer's Dependencies (PR-013 / PR-018). The
+	// redaction sweep does not exercise those routes directly, but
+	// the server constructor validates every dep at construction
+	// time — wire real services so the gate passes.
 	deploymentPkgRepo := postgres.NewDeploymentPackageRepository(db)
 	agentsRepo := postgres.NewAgentRepository(db)
 	enrollSvc, err := enrollment.NewService(
@@ -115,10 +116,17 @@ func TestNoPlaintextSecretsInLogs(t *testing.T) {
 		t.Fatalf("enrollment.NewService: %v", err)
 	}
 
+	inventoryRepo := postgres.NewAgentInventorySnapshotRepository(db)
+	inventorySvc, err := agentinventory.NewService(inventoryRepo, clock.System{})
+	if err != nil {
+		t.Fatalf("agentinventory.NewService: %v", err)
+	}
+
 	apiServer, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{
-		AuthService:       svc,
-		CookieSigner:      signer,
-		EnrollmentService: enrollSvc,
+		AuthService:           svc,
+		CookieSigner:          signer,
+		EnrollmentService:     enrollSvc,
+		AgentInventoryService: inventorySvc,
 	})
 	if err != nil {
 		t.Fatalf("httpapi.NewServer: %v", err)

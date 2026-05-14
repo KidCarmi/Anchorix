@@ -277,10 +277,11 @@ primitive.
 | ------ | ------------------------------------- | -------- | ------------------------------------------------------ |
 | GET    | `/agents`                             | user     | List registered agents (org-scoped)                    |
 | GET    | `/agents/{id}`                        | user     | Get a single agent *(stub — Phase 2 continuation)*     |
+| GET    | `/agents/{id}/inventory`              | user     | Read the agent's current machine-inventory snapshot    |
 | POST   | `/agents/enroll`                      | bootstrap| Agent enrollment (consumes bootstrap secret)           |
 | GET    | `/agent/me`                           | agent    | Authenticated agent identity (bearer credential)       |
 | POST   | `/agent/heartbeat`                    | agent    | Liveness heartbeat (bumps `last_seen_at`)              |
-| POST   | `/agents/{id}/inventory`              | agent    | *Stub — Phase 3.*                                      |
+| POST   | `/agent/inventory`                    | agent    | Submit / replace the agent's machine-inventory snapshot |
 
 The original v0.1 schema proposal included a
 `POST /agents/enrollment-tokens` endpoint for issuing single-use
@@ -463,42 +464,121 @@ Offline state is derived externally: an agent is "offline" if
 v0.1 does NOT ship a stale-agent sweeper, automatic state
 transitions, or alerting — those are future work.
 
-### Inventory upload
+### `POST /agent/inventory`
+
+**Agent-authenticated** endpoint. The agent reports its current
+machine-inventory snapshot (host facts: OS, version, architecture,
+local IPs). The handler UPSERTs a single row keyed by
+`(organization_id, agent_id)`; there is **no history table** in v0.1
+and repeated identical submissions are naturally idempotent at the
+row level. Certificate inventory and risk findings are separate
+domains; this endpoint does NOT accept certificate material.
+
+The agent id and organization id come from the authenticated agent
+principal — body-supplied `agent_id` / `organization_id` are
+ignored. An agent cannot submit inventory on behalf of another
+agent.
+
+**Audit policy: this endpoint is operational state sync.** No
+`audit_events` row is written for a successful submission, matching
+the heartbeat cost model documented in
+[`docs/engineering/AGENT_ENROLLMENT.md`](../engineering/AGENT_ENROLLMENT.md)
+"Heartbeat". Failed authentication is still audited by the
+`agent.authentication_failed` path (H-007).
+
+Request body (every field optional; an empty `{}` is valid):
+
+```json
+{
+  "hostname": "ws-001.corp.example",
+  "os_name": "Windows 11",
+  "os_version": "10.0.22631",
+  "agent_version": "0.1.0",
+  "machine_arch": "amd64",
+  "local_ips": ["10.0.0.5", "fe80::1%eth0"],
+  "installed_at": "2026-04-01T00:00:00Z"
+}
+```
+
+`installed_at` may be omitted or `null` when the installer does not
+record it. All string fields are trimmed; per-field byte caps
+(non-negotiable, oversize input is rejected — no silent truncation):
+
+| Field           | Max bytes |
+| --------------- | --------- |
+| `hostname`      | 255       |
+| `os_name`       | 100       |
+| `os_version`    | 100       |
+| `agent_version` | 64        |
+| `machine_arch`  | 64        |
+
+`local_ips` is capped at 32 entries, each ≤ 64 bytes. Empty list
+(or omitted field) is valid.
+
+Successful response — `200 OK`:
+
+```json
+{
+  "status": "ok",
+  "received_at": "2026-06-01T12:00:00Z"
+}
+```
+
+The response is intentionally minimal — there is no
+`next_inventory_seconds` cadence hint in v0.1; inventory cadence is
+operator-controlled. Adding a cadence hint later is an additive
+change under CLAUDE.md §17.
+
+Failure responses:
+
+| Status | `code`               | When                                                        |
+| ------ | -------------------- | ----------------------------------------------------------- |
+| 400    | `bad_request`        | Body is malformed JSON, has trailing JSON / garbage, exceeds the per-field byte caps, or has too many `local_ips` entries |
+| 401    | `agent_unauthorized` | Bearer missing, malformed, unknown, or agent revoked/disabled |
+
+### `GET /agents/{id}/inventory`
+
+Operator-only, organization-scoped. Returns the current machine-
+inventory snapshot for an agent enrolled in the operator's
+organization. A snapshot belonging to a different organization
+surfaces as `404 not_found` (same envelope a truly-missing id
+produces) so operators cannot enumerate snapshots in neighboring
+tenants.
+
+Successful response — `200 OK`:
 
 ```json
 {
   "agent_id": "...",
+  "organization_id": "anchorix",
   "hostname": "ws-001.corp.example",
-  "collected_at": "2026-05-07T13:24:00Z",
-  "certificates": [
-    {
-      "store_location": "LocalMachine\\My",
-      "fingerprint_sha256": "ab12...",
-      "subject": "CN=ws-001.corp.example",
-      "issuer": "CN=Internal Issuing CA",
-      "serial_number_hex": "01ab...",
-      "signature_algorithm": "SHA256-RSA",
-      "public_key_algorithm": "RSA",
-      "public_key_bits": 2048,
-      "not_before": "2025-05-07T00:00:00Z",
-      "not_after": "2026-05-07T00:00:00Z",
-      "sans": ["ws-001.corp.example"],
-      "key_usages": ["DigitalSignature","KeyEncipherment"],
-      "ext_key_usages": ["ServerAuth"],
-      "is_self_signed": false,
-      "is_ca": false,
-      "certificate_pem": "-----BEGIN CERTIFICATE-----\n..."
-    }
-  ]
+  "os_name": "Windows 11",
+  "os_version": "10.0.22631",
+  "agent_version": "0.1.0",
+  "machine_arch": "amd64",
+  "local_ips": ["10.0.0.5", "fe80::1%eth0"],
+  "installed_at": "2026-04-01T00:00:00Z",
+  "received_at": "2026-06-01T12:00:00Z",
+  "updated_at": "2026-06-01T12:00:00Z"
 }
 ```
 
-**Server-side hard rejections (HTTP 400):**
+Failure responses:
 
-- payload contains any `BEGIN ... PRIVATE KEY` block
-- `certificate_pem` does not parse
-- `agent_id` does not match the authenticated agent
-- `collected_at` is more than 24h in the future
+| Status | `code`         | When                                                                |
+| ------ | -------------- | ------------------------------------------------------------------- |
+| 400    | `bad_request`  | URL has no id                                                       |
+| 401    | `unauthorized` | No session                                                          |
+| 404    | `not_found`    | No snapshot exists for this agent in the caller's organization      |
+
+### Certificate inventory (deferred)
+
+Certificate inventory (PEM-bearing observation upload, deduplication
+by fingerprint, observations table) is intentionally NOT part of
+v0.1 PR-018; it ships in a later phase under a separate endpoint
+contract. The original v0.1 schema proposal hinted at a
+certificate-shaped `POST /agents/{id}/inventory` payload; that
+shape is **not** the contract for `POST /agent/inventory` above.
 
 ## Certificates
 
