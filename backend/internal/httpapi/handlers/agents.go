@@ -264,7 +264,16 @@ func AgentHeartbeat(deps AgentsDeps) http.HandlerFunc {
 // same PR. A follow-up handler-cleanup PR can delete it.
 func AgentsHeartbeat(w http.ResponseWriter, _ *http.Request) { notImplemented(w) }
 
-// AgentsInventory remains stub (inventory lands in Phase 3).
+// AgentsInventory is the LEGACY operator-keyed inventory stub
+// (POST /agents/{id}/inventory) carried over from the original
+// v0.1 schema proposal. PR-018 introduces the agent-keyed
+// equivalent (POST /agent/inventory) for the machine-inventory
+// snapshot — see handlers.AgentInventorySubmit / .AgentInventoryGet
+// in agent_inventory.go — wrapped behind RequireAuthenticatedAgent.
+// The legacy path is no longer routed in router.go; this stub
+// remains only because external imports of the package symbol
+// would break if it were removed in the same PR. A follow-up
+// handler-cleanup PR can delete it.
 func AgentsInventory(w http.ResponseWriter, _ *http.Request) { notImplemented(w) }
 
 // agentMeResponse is the JSON shape returned by GET /api/v1/agent/me.

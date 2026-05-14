@@ -56,6 +56,7 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 		Service:       deps.EnrollmentService,
 		PublicBaseURL: cfg.PublicBaseURL,
 	}
+	agentInventoryDeps := handlers.AgentInventoryDeps{Service: deps.AgentInventoryService}
 
 	// --- auth ---
 	// Login is anonymous; the session resolver runs but does not block.
@@ -97,10 +98,20 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 	// carries no agent id.
 	mux.Handle("GET /agent/me", agentAuth(handlers.AgentMe()))
 	mux.Handle("POST /agent/heartbeat", agentAuth(handlers.AgentHeartbeat(agentsDeps)))
-	// Inventory remains a 501 stub at the legacy operator-keyed
-	// path; Phase 3 will introduce the agent-keyed equivalent
-	// (POST /agent/inventory) wrapped behind the same middleware.
-	mux.HandleFunc("POST /agents/{id}/inventory", handlers.AgentsInventory)
+	// POST /agent/inventory (PR-018) — agent reports its current
+	// machine-inventory snapshot. Operational state sync, like
+	// heartbeat: no audit row on success; one snapshot row per
+	// (organization_id, agent_id) UPSERTed in place.
+	mux.Handle("POST /agent/inventory", agentAuth(handlers.AgentInventorySubmit(agentInventoryDeps)))
+	// GET /agents/{id}/inventory (PR-018) — operator read of the
+	// snapshot above. Org-scoped via the session; cross-org id
+	// surfaces as 404 not_found.
+	mux.Handle("GET /agents/{id}/inventory",
+		resolver(mw.RequireAuth(handlers.AgentInventoryGet(agentInventoryDeps))))
+	// The legacy operator-keyed POST /agents/{id}/inventory stub
+	// (a placeholder from the original v0.1 schema proposal) is no
+	// longer routed; certificate inventory is a separate Phase 3+
+	// concern (internal/inventory) and remains unimplemented.
 
 	// --- certificates ---
 	mux.HandleFunc("GET /certificates", handlers.CertificatesList)

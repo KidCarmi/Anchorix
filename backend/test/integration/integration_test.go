@@ -21,6 +21,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/kidcarmi/anchorix/backend/internal/agentinventory"
 	"github.com/kidcarmi/anchorix/backend/internal/auth"
 	"github.com/kidcarmi/anchorix/backend/internal/clock"
 	"github.com/kidcarmi/anchorix/backend/internal/config"
@@ -134,10 +135,17 @@ func testServer(t *testing.T, db *postgres.DB) (*httptest.Server, *auth.Service)
 		t.Fatalf("enrollment.NewService: %v", err)
 	}
 
+	inventoryRepo := postgres.NewAgentInventorySnapshotRepository(db)
+	inventorySvc, err := agentinventory.NewService(inventoryRepo, clock.System{})
+	if err != nil {
+		t.Fatalf("agentinventory.NewService: %v", err)
+	}
+
 	srv, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{
-		AuthService:       svc,
-		CookieSigner:      signer,
-		EnrollmentService: enrollSvc,
+		AuthService:           svc,
+		CookieSigner:          signer,
+		EnrollmentService:     enrollSvc,
+		AgentInventoryService: inventorySvc,
 	})
 	if err != nil {
 		t.Fatalf("httpapi.NewServer: %v", err)

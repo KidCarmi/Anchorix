@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kidcarmi/anchorix/backend/internal/agentinventory"
 	"github.com/kidcarmi/anchorix/backend/internal/auth"
 	"github.com/kidcarmi/anchorix/backend/internal/config"
 	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
@@ -43,9 +44,10 @@ func testRouter(t *testing.T, register func(*Readiness)) http.Handler {
 		t.Fatalf("NewSignedCookie: %v", err)
 	}
 	deps := Dependencies{
-		AuthService:       &auth.Service{},
-		CookieSigner:      signer,
-		EnrollmentService: &enrollment.Service{},
+		AuthService:           &auth.Service{},
+		CookieSigner:          signer,
+		EnrollmentService:     &enrollment.Service{},
+		AgentInventoryService: &agentinventory.Service{},
 	}
 	return newRouter(cfg, log, r, deps)
 }

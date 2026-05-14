@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/kidcarmi/anchorix/backend/internal/agentinventory"
 	"github.com/kidcarmi/anchorix/backend/internal/auth"
 	"github.com/kidcarmi/anchorix/backend/internal/clock"
 	"github.com/kidcarmi/anchorix/backend/internal/config"
@@ -77,11 +78,18 @@ func cmdServe(ctx context.Context, cfg *config.Config, log *logger.Logger) error
 		return fmt.Errorf("enrollment service: %w", err)
 	}
 
+	agentInventoryRepo := postgres.NewAgentInventorySnapshotRepository(db)
+	agentInventoryService, err := agentinventory.NewService(agentInventoryRepo, clock.System{})
+	if err != nil {
+		return fmt.Errorf("agent inventory service: %w", err)
+	}
+
 	// HTTP layer.
 	srv, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{
-		AuthService:       authService,
-		CookieSigner:      signer,
-		EnrollmentService: enrollmentService,
+		AuthService:           authService,
+		CookieSigner:          signer,
+		EnrollmentService:     enrollmentService,
+		AgentInventoryService: agentInventoryService,
 	})
 	if err != nil {
 		return fmt.Errorf("init server: %w", err)
