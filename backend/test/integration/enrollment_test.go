@@ -1378,32 +1378,54 @@ func TestAgentHeartbeatRejectsDisabledAgent(t *testing.T) {
 	agentHeartbeat(t, srv.URL, credential, map[string]string{}, http.StatusUnauthorized)
 }
 
-// TestAgentHeartbeatRejectsTrailingGarbage covers the documented
-// 400 bad_request contract for malformed JSON: a body that decodes
-// as a valid object followed by trailing non-whitespace bytes (for
-// example a second JSON object glued onto the first) is rejected
-// rather than silently accepted. Without this check a client
-// serialization bug could ship heartbeats whose trailing garbage
-// would be swallowed.
-func TestAgentHeartbeatRejectsTrailingGarbage(t *testing.T) {
+// TestAgentHeartbeatBodyShapes covers the full documented 400
+// bad_request contract for the heartbeat body parser:
+//
+//   - empty body accepted
+//   - valid single JSON object accepted
+//   - valid object + trailing whitespace accepted
+//   - two JSON objects rejected
+//   - valid object + trailing garbage rejected
+//   - malformed JSON rejected
+//
+// The trailing-content cases are the substantive guard: without a
+// second Decode that hits io.EOF, the handler would silently
+// consume the first JSON value and swallow the rest, hiding client
+// serialization bugs in production.
+func TestAgentHeartbeatBodyShapes(t *testing.T) {
 	db := testDB(t)
 	freshDatabase(t, db)
 	srv, svc := testServer(t, db)
 	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
 	_, credential := enrolledAgent(t, srv.URL, adminClient)
 
-	raw := []byte(`{"hostname":"h"}{"extra":1}`)
-	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/agent/heartbeat", bytes.NewReader(raw))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+credential)
-	resp, err := http.DefaultClient.Do(req)
-	if err != nil {
-		t.Fatalf("heartbeat: %v", err)
+	cases := []struct {
+		name       string
+		body       string
+		wantStatus int
+	}{
+		{"empty body", "", http.StatusOK},
+		{"valid object", `{"hostname":"h"}`, http.StatusOK},
+		{"valid object + trailing whitespace", `{"hostname":"h"}` + "\n  \t", http.StatusOK},
+		{"two objects", `{"hostname":"h"}{"extra":1}`, http.StatusBadRequest},
+		{"trailing garbage", `{"hostname":"h"}abc`, http.StatusBadRequest},
+		{"malformed JSON", `{"hostname":`, http.StatusBadRequest},
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		b, _ := io.ReadAll(resp.Body)
-		t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, b)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/agent/heartbeat", bytes.NewReader([]byte(tc.body)))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+credential)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatalf("heartbeat: %v", err)
+			}
+			defer resp.Body.Close()
+			if resp.StatusCode != tc.wantStatus {
+				b, _ := io.ReadAll(resp.Body)
+				t.Fatalf("status = %d, want %d; body=%s", resp.StatusCode, tc.wantStatus, b)
+			}
+		})
 	}
 }
 

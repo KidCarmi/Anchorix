@@ -202,19 +202,25 @@ func AgentHeartbeat(deps AgentsDeps) http.HandlerFunc {
 		// NOT guard the decode with r.ContentLength because that
 		// breaks chunked-transfer requests (ContentLength = -1),
 		// which proxies and streaming clients commonly use. The
-		// EOF check below covers the truly-empty-body case
-		// (Content-Length: 0 or no body sent at all); any other
-		// decode error means malformed JSON. After a successful
-		// decode we also reject trailing non-whitespace bytes
-		// (e.g. a second JSON object glued onto the first) so the
-		// documented 400 bad_request contract is honored.
+		// EOF check on the first Decode covers the truly-empty-body
+		// case (Content-Length: 0 or no body sent at all); any
+		// other decode error means malformed JSON.
+		//
+		// A second Decode follows: it MUST hit io.EOF, otherwise
+		// the body had trailing bytes after the first JSON value
+		// (a second object, garbage, etc.) and we reject with the
+		// documented 400 bad_request envelope. This is the
+		// documented Go idiom for asserting a single-document body;
+		// dec.More() is for detecting elements inside the current
+		// array/object being parsed, not top-level trailing data.
 		var body heartbeatRequest
 		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
 		if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
 			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
 			return
 		}
-		if dec.More() {
+		var extra any
+		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
 			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
 			return
 		}
