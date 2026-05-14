@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // inventoryReqDTO is the JSON body the agent submits to
@@ -492,6 +494,78 @@ func TestOperatorGetAgentInventoryNotFound(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusNotFound {
 		t.Errorf("unknown agent status = %d, want 404", resp.StatusCode)
+	}
+}
+
+// TestAgentInventoryCompositeFKEnforcesOrgMatch defends the
+// denormalized organization_id column on agent_inventory_snapshots.
+// The application path never produces a mismatched (org, agent)
+// pair (the service derives both from AgentFromContext), but a
+// future buggy repository or a direct SQL path could. Migration
+// 0004's composite FK
+//
+//	(organization_id, agent_id) -> agents(organization_id, id)
+//
+// must reject any insert whose organization_id disagrees with the
+// agent row's own org with a 23503 foreign_key_violation. This
+// test attempts that insert via raw SQL and asserts the constraint
+// fires.
+func TestAgentInventoryCompositeFKEnforcesOrgMatch(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	agentID, _ := enrolledAgent(t, srv.URL, adminClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Stand up a second org so the (organization_id) -> organizations
+	// FK is satisfied — the mismatch we want to test is between the
+	// snapshot's organization_id and the AGENT's organization_id,
+	// not between the snapshot and an unknown org.
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			`INSERT INTO organizations (id, name) VALUES ('other-org', 'Other Org')`)
+		return err
+	}); err != nil {
+		t.Fatalf("seed other-org: %v", err)
+	}
+
+	// Mismatched insert: organization_id = 'other-org', agent_id =
+	// <agent enrolled in 'anchorix'>. The composite FK on
+	// agents(organization_id, id) must reject this.
+	err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			`INSERT INTO agent_inventory_snapshots
+				(organization_id, agent_id, hostname, received_at, updated_at)
+			 VALUES ('other-org', $1, 'cross-org-attempt', now(), now())`,
+			agentID)
+		return err
+	})
+	if err == nil {
+		t.Fatal("composite FK did not reject mismatched (org, agent); want 23503 foreign_key_violation")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		t.Fatalf("err type = %T (%v); want *pgconn.PgError", err, err)
+	}
+	if pgErr.Code != "23503" {
+		t.Errorf("SQLSTATE = %q, want 23503 (foreign_key_violation)", pgErr.Code)
+	}
+
+	// No row was created.
+	var count int
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT COUNT(*) FROM agent_inventory_snapshots WHERE agent_id = $1`,
+			agentID,
+		).Scan(&count)
+	}); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("row count = %d, want 0 (FK should have blocked the insert)", count)
 	}
 }
 
