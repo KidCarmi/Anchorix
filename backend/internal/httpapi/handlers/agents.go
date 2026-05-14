@@ -204,10 +204,17 @@ func AgentHeartbeat(deps AgentsDeps) http.HandlerFunc {
 		// which proxies and streaming clients commonly use. The
 		// EOF check below covers the truly-empty-body case
 		// (Content-Length: 0 or no body sent at all); any other
-		// decode error means malformed JSON. This mirrors the
-		// revoke handler's parsing pattern.
+		// decode error means malformed JSON. After a successful
+		// decode we also reject trailing non-whitespace bytes
+		// (e.g. a second JSON object glued onto the first) so the
+		// documented 400 bad_request contract is honored.
 		var body heartbeatRequest
-		if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16))
+		if err := dec.Decode(&body); err != nil && !errors.Is(err, io.EOF) {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+			return
+		}
+		if dec.More() {
 			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
 			return
 		}

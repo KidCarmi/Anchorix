@@ -1378,6 +1378,35 @@ func TestAgentHeartbeatRejectsDisabledAgent(t *testing.T) {
 	agentHeartbeat(t, srv.URL, credential, map[string]string{}, http.StatusUnauthorized)
 }
 
+// TestAgentHeartbeatRejectsTrailingGarbage covers the documented
+// 400 bad_request contract for malformed JSON: a body that decodes
+// as a valid object followed by trailing non-whitespace bytes (for
+// example a second JSON object glued onto the first) is rejected
+// rather than silently accepted. Without this check a client
+// serialization bug could ship heartbeats whose trailing garbage
+// would be swallowed.
+func TestAgentHeartbeatRejectsTrailingGarbage(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	raw := []byte(`{"hostname":"h"}{"extra":1}`)
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/agent/heartbeat", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+credential)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("heartbeat: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, b)
+	}
+}
+
 func TestAgentHeartbeatPreservesValuesOnEmptyBody(t *testing.T) {
 	db := testDB(t)
 	freshDatabase(t, db)
