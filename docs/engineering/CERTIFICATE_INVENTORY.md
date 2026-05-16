@@ -180,7 +180,7 @@ currently observes in a declared set of stores; the server
 reconciles by marking absent observations as `removed_at` and
 clearing `removed_at` when an absent cert reappears.
 
-### Decision: scope each upload by `store_coverage`
+### Decision: scope each upload by `store_coverage` (required, non-empty)
 
 Each batch declares which stores it covers:
 
@@ -192,6 +192,11 @@ Each batch declares which stores it covers:
 }
 ```
 
+`store_coverage` is **required and must be non-empty**. The server
+rejects a missing or empty `store_coverage` with `400 bad_request`.
+There is no implicit "upsert-only / no-reconcile" mode in v0.1 — see
+"Why store_coverage is required" below.
+
 Reconciliation is then well-defined:
 
 1. For every `(agent_id, store_location)` pair in `store_coverage`:
@@ -202,7 +207,30 @@ Reconciliation is then well-defined:
      `last_seen_at` untouched.
 2. Observations whose `store_location` is **not** in
    `store_coverage` are untouched. Allows an agent to upload one
-   store at a time without affecting others.
+   store at a time without affecting others — but the agent MUST
+   declare which stores it is uploading, even if it is uploading
+   only one.
+
+### Why store_coverage is required
+
+Allowing an empty `store_coverage` would create two ingestion
+modes for the same endpoint:
+
+1. Full-set reconciliation for declared stores.
+2. Upsert-only / no-reconcile partial mode.
+
+That ambiguity is unsafe. A buggy agent that accidentally omits
+`store_coverage` (or sends it empty) would silently stop
+reconciliation: certificates that disappear from the host would
+remain marked "currently observed" forever, polluting operator
+queries and any future findings that depend on currency.
+
+v0.1 fail-closes: the agent declares the stores it fully
+observed, the server reconciles exactly those stores, no
+implicit partial mode. If an explicit upsert-only mode ever
+becomes operationally necessary, it lands as a separate field
+(e.g. `mode: "upsert_only"`) with its own audit posture — never
+as the absent-field default.
 
 ### Why set-reconciliation, not delta
 
@@ -283,17 +311,17 @@ Field rules:
   reconciliation. Future > now + 24h is rejected as clock skew
   (matches the existing v0.1 inventory contract in REST_API.md).
 - **`store_coverage`** is the explicit list of stores this batch
-  reconciles. Required when the agent wants reconciliation
-  semantics for the listed stores. Stores outside the list are
-  untouched by this batch. An empty list is **allowed** and means
-  "upsert observations but do not reconcile" — useful for
-  incremental uploads, but the recommended pattern is full-set
-  uploads per store.
-- **`certificates`** is the array of observed certs. Each entry's
-  `store_location` MUST be in `store_coverage` (if `store_coverage`
-  is non-empty). The server rejects the batch otherwise with `400
-  bad_request` and reason metadata `unknown_store_location` (in
-  audit, not on the wire).
+  reconciles. **Required and non-empty** — see §3 "Why
+  store_coverage is required" for the rationale. A missing or
+  empty `store_coverage` returns `400 bad_request`. Stores
+  outside the list are untouched by this batch; the agent MUST
+  declare every store it observed in this batch even if it is
+  uploading only one.
+- **`certificates`** is the array of observed certs. Every
+  entry's `store_location` MUST be in `store_coverage`. The
+  server rejects the batch otherwise with `400 bad_request` and
+  reason metadata `unknown_store_location` (in audit, not on the
+  wire).
 - **`certificate_pem`** is the wire format. Required.
 - **`friendly_name`** is descriptive, optional, capped at 255 bytes.
 - The agent does NOT supply parsed metadata (subject, issuer,
@@ -371,7 +399,7 @@ when H-014 lands.
 
 | Status | `code`                  | When                                                                                                          |
 | ------ | ----------------------- | ------------------------------------------------------------------------------------------------------------- |
-| 400    | `bad_request`           | Malformed JSON, trailing JSON, oversize body, oversize cert, too many certs, store_location not in store_coverage, `collected_at` > now+24h |
+| 400    | `bad_request`           | Malformed JSON, trailing JSON, oversize body, oversize cert, too many certs, missing or empty `store_coverage`, store_location not in `store_coverage`, `collected_at` > now+24h |
 | 400    | `private_key_rejected`  | Any cert in the batch contains private-key material (entire batch rejected — see §7)                          |
 | 400    | `certificate_unparseable` | Any cert in the batch fails to parse as X.509. (Entire batch rejected — see "Reject-whole-batch" in §7.)    |
 | 401    | `agent_unauthorized`    | Bearer missing / malformed / unknown / agent revoked / disabled (handled by existing middleware)              |
@@ -932,24 +960,17 @@ the operator-useful state is after H-015.
 Flagged for the implementation PRs to confirm with operators
 before locking the wire.
 
-1. **`store_coverage` empty-list semantics.** §4 says an empty
-   `store_coverage` means "upsert observations but do not
-   reconcile". An alternative is to **require** non-empty
-   `store_coverage` and reject empty as `bad_request`. The strict
-   reading is safer (forces the agent to declare what it's
-   covering); the lenient reading lets incremental uploads work
-   without store metadata.
-2. **Collection cadence default.** §4 says no
+1. **Collection cadence default.** §4 says no
    `next_collection_seconds` in the response. Operators may want
    a server-side suggestion (e.g., "ask me again in 6 hours").
    Additive per CLAUDE.md §17 — can land later without breaking
    v1 callers.
-3. **Configurable size limits.** §4's `MaxJSONBodyBytes`,
+2. **Configurable size limits.** §4's `MaxJSONBodyBytes`,
    `MaxCertsPerBatch`, `MaxCertPEMBytes`, `MaxStoreCoverageEntries`,
    `MaxStoreLocationLength` are reasonable defaults; the H-015
    implementation should expose them via `internal/config` for
    future tuning without code changes.
-4. **Out-of-order batch handling for `removed_at`.** §5 covers
+3. **Out-of-order batch handling for `removed_at`.** §5 covers
    `last_seen_at` but not the symmetric `removed_at` clear:
    should an older batch be able to clear `removed_at` if the
    stored `last_seen_at` is younger? Recommend NO — only the
@@ -960,7 +981,7 @@ before locking the wire.
    ```
 
    for both bump-up and clear-removed actions.
-5. **Trust-store classification by `store_location`.** Should the
+4. **Trust-store classification by `store_location`.** Should the
    server label `LocalMachine\Root` observations as
    `is_trust_store_observation = TRUE` (a denormalized column on
    observations) to make Phase 4 trust-store findings faster? Or
@@ -968,7 +989,7 @@ before locking the wire.
    classification at query time? Recommend query-time for v0.1 —
    simpler schema, the operator's `WHERE store_location IN (...)`
    list is operator-policy anyway.
-6. **PEM canonicalization.** Should the server canonicalize the
+5. **PEM canonicalization.** Should the server canonicalize the
    PEM (strip trailing whitespace, fix line endings, re-wrap to
    64-column lines) before storage? Recommend YES — gives a
    stable on-disk representation regardless of the agent's
@@ -976,6 +997,17 @@ before locking the wire.
    the wire contract.
 
 None of the above block the design from merging.
+
+### Resolved during review
+
+- **`store_coverage` empty-list semantics.** Initially listed as
+  an unresolved question with two readings (strict vs lenient).
+  Resolved during PR #23 review in favor of the strict reading:
+  `store_coverage` is required and non-empty; missing or empty
+  returns `400 bad_request`. §3 carries the rationale; §4 carries
+  the wire contract. An explicit upsert-only mode is deferred
+  until there is operator demand and lands as a separate field,
+  never as the absent-field default.
 
 ## References
 

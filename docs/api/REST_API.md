@@ -665,14 +665,15 @@ authoritative request/response shapes live in CERTIFICATE_INVENTORY.md
 Future operator endpoints (implementation in H-016). The contracts
 below are the future-direction notes locked in by
 [`docs/engineering/CERTIFICATE_INVENTORY.md`](../engineering/CERTIFICATE_INVENTORY.md)
-§12; the rows currently return `501 not_implemented`.
+§12. The "Current state" column reflects what each path returns
+**today**, before H-016 wires the real handlers:
 
-| Method | Path                                          | Auth | Purpose                                                              |
-| ------ | --------------------------------------------- | ---- | -------------------------------------------------------------------- |
-| GET    | `/certificates`                               | user | Paginated list of certificates with summary fields                   |
-| GET    | `/certificates/{id}`                          | user | Single certificate detail including full PEM                          |
-| GET    | `/certificates/{id}/observations`             | user | List of observations (agent + store) for one certificate              |
-| GET    | `/agents/{id}/certificates`                   | user | Certificates observed by one agent                                    |
+| Method | Path                                          | Auth | Purpose                                                              | Current state          |
+| ------ | --------------------------------------------- | ---- | -------------------------------------------------------------------- | ---------------------- |
+| GET    | `/certificates`                               | user | Paginated list of certificates with summary fields                   | `501 not_implemented` (stub routed) |
+| GET    | `/certificates/{id}`                          | user | Single certificate detail including full PEM                          | `501 not_implemented` (stub routed) |
+| GET    | `/certificates/{id}/observations`             | user | List of observations (agent + store) for one certificate              | `404 not_found` (route not mounted yet — H-016) |
+| GET    | `/agents/{id}/certificates`                   | user | Certificates observed by one agent                                    | `404 not_found` (route not mounted yet — H-016) |
 
 Supported filters on `/certificates` list (per CERTIFICATE_INVENTORY.md §12):
 
