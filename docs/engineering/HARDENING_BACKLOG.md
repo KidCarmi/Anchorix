@@ -16,76 +16,81 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
 
 ## Open Items
 
-### H-009 — Shared strict JSON body decoder helper
+### H-014 — Certificate inventory: storage layer
 
-- **Title:** `refactor(httpapi): shared strict-decode helper for optional JSON bodies`
-- **Risk:** low (correctness / maintainability; no security gap
-  today — every existing call site already does the right thing).
-  The "single object body, no trailing JSON, optional empty body"
-  idiom is duplicated across `handlers/agents.go` (heartbeat),
-  `handlers/agent_inventory.go` (snapshot submit), and
-  `handlers/deployment_packages.go` (revoke). The duplication is
-  three identical `json.NewDecoder(http.MaxBytesReader(...)).Decode`
-  + second-Decode-must-EOF blocks, which is exactly the shape
-  CLAUDE.md §8.5 warns against (copy-paste instead of a small
-  shared helper). A regression in one site (e.g. a future PR
-  drops the second Decode) would not surface as a test failure
-  in the others.
-- **Scope:** introduce one helper — likely
-  `envelope.DecodeStrictOptional(r, &body)` returning a clear
-  error sentinel — and migrate the three current call sites.
-  Keep the existing 400 envelope and 64 KiB cap. No wire-shape
-  change.
-- **Recommended PR:** `refactor(httpapi): centralize strict
-  optional-body JSON decode in envelope package`.
-- **Reason not fixed now:** PR-019 is scoped to docs + tests +
-  stub cleanup; a multi-handler refactor is its own focused PR.
-- **References:** CLAUDE.md §8.5 (no copy-paste implementations
-  instead of a small shared helper), §17 (envelope ownership);
-  `backend/internal/httpapi/handlers/agent_inventory.go`,
-  `agents.go::AgentHeartbeat`, `deployment_packages.go::DeploymentPackagesRevoke`.
+- **Title:** `feat(inventory): certificate + observations storage layer`
+- **Risk:** medium (schema introduction, no-private-key
+  invariant, ingestion atomicity). H-011's design landed (see
+  References); this implementation PR is the schema half.
+- **Scope:** migration introducing `certificates` and
+  `certificate_observations` with the composite FK pattern
+  established in PR-019 H-009
+  (`(organization_id, agent_id) → agents(organization_id, id)`
+  and `(organization_id, certificate_id) → certificates(organization_id, id)`);
+  internal/inventory repository implementation (deduplication
+  by `(organization_id, fingerprint_sha256)`, reconciliation
+  with `removed_at` for store_coverage); indexes per
+  CERTIFICATE_INVENTORY.md §10. No HTTP surface yet.
+- **Recommended PR:** `feat(inventory): certificate + observations storage layer`.
+- **Reason not fixed now:** spawned by the H-011 design PR.
+  Land schema first so H-015 (the ingestion endpoint) has a
+  storage layer to wire against.
+- **References:**
+  [`docs/engineering/CERTIFICATE_INVENTORY.md`](./CERTIFICATE_INVENTORY.md)
+  §1, §8, §10; CLAUDE.md §6.2, §16; PR-019 H-009 composite-FK
+  precedent.
 
-### H-011 — Certificate inventory (Phase 3 follow-up)
+### H-015 — Certificate inventory: agent ingestion endpoint
 
-- **Title:** `feat(inventory): certificate inventory upload + observations`
-- **Risk:** medium (real product work; touches schema, the
-  no-private-key invariant, and risk-rule wiring later). The
-  `internal/inventory` package already carries domain types
-  (`Certificate`, `CertificateObservation`, `InventoryBatch`,
-  `DiscoveredCertificate`), the `Ingestor` skeleton with the
-  no-private-key safety check, and a `Repository` interface.
-  None of it is wired — there is no HTTP route, no postgres
-  repository, no service composition. PR-018 deliberately did
-  NOT touch any of this (different domain, different cost
-  model: certificates are append-style observations, not a
-  replace-in-place snapshot).
-- **Scope:** **design first, then implement.** The design
-  needs to settle: (a) the agent-keyed endpoint shape (`POST
-  /agent/inventory-certificates`? `POST /agent/certificates`?)
-  and how it composes with the existing
-  `POST /agent/inventory` snapshot endpoint without name
-  confusion; (b) idempotency-key contract per CLAUDE.md §18
-  (inventory batches are non-idempotent without one);
-  (c) audit policy — per-batch summary vs. per-cert row vs.
-  silence — applying the cardinality reasoning from
-  AGENT_ENROLLMENT.md "Heartbeat"; (d) `(certificate_id,
-  agent_id, store_location)` uniqueness vs. the
-  `(fingerprint_sha256, source_host, source_store)` shape the
-  ROADMAP currently hints at — these disagree and the schema
-  must be the one that wins.
-- **Recommended PR:** First a design doc
-  (`docs/engineering/CERTIFICATE_INVENTORY.md`); then a
-  migration + storage repo + service wiring + handler +
-  REST_API additions, ideally split across two implementation
-  PRs (storage + ingestion service, then handler + tests).
-- **Reason not fixed now:** explicit Phase 3 scope item
-  (ROADMAP.md), and PR-018 was scoped to machine-inventory
-  snapshot only. Tracking it here so it doesn't get lost in
-  the gap between the snapshot foundation and Phase 4
-  findings.
-- **References:** CLAUDE.md §4 (v0.1 scope), §6.2 (no private
-  key exfiltration), §18 (idempotency keys);
-  `backend/internal/inventory/`; ROADMAP.md Phase 3.
+- **Title:** `feat(inventory): agent certificate ingestion endpoint`
+- **Risk:** medium-high (real product wire, no-private-key
+  invariant on hot path). Implements
+  `POST /api/v1/agent/certificates` behind the existing
+  `RequireAuthenticatedAgent` middleware. Uses the H-014
+  storage layer plus the shared
+  `envelope.DecodeStrictOptionalJSON` helper (H-009).
+- **Scope:** handler, ingestion service, set-reconciliation
+  logic (per CERTIFICATE_INVENTORY.md §3), private-key
+  rejection (entire-batch fail closed per §7), server-side
+  PEM parsing + canonical fingerprint computation (§4),
+  audit events `agent.certificate_batch_rejected` /
+  `agent.certificate_batch_invalid` with
+  `severity: "security"` and no cert content in metadata
+  (§6, §7). Size / count caps per §4. Full unit + integration
+  test coverage including private-key rejection, batch
+  reconciliation, out-of-order arrival handling, and the
+  cross-org defense.
+- **Recommended PR:** `feat(inventory): agent certificate ingestion endpoint`.
+- **Reason not fixed now:** depends on H-014 landing first
+  (needs the storage layer).
+- **References:**
+  [`docs/engineering/CERTIFICATE_INVENTORY.md`](./CERTIFICATE_INVENTORY.md)
+  §4, §5, §6, §7; CLAUDE.md §6.2, §6.9, §9, §18; H-009
+  (DecodeStrictOptionalJSON); H-007 (agent-auth middleware).
+
+### H-016 — Certificate inventory: operator read API
+
+- **Title:** `feat(inventory): operator certificate read endpoints`
+- **Risk:** low-medium (read-only operator surface; org-scoping
+  is the only security concern, and the H-010 pattern already
+  has the recipe).
+- **Scope:** four operator-side endpoints —
+  `GET /api/v1/certificates`,
+  `GET /api/v1/certificates/{id}`,
+  `GET /api/v1/certificates/{id}/observations`,
+  `GET /api/v1/agents/{id}/certificates`. Cursor pagination
+  matching the H-010 pattern; slim summary rows for list
+  endpoints, full detail (including PEM) for the single-cert
+  endpoint. Filters per CERTIFICATE_INVENTORY.md §12.
+  Cross-org → 404 not_found.
+- **Recommended PR:** `feat(inventory): operator certificate read endpoints`.
+- **Reason not fixed now:** depends on H-014. Can ship before
+  or after H-015 — without H-015 the read endpoints return
+  empty pages, but they still build the operator-facing query
+  surface.
+- **References:**
+  [`docs/engineering/CERTIFICATE_INVENTORY.md`](./CERTIFICATE_INVENTORY.md)
+  §11, §12; H-010 (operator-side list pattern).
 
 ### H-012 — Agent rebind: admin token issuance + redemption
 
