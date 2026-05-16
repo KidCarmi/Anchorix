@@ -317,10 +317,14 @@ binding**, deliberately:
   original `POST /agents/enroll` response struct and is GC'd as
   soon as that response is written.
 - Reinstall, rebind, and recovery flows are **intentionally
-  deferred**. Re-issuing a credential to a "returning"
-  `install_id` requires an explicit design (probably a Phase-3
-  admin-approved reinstall token + credential rotation flow), and
-  v0.1 does not paper over the gap.
+  deferred** from v0.1's initial enrollment surface. The end-state
+  design — operator-issued single-use rebind tokens, agent-initiated
+  credential rotation, and the rule that rebind reuses the same
+  `agent_id` so observations remain continuous — is documented in
+  [`AGENT_REINSTALL_REBIND.md`](./AGENT_REINSTALL_REBIND.md)
+  (H-006). The implementation lands in H-012 (rebind) and H-013
+  (rotation); until those merge, v0.1 stays fail-closed and
+  operators use the workaround below.
 - Future versions may support explicit rebind / rotation flows
   with operator approval. The current behavior is **fail-closed by
   design** so two installers cannot race to take over the same
