@@ -732,3 +732,342 @@ func TestOperatorGetAgentInventoryCrossOrgReturns404(t *testing.T) {
 		t.Errorf("response body leaks foreign agent id: %s", body)
 	}
 }
+
+// --- GET /agent-inventory (H-010) ----------------------------------
+
+// summaryItemDTO mirrors the handler's slim row. Kept local to this
+// test file so the test does not depend on internal handler types.
+type summaryItemDTO struct {
+	AgentID       string  `json:"agent_id"`
+	Hostname      string  `json:"hostname"`
+	OSName        string  `json:"os_name"`
+	OSVersion     string  `json:"os_version"`
+	AgentVersion  string  `json:"agent_version"`
+	MachineArch   string  `json:"machine_arch"`
+	LocalIPsCount int     `json:"local_ips_count"`
+	InstalledAt   *string `json:"installed_at"`
+	ReceivedAt    string  `json:"received_at"`
+	UpdatedAt     string  `json:"updated_at"`
+}
+
+type inventoryListDTO struct {
+	Items      []summaryItemDTO `json:"items"`
+	NextCursor *string          `json:"next_cursor"`
+
+	// LocalIPs MUST NOT appear in the list payload. The DTO leaves
+	// it intentionally undeclared so an accidental server-side
+	// reintroduction surfaces as a raw-JSON contains-check
+	// (TestOperatorListAgentInventoryDoesNotEchoLocalIPs).
+}
+
+// listAgentInventory performs the GET, asserts the status code, and
+// returns the parsed body. Pass empty query for "no params".
+func listAgentInventory(t *testing.T, srv string, client *http.Client, query string, wantStatus int) inventoryListDTO {
+	t.Helper()
+	url := srv + "/api/v1/agent-inventory"
+	if query != "" {
+		url += "?" + query
+	}
+	req, _ := http.NewRequest(http.MethodGet, url, nil)
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != wantStatus {
+		b, _ := io.ReadAll(resp.Body)
+		t.Fatalf("list status = %d, want %d; body=%s", resp.StatusCode, wantStatus, b)
+	}
+	if wantStatus != http.StatusOK {
+		return inventoryListDTO{}
+	}
+	var out inventoryListDTO
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	return out
+}
+
+// seedListFixture enrolls n distinct agents in the admin's org and
+// submits a snapshot for each. Returns the agent ids in enrollment
+// order; the inventory endpoint orders by received_at DESC so the
+// LAST agent enrolled is the FIRST result.
+func seedListFixture(t *testing.T, srv string, adminClient *http.Client, n int) []string {
+	t.Helper()
+	ids := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		// enrolledAgent already creates a fresh package + agent.
+		agentID, credential := enrolledAgent(t, srv, adminClient)
+		submitInventory(t, srv, credential, inventoryReqDTO{
+			Hostname:     "host-" + agentID[:8],
+			OSName:       "Windows 11",
+			OSVersion:    "10.0.22631",
+			AgentVersion: "0.1.0",
+			MachineArch:  "amd64",
+			LocalIPs:     []string{"10.0.0." + strconvItoa(i+1)},
+		}, http.StatusOK)
+		ids = append(ids, agentID)
+		// Tiny sleep so received_at differs measurably between rows;
+		// keeps assertion on ordering deterministic even on coarse
+		// clocks.
+		time.Sleep(2 * time.Millisecond)
+	}
+	return ids
+}
+
+// strconvItoa is a local helper avoiding the import-cycle of pulling
+// strconv into a tiny integration helper that already pulls every
+// other test dependency.
+func strconvItoa(i int) string {
+	if i == 0 {
+		return "0"
+	}
+	out := []byte{}
+	for n := i; n > 0; n /= 10 {
+		out = append([]byte{byte('0' + n%10)}, out...)
+	}
+	return string(out)
+}
+
+func TestOperatorListAgentInventoryHappyPath(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	ids := seedListFixture(t, srv.URL, adminClient, 3)
+
+	out := listAgentInventory(t, srv.URL, adminClient, "", http.StatusOK)
+	if len(out.Items) != 3 {
+		t.Fatalf("len(items) = %d, want 3", len(out.Items))
+	}
+	if out.NextCursor != nil {
+		t.Errorf("NextCursor = %v, want nil (only 3 rows, default page is 50)", *out.NextCursor)
+	}
+	// Items must be ordered by received_at DESC, so the LAST agent
+	// enrolled (ids[2]) is FIRST in the response.
+	if out.Items[0].AgentID != ids[2] || out.Items[2].AgentID != ids[0] {
+		t.Errorf("ordering wrong; got %s,%s,%s; want %s,%s,%s",
+			out.Items[0].AgentID, out.Items[1].AgentID, out.Items[2].AgentID,
+			ids[2], ids[1], ids[0])
+	}
+	// LocalIPsCount must reflect the submitted single IP per row.
+	for _, item := range out.Items {
+		if item.LocalIPsCount != 1 {
+			t.Errorf("agent %s LocalIPsCount = %d, want 1", item.AgentID, item.LocalIPsCount)
+		}
+	}
+}
+
+func TestOperatorListAgentInventoryRequiresSession(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, _ := testServer(t, db)
+
+	resp, err := http.Get(srv.URL + "/api/v1/agent-inventory")
+	if err != nil {
+		t.Fatalf("anon: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("anon status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestOperatorListAgentInventoryAgentBearerRejected(t *testing.T) {
+	// Agent bearer credentials are NOT honored on operator routes.
+	// A request carrying `Authorization: Bearer <agent_credential>`
+	// must NOT be admitted to the list endpoint.
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/agent-inventory", nil)
+	req.Header.Set("Authorization", "Bearer "+credential)
+	// New client with no session cookie — only the bearer.
+	bearerOnly := &http.Client{Timeout: 5 * time.Second}
+	resp, err := bearerOnly.Do(req)
+	if err != nil {
+		t.Fatalf("bearer: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("agent bearer admitted; status = %d, want 401", resp.StatusCode)
+	}
+}
+
+func TestOperatorListAgentInventoryEmptyOrgReturnsEmptyItems(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	// No agents enrolled.
+
+	out := listAgentInventory(t, srv.URL, adminClient, "", http.StatusOK)
+	if len(out.Items) != 0 {
+		t.Errorf("len(items) = %d, want 0", len(out.Items))
+	}
+	if out.NextCursor != nil {
+		t.Errorf("NextCursor = %v, want nil on empty list", *out.NextCursor)
+	}
+}
+
+func TestOperatorListAgentInventoryOrgScoping(t *testing.T) {
+	// Seed snapshots in two orgs; the admin in 'anchorix' must NOT
+	// see the foreign-org snapshot regardless of how recent it is.
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	homeIDs := seedListFixture(t, srv.URL, adminClient, 2)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	const foreignAgentID = "foreign-agent-list-test"
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO organizations (id, name) VALUES ('other-org', 'Other Org')`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO agents (id, organization_id, hostname, version, status, enrolled_at, last_seen_at)
+			 VALUES ($1, 'other-org', 'foreign-host', '', 'active', now(), now())`,
+			foreignAgentID); err != nil {
+			return err
+		}
+		// Foreign snapshot is set to a FUTURE time so a missing org
+		// filter would surface it at the top of the DESC ordering.
+		_, err := tx.Exec(ctx,
+			`INSERT INTO agent_inventory_snapshots
+				(organization_id, agent_id, hostname, received_at, updated_at)
+			 VALUES ('other-org', $1, 'cross-org-list', '2099-01-01T00:00:00Z', '2099-01-01T00:00:00Z')`,
+			foreignAgentID)
+		return err
+	}); err != nil {
+		t.Fatalf("seed cross-org: %v", err)
+	}
+
+	out := listAgentInventory(t, srv.URL, adminClient, "", http.StatusOK)
+	if len(out.Items) != 2 {
+		t.Errorf("len(items) = %d, want 2 (only same-org rows)", len(out.Items))
+	}
+	for _, item := range out.Items {
+		if item.AgentID == foreignAgentID {
+			t.Errorf("cross-org row leaked into list: %+v", item)
+		}
+	}
+	_ = homeIDs
+}
+
+func TestOperatorListAgentInventoryDoesNotEchoLocalIPs(t *testing.T) {
+	// The list endpoint exposes local_ips_count, NOT the full array.
+	// A regression that re-added the array would leak metadata the
+	// per-agent GET intentionally keeps separate.
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+	submitInventory(t, srv.URL, credential, inventoryReqDTO{
+		Hostname: "ip-leak-check",
+		LocalIPs: []string{"10.1.2.3", "fe80::abcd"},
+	}, http.StatusOK)
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/agent-inventory", nil)
+	resp, err := adminClient.Do(req)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(raw), `"local_ips_count":2`) {
+		t.Errorf("expected local_ips_count=2 in response; body=%s", raw)
+	}
+	if strings.Contains(string(raw), `"local_ips":`) {
+		t.Errorf("response leaks local_ips array; body=%s", raw)
+	}
+	if strings.Contains(string(raw), "10.1.2.3") || strings.Contains(string(raw), "fe80::abcd") {
+		t.Errorf("response leaks raw IP values; body=%s", raw)
+	}
+}
+
+func TestOperatorListAgentInventoryLimitAndCursor(t *testing.T) {
+	// Five rows, page size 2 → 3 pages (2+2+1). Each step asserts
+	// row count, NextCursor presence, and that the documented sort
+	// order is preserved across page boundaries.
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	ids := seedListFixture(t, srv.URL, adminClient, 5)
+
+	page1 := listAgentInventory(t, srv.URL, adminClient, "limit=2", http.StatusOK)
+	if len(page1.Items) != 2 {
+		t.Fatalf("page1 len = %d, want 2", len(page1.Items))
+	}
+	if page1.NextCursor == nil {
+		t.Fatal("page1 NextCursor nil; want set")
+	}
+	if page1.Items[0].AgentID != ids[4] || page1.Items[1].AgentID != ids[3] {
+		t.Errorf("page1 ids out of order; got %s,%s; want %s,%s",
+			page1.Items[0].AgentID, page1.Items[1].AgentID, ids[4], ids[3])
+	}
+
+	page2 := listAgentInventory(t, srv.URL, adminClient,
+		"limit=2&cursor="+*page1.NextCursor, http.StatusOK)
+	if len(page2.Items) != 2 {
+		t.Fatalf("page2 len = %d, want 2", len(page2.Items))
+	}
+	if page2.NextCursor == nil {
+		t.Fatal("page2 NextCursor nil; want set")
+	}
+	if page2.Items[0].AgentID != ids[2] || page2.Items[1].AgentID != ids[1] {
+		t.Errorf("page2 ids out of order; got %s,%s; want %s,%s",
+			page2.Items[0].AgentID, page2.Items[1].AgentID, ids[2], ids[1])
+	}
+
+	page3 := listAgentInventory(t, srv.URL, adminClient,
+		"limit=2&cursor="+*page2.NextCursor, http.StatusOK)
+	if len(page3.Items) != 1 {
+		t.Errorf("page3 len = %d, want 1 (final row)", len(page3.Items))
+	}
+	if page3.NextCursor != nil {
+		t.Errorf("page3 NextCursor = %v, want nil (no more rows)", *page3.NextCursor)
+	}
+	if page3.Items[0].AgentID != ids[0] {
+		t.Errorf("page3 id = %s, want %s", page3.Items[0].AgentID, ids[0])
+	}
+}
+
+func TestOperatorListAgentInventoryEnforcesMaxLimit(t *testing.T) {
+	// limit = 201 exceeds the documented max (200) → 400 bad_request.
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	listAgentInventory(t, srv.URL, adminClient, "limit=201", http.StatusBadRequest)
+	// Default max is 200; at-or-below default page sizes are valid.
+	listAgentInventory(t, srv.URL, adminClient, "limit=200", http.StatusOK)
+}
+
+func TestOperatorListAgentInventoryRejectsInvalidLimit(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	listAgentInventory(t, srv.URL, adminClient, "limit=not-a-number", http.StatusBadRequest)
+	listAgentInventory(t, srv.URL, adminClient, "limit=-3", http.StatusBadRequest)
+}
+
+func TestOperatorListAgentInventoryRejectsMalformedCursor(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	listAgentInventory(t, srv.URL, adminClient, "cursor=!!!not-base64!!!", http.StatusBadRequest)
+	listAgentInventory(t, srv.URL, adminClient, "cursor=YWFh", http.StatusBadRequest) // base64("aaa") — no separator
+}

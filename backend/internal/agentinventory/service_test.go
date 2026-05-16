@@ -25,9 +25,11 @@ type fakeRepo struct {
 
 	upsertCalls int
 	getCalls    int
+	listCalls   int
 
 	upsertErr error
 	getErr    error
+	listErr   error
 }
 
 func newFakeRepo() *fakeRepo {
@@ -61,6 +63,79 @@ func (f *fakeRepo) GetByAgentAndOrg(_ context.Context, agentID, organizationID s
 	cp := *row
 	cp.LocalIPs = append([]string(nil), row.LocalIPs...)
 	return &cp, nil
+}
+
+// ListSummaries is the in-memory analogue of the postgres query.
+// We sort the entire in-memory set by (received_at DESC, agent_id
+// ASC), apply the cursor predicate, and return the first
+// q.Limit rows. The list-related unit tests in list_test.go drive
+// the service through this fake to exercise the +1 sentinel and
+// cursor-encode logic without needing postgres.
+func (f *fakeRepo) ListSummaries(_ context.Context, q SummaryRepositoryQuery) ([]Summary, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listCalls++
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
+	var all []Snapshot
+	for _, row := range f.rows {
+		if row.OrganizationID != q.OrganizationID {
+			continue
+		}
+		all = append(all, *row)
+	}
+	sortByReceivedDescAgentAsc(all)
+	out := make([]Summary, 0, len(all))
+	for _, row := range all {
+		if !q.CursorReceivedAt.IsZero() {
+			if row.ReceivedAt.After(q.CursorReceivedAt) {
+				continue
+			}
+			if row.ReceivedAt.Equal(q.CursorReceivedAt) && row.AgentID <= q.CursorAgentID {
+				continue
+			}
+		}
+		out = append(out, Summary{
+			AgentID:       row.AgentID,
+			Hostname:      row.Hostname,
+			OSName:        row.OSName,
+			OSVersion:     row.OSVersion,
+			AgentVersion:  row.AgentVersion,
+			MachineArch:   row.MachineArch,
+			LocalIPsCount: len(row.LocalIPs),
+			InstalledAt:   row.InstalledAt,
+			ReceivedAt:    row.ReceivedAt,
+			UpdatedAt:     row.UpdatedAt,
+		})
+		if len(out) >= q.Limit {
+			break
+		}
+	}
+	return out, nil
+}
+
+func sortByReceivedDescAgentAsc(rows []Snapshot) {
+	// Hand-rolled insertion sort keeps the test fixture tiny without
+	// importing sort and writing a Less closure inline; the fake
+	// processes at most a handful of rows per test.
+	for i := 1; i < len(rows); i++ {
+		j := i
+		for j > 0 && less(rows[j], rows[j-1]) {
+			rows[j], rows[j-1] = rows[j-1], rows[j]
+			j--
+		}
+	}
+}
+
+func less(a, b Snapshot) bool {
+	if a.ReceivedAt.After(b.ReceivedAt) {
+		return true
+	}
+	if a.ReceivedAt.Equal(b.ReceivedAt) {
+		return a.AgentID < b.AgentID
+	}
+	return false
 }
 
 const (

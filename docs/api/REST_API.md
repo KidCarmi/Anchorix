@@ -278,6 +278,7 @@ primitive.
 | GET    | `/agents`                             | user     | List registered agents (org-scoped)                    |
 | GET    | `/agents/{id}`                        | user     | Get a single agent *(stub — Phase 2 continuation)*     |
 | GET    | `/agents/{id}/inventory`              | user     | Read the agent's current machine-inventory snapshot    |
+| GET    | `/agent-inventory`                    | user     | List slim machine-inventory summaries across the fleet |
 | POST   | `/agents/enroll`                      | bootstrap| Agent enrollment (consumes bootstrap secret)           |
 | GET    | `/agent/me`                           | agent    | Authenticated agent identity (bearer credential)       |
 | POST   | `/agent/heartbeat`                    | agent    | Liveness heartbeat (bumps `last_seen_at`)              |
@@ -570,6 +571,70 @@ Failure responses:
 | 400    | `bad_request`  | URL has no id                                                       |
 | 401    | `unauthorized` | No session                                                          |
 | 404    | `not_found`    | No snapshot exists for this agent in the caller's organization      |
+
+### `GET /agent-inventory`
+
+Operator-only, organization-scoped. Returns a paginated list of
+slim machine-inventory summaries for every agent in the operator's
+organization. Designed for fleet-overview screens — operators
+wanting the full snapshot for one agent still use
+`GET /agents/{id}/inventory`.
+
+The endpoint is mounted on the `/agent-inventory` (no trailing
+`s`) resource so it does not collide with `/agents/{id}/...`
+path-parameter routes. Agent bearer credentials are NOT honored;
+operator and agent identity are independent axes (CLAUDE.md §8.6).
+
+Query parameters:
+
+| Param    | Default | Max | Notes                                                                     |
+| -------- | ------- | --- | ------------------------------------------------------------------------- |
+| `limit`  | 50      | 200 | Positive integer. Non-numeric, zero (treated as default), negative, or above-max values return `400 bad_request`. |
+| `cursor` | —       | —   | Opaque pagination token from a prior response's `next_cursor`. Malformed cursor returns `400 bad_request`. |
+
+Ordering is **`received_at DESC, agent_id ASC`** — newest snapshot
+first, with a stable tie-break on `agent_id`. The
+`(received_at, agent_id)` tuple is the cursor.
+
+Successful response — `200 OK`:
+
+```json
+{
+  "items": [
+    {
+      "agent_id": "...",
+      "hostname": "ws-001.corp.example",
+      "os_name": "Windows 11",
+      "os_version": "10.0.22631",
+      "agent_version": "0.1.0",
+      "machine_arch": "amd64",
+      "local_ips_count": 2,
+      "installed_at": "2026-04-01T00:00:00Z",
+      "received_at": "2026-06-01T12:00:00Z",
+      "updated_at": "2026-06-01T12:00:00Z"
+    }
+  ],
+  "next_cursor": "MjAyNi0wNi0wMVQxMjowMDowMC4xMjM0NTY3ODlafGFnZW50LTAwMQ"
+}
+```
+
+`next_cursor` is `null` when no further pages remain.
+
+`local_ips` is intentionally **not** returned in the list payload —
+only `local_ips_count`. The list endpoint is the fleet-overview
+surface; the per-agent endpoint
+(`GET /agents/{id}/inventory`) remains the single source for the
+full IP list and any other field the summary omits.
+
+Failure responses:
+
+| Status | `code`         | When                                                                |
+| ------ | -------------- | ------------------------------------------------------------------- |
+| 400    | `bad_request`  | `limit` non-numeric / non-positive / above 200, or `cursor` malformed |
+| 401    | `unauthorized` | No operator session (agent bearer credentials are not honored)      |
+
+Audit policy: read-only. No `audit_events` row is emitted
+(CLAUDE.md §9 — audits record state changes).
 
 ### Certificate inventory (deferred)
 

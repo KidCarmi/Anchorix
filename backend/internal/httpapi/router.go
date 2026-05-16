@@ -108,6 +108,14 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 	// surfaces as 404 not_found.
 	mux.Handle("GET /agents/{id}/inventory",
 		resolver(mw.RequireAuth(handlers.AgentInventoryGet(agentInventoryDeps))))
+	// GET /agent-inventory (H-010) — operator-facing fleet-wide
+	// list of current machine-inventory snapshots. Cursor-paginated,
+	// org-scoped via the session, slim summary rows only (full
+	// snapshot stays on the per-agent GET above). Mounted on the
+	// `/agent-inventory` (no `s`) resource so it does not collide
+	// with `/agents/{id}/...` path-parameter routes.
+	mux.Handle("GET /agent-inventory",
+		resolver(mw.RequireAuth(handlers.AgentInventoryList(agentInventoryDeps))))
 	// The legacy operator-keyed POST /agents/{id}/inventory stub
 	// (a placeholder from the original v0.1 schema proposal) is no
 	// longer routed; certificate inventory is a separate Phase 3+

@@ -104,6 +104,85 @@ func (r *AgentInventorySnapshotRepository) GetByAgentAndOrg(
 	return snapshot, nil
 }
 
+// ListSummaries returns a page of slim summary rows for the
+// organization, ordered by received_at DESC then agent_id ASC. The
+// (received_at, agent_id) tuple is the canonical cursor — it is
+// stable (agent_id is unique within an org and breaks any nanosecond
+// tie on received_at) and indexable.
+//
+// Cursor semantics: when CursorReceivedAt is the zero value, no
+// after-bound is applied (first page). Otherwise the WHERE clause
+// filters to rows that come AFTER (CursorReceivedAt, CursorAgentID)
+// in the documented sort order. Concretely "after" with
+// `received_at DESC, agent_id ASC` means:
+//
+//	received_at < cursor.received_at
+//	OR (received_at = cursor.received_at AND agent_id > cursor.agent_id)
+//
+// The org filter is in the WHERE clause so cross-org rows never
+// surface — there is no application-level filtering downstream.
+//
+// local_ips_count is computed at SELECT time via jsonb_array_length
+// so the slim summary stays a single SQL row per agent without
+// pulling the full local_ips array across the wire.
+func (r *AgentInventorySnapshotRepository) ListSummaries(
+	ctx context.Context,
+	q agentinventory.SummaryRepositoryQuery,
+) ([]agentinventory.Summary, error) {
+	const sql = `
+		SELECT agent_id, hostname, os_name, os_version,
+		       agent_version, machine_arch,
+		       jsonb_array_length(local_ips) AS local_ips_count,
+		       installed_at, received_at, updated_at
+		  FROM agent_inventory_snapshots
+		 WHERE organization_id = $1
+		   AND ($2::timestamptz IS NULL
+		        OR received_at < $2::timestamptz
+		        OR (received_at = $2::timestamptz AND agent_id > $3))
+		 ORDER BY received_at DESC, agent_id ASC
+		 LIMIT $4`
+	// pgx maps Go's time.Time zero value to a non-NULL SQL value;
+	// we want NULL semantics for "no cursor", so pass an explicit
+	// nil interface when the cursor is unset.
+	var cursorAt any
+	var cursorAgent any
+	if !q.CursorReceivedAt.IsZero() {
+		cursorAt = q.CursorReceivedAt
+		cursorAgent = q.CursorAgentID
+	}
+	rows, err := r.db.querierFor(ctx).Query(ctx, sql,
+		q.OrganizationID, cursorAt, cursorAgent, q.Limit,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list agent inventory summaries: %w", err)
+	}
+	defer rows.Close()
+
+	var out []agentinventory.Summary
+	for rows.Next() {
+		var (
+			s             agentinventory.Summary
+			installedAt   *time.Time
+			localIPsCount int
+		)
+		if err := rows.Scan(
+			&s.AgentID, &s.Hostname, &s.OSName, &s.OSVersion,
+			&s.AgentVersion, &s.MachineArch,
+			&localIPsCount,
+			&installedAt, &s.ReceivedAt, &s.UpdatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("postgres: scan agent inventory summary: %w", err)
+		}
+		s.InstalledAt = installedAt
+		s.LocalIPsCount = localIPsCount
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate agent inventory summaries: %w", err)
+	}
+	return out, nil
+}
+
 func scanAgentInventorySnapshot(row pgx.Row) (*agentinventory.Snapshot, error) {
 	var (
 		s           agentinventory.Snapshot

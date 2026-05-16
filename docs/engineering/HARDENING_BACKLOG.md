@@ -45,35 +45,6 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
   `backend/internal/httpapi/handlers/agent_inventory.go`,
   `agents.go::AgentHeartbeat`, `deployment_packages.go::DeploymentPackagesRevoke`.
 
-### H-010 — Operator inventory list / summary API
-
-- **Title:** `feat(httpapi): operator-facing list endpoint for agent inventory snapshots`
-- **Risk:** low (product / UX gap; no security implication today).
-  PR-018 ships exactly two inventory endpoints: an agent-bearer
-  POST and a per-agent operator GET. There is no fleet-wide list
-  endpoint, so an operator wanting to see "which agents are on
-  Windows 11 vs Windows Server 2022 across the org" must hit
-  `GET /agents` and then `GET /agents/{id}/inventory` once per
-  agent. That's fine for a handful of agents but won't survive
-  the SCCM-style bulk rollouts deployment-packages target.
-- **Scope:** add `GET /api/v1/agent-inventory` (operator,
-  org-scoped). Pagination via `cursor` + `limit` consistent with
-  REST_API.md conventions. Returns a slim row per agent
-  (agent_id, hostname, os_name, os_version, agent_version,
-  machine_arch, received_at) — NOT the full snapshot — so the
-  payload stays cheap at fleet scale. Repository gains one new
-  method; service gains one new wrapper; no schema change.
-- **Recommended PR:** `feat(agentinventory): operator-side list
-  endpoint with cursor pagination`.
-- **Reason not fixed now:** PR-018's exit criterion is the
-  single-snapshot pair (POST + per-agent GET); the list endpoint
-  is feature surface, deliberately deferred per PR-018's "no
-  feature creep" rule.
-- **References:** CLAUDE.md §4 (v0.1 scope), §17 (additive
-  /api/v1 changes); REST_API.md "Pagination" conventions;
-  `docs/engineering/AGENT_ENROLLMENT.md` "Grouping and labels"
-  (the natural UI partner for this endpoint).
-
 ### H-011 — Certificate inventory (Phase 3 follow-up)
 
 - **Title:** `feat(inventory): certificate inventory upload + observations`
