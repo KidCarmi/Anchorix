@@ -646,6 +646,63 @@ func TestMarkMissingObservationsRemovedRejectsEmptyCoverage(t *testing.T) {
 	}
 }
 
+// TestMarkMissingObservationsRemovedHandlesNilObservedCertIDs is
+// the Codex P1 regression test: a caller passing nil (not an
+// explicit empty slice) for observedCertIDs MUST result in every
+// observation in the covered stores being marked removed_at —
+// just as an empty slice would. Without the nil → []string{}
+// normalization in the repository, pgx encodes nil as SQL NULL,
+// `NOT (certificate_id = ANY(NULL))` evaluates to NULL, and the
+// WHERE clause silently matches zero rows.
+func TestMarkMissingObservationsRemovedHandlesNilObservedCertIDs(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	repo := postgres.NewCertificateInventoryRepository(db)
+	ctx := context.Background()
+	agentID := seedAgent(t, db, "anchorix", "nil-observed-ids")
+
+	t0 := time.Date(2026, 5, 16, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(1 * time.Hour)
+
+	// Two observations both currently active.
+	for i, fp := range []string{"fp-nil-1", "fp-nil-2"} {
+		cert, err := repo.UpsertCertificate(ctx,
+			newCertificate("anchorix", fp, "CN=nil-"+fp, t0.AddDate(1, 0, 0)), t0)
+		if err != nil {
+			t.Fatalf("upsert cert %d: %v", i, err)
+		}
+		if err := repo.UpsertObservation(ctx,
+			newObservation("anchorix", cert.ID, agentID, "LocalMachine\\My", ""), t0); err != nil {
+			t.Fatalf("upsert observation %d: %v", i, err)
+		}
+	}
+
+	// Pass nil — semantically equivalent to "the batch reported
+	// zero certs in the covered stores". Both observations must
+	// be marked removed_at.
+	if err := repo.MarkMissingObservationsRemoved(ctx,
+		"anchorix", agentID,
+		[]string{"LocalMachine\\My"},
+		nil, // <-- the case under test
+		t1); err != nil {
+		t.Fatalf("mark removed: %v", err)
+	}
+
+	activeCount := countObservations(t, db,
+		"organization_id = $1 AND agent_id = $2 AND removed_at IS NULL",
+		"anchorix", agentID)
+	if activeCount != 0 {
+		t.Errorf("active observation count = %d after nil-coverage reconciliation; want 0 (nil must behave like empty slice)", activeCount)
+	}
+
+	removedCount := countObservations(t, db,
+		"organization_id = $1 AND agent_id = $2 AND removed_at = $3",
+		"anchorix", agentID, t1)
+	if removedCount != 2 {
+		t.Errorf("removed observation count = %d, want 2", removedCount)
+	}
+}
+
 // TestMarkMissingObservationsRemovedStoreCoverageScoping confirms
 // observations in stores NOT covered by the batch are left
 // untouched — the reconciliation is scoped to declared stores

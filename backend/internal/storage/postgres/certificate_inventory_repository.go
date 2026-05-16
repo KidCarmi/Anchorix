@@ -200,9 +200,17 @@ func (r *CertificateInventoryRepository) MarkMissingObservationsRemoved(
 
 	// observedCertIDs may legitimately be empty (the batch reported
 	// no certs in the covered stores → mark all existing
-	// observations in those stores as removed). The SQL handles
-	// the empty case via NOT (cert_id = ANY(empty_array)) which is
-	// NOT FALSE = TRUE.
+	// observations in those stores as removed). pgx encodes a nil
+	// []string as SQL NULL, which would make
+	// `certificate_id = ANY(NULL::text[])` evaluate to NULL — and
+	// `NOT NULL` is NULL too, so the WHERE clause would never
+	// match any row and reconciliation would silently do nothing.
+	// Normalize nil → empty slice so pgx sends an empty array,
+	// which `ANY()` correctly treats as FALSE → `NOT FALSE` →
+	// TRUE for every row. (Codex P1 fix.)
+	if observedCertIDs == nil {
+		observedCertIDs = []string{}
+	}
 	const q = `
 		UPDATE certificate_observations
 		   SET removed_at = $4
