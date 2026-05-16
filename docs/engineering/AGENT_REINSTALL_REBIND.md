@@ -84,7 +84,7 @@ rotation endpoints land.
 | 6  | Hostname change                                                 | Drift is silently absorbed by heartbeat / inventory                        | Same — `hostname` is descriptive, not identity. No rebind needed.                                     |
 | 7  | `machine_fingerprint` change (mainboard replacement)            | Drift surfaces in audit metadata only                                      | Same — descriptive only. No rebind needed unless the credential was also lost.                        |
 | 8  | Lost local credential (crashed before persisting after rotate)  | Agent is bricked; operator workaround is revoke + redeploy                 | Operator issues a rebind token. Agent recovers without losing history.                                |
-| 9  | Stolen credential (operator suspects exposure)                  | No in-product remediation                                                  | Admin-forced rotation: operator issues a rebind token AND revokes the current credential immediately. Old credential rejected on next call; agent must redeem the token to recover. |
+| 9  | Stolen credential (operator suspects exposure)                  | No in-product remediation                                                  | **Two-step admin action:** (a) force-revoke the agent (separate primitive — flips `agents.status` to `revoked`; the existing agent-auth middleware then rejects the stolen credential at the very next call); (b) issue a rebind token so the legitimate agent can recover with a fresh credential. Issuing a rebind token alone does NOT invalidate the current credential — see §4 "Properties". |
 | 10 | Deployment package reused after reinstall                       | Works — the package's `bootstrap_secret` is what authenticates enrollment  | Same. Bootstrap is enrollment-level identity; rebind is agent-level identity. They do not interact.   |
 
 The scenarios that **need** a rebind flow are 1, 2, 3, 8, 9. Scenarios
@@ -188,10 +188,23 @@ suspect, or unrecognized.
   the agent_id throughout. The operator-visible row in
   `GET /agents` looks unchanged except for `updated_at` and a new
   `last_credential_rotated_at` field (see §10).
-- **Old credential is invalidated atomically.** The UPDATE in step
-  (c) overwrites `credential_hash`. A request carrying the old
-  plaintext credential will fail `FindByCredentialHash` and surface
-  the standard generic `agent_unauthorized` envelope.
+- **Old credential is invalidated atomically — at redemption, NOT
+  at token issuance.** The UPDATE in step (c) overwrites
+  `credential_hash`. A request carrying the old plaintext credential
+  will fail `FindByCredentialHash` and surface the standard generic
+  `agent_unauthorized` envelope. Importantly, **issuing a rebind
+  token has no side effect on the current `credential_hash`** —
+  between token issuance and redemption, the existing credential
+  remains valid. This is a deliberate separation of concerns: a
+  rebind token is a **recovery** primitive; immediate invalidation
+  of a suspected-stolen credential is a separate **revocation**
+  primitive (force-flip `agents.status = 'revoked'`; the existing
+  agent-auth middleware already rejects non-active agents at the
+  very next call). Scenario #9 in §2 calls out the two-step admin
+  action explicitly. An agent-revoke API beyond direct SQL is
+  tracked separately by the AGENT_ENROLLMENT.md "Non-goals" list
+  (Phase 3+) — the design here does NOT introduce it but is
+  written to compose cleanly with it once it lands.
 - **Optional descriptive refresh.** The rebind request body may
   carry fresh `hostname` / `machine_fingerprint` / `install_id` /
   `agent_version` to update the agent's descriptive fields in the
@@ -295,20 +308,62 @@ behaviors during normal operation.
 | Pattern                                                     | Detection                                                                         | v0.1 response                                                                                                  |
 | ----------------------------------------------------------- | --------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
 | Duplicate `install_id` within an org                        | Unique index on `agents(organization_id, install_id) WHERE install_id IS NOT NULL`| Fail closed at enrollment (current v0.1).                                                                      |
-| Same `machine_fingerprint_hash`, different `install_id`     | Heartbeat / inventory drift check (post-implementation)                            | Audit `agent.suspicious_duplicate` (severity:"security") — operator decides whether to revoke. NOT auto-rejected.  |
+| Same `machine_fingerprint_hash`, different `install_id`     | **Requires precondition (see below).** Drift check between the row's stored fingerprint and a value re-reported on heartbeat / inventory. | Audit `agent.suspicious_duplicate` (severity:"security") — operator decides whether to revoke. NOT auto-rejected.  |
 | Same hostname from multiple agents                          | Hostname is descriptive — not a uniqueness signal.                                | Allowed.                                                                                                       |
-| Cloned VM with copied credential (both copies running)      | `machine_fingerprint_hash` drift between heartbeats from the same `agent_id`      | Audit `agent.suspicious_duplicate`. v0.1 cannot reliably prevent the clone with bearer auth alone — Phase 6 mTLS is the real defense. |
+| Cloned VM with copied credential (both copies running)      | **Requires precondition (see below).** Same drift check above, plus heartbeat from distinct `remote_addr` values for the same `agent_id` in a short window.      | Audit `agent.suspicious_duplicate`. v0.1 cannot reliably prevent the clone with bearer auth alone — Phase 6 mTLS is the real defense. |
 | Cloned VM with copied `install_id`, no credential           | Enrollment-time unique constraint                                                  | Fail closed at enrollment.                                                                                     |
 | Rebind token reused (replay)                                | `consumed_at` is non-NULL on token row                                            | Fail closed; audit `agent.rebind_rejected` with `reason: "token_consumed"`.                                    |
 
-**Known v0.1 limitation explicitly accepted by this design:** a
-clone that copies the credential AND the local installation state
+**Precondition for fingerprint-drift detection (binding on the
+implementation PR).** Today, `agents.machine_fingerprint_hash` is
+populated only at enrollment (see
+[`AGENT_ENROLLMENT.md`](./AGENT_ENROLLMENT.md) "Reinstall behavior
+in v0.1") and never refreshed. The current heartbeat
+(`POST /agent/heartbeat`) and inventory (`POST /agent/inventory`)
+request bodies do NOT carry `machine_fingerprint`. As a
+consequence the two table rows tagged "Requires precondition
+(see below)" above are **not implementable from the current
+wire contract**: a clone that re-uses the credential will
+heartbeat happily and the control plane will never see a second
+fingerprint to compare against.
+
+Closing the gap requires one of:
+
+1. **Additive heartbeat field.** Add optional `machine_fingerprint`
+   to the heartbeat request body. The handler hashes it (same
+   helper enrollment uses) and either UPDATEs
+   `agents.machine_fingerprint_hash` (if the stored value is NULL),
+   or compares against the stored value and writes
+   `agent.suspicious_duplicate` on mismatch. Same shape as
+   `agent_version` / `hostname` drift handling (`PR-017`). Additive
+   per CLAUDE.md §17.
+2. **Additive inventory field.** Same idea, on the inventory POST.
+   Lower-frequency than heartbeat → slower detection but less
+   per-request cost.
+3. **Detection deferred entirely to Phase 6.** Accept that v0.1's
+   bearer-credential model cannot detect copy-clones on the wire,
+   document it, and rely on mTLS (H-008) for the real fix.
+
+**Recommendation.** Option 1 (heartbeat additive field). It is the
+smallest possible wire change, runs at the cadence operators care
+about (5 minutes), and keeps the fingerprint-drift audit signal
+honest. The H-012 implementation PR should land this addition
+**together** with the rebind primitive — without it, the
+"suspicious duplicate" detection promised by the design is a
+no-op. Flagged as an unresolved question in §"Unresolved
+questions" for the operator to confirm before the implementer
+locks the wire.
+
+**Known v0.1 limitation explicitly accepted by this design:** even
+with the precondition above in place, a clone that copies the
+credential AND the local installation state AND the host's hardware
+fingerprint (e.g. a VM clone before sysprep on identical hardware)
 cannot be distinguished from the legitimate original at the
 control-plane wire boundary. The bearer credential is the entire
-proof. Detection is operational (audit signals), not enforced. This
-is exactly what CLAUDE.md §6.4 commits to fixing in Phase 6 via
-mTLS — each agent's identity becomes its private key, which is
-stored in CNG/DPAPI and resists copy.
+proof. Detection is best-effort (audit signals on observable
+drift), not enforced. This is exactly what CLAUDE.md §6.4 commits
+to fixing in Phase 6 via mTLS — each agent's identity becomes its
+private key, which is stored in CNG/DPAPI and resists copy.
 
 ## 7. Security invariants
 
@@ -327,7 +382,12 @@ implementation surface.
    the right org.
 3. **Operator-approved recovery.** Rebind requires a token an
    admin issues; the recovering agent cannot self-promote. The
-   token is admin-scoped to one `agent_id`.
+   token is admin-scoped to one `agent_id`. **Rebind tokens do
+   not by themselves invalidate the current credential** — they
+   are a recovery primitive, not a revocation primitive. Immediate
+   invalidation of a suspected-stolen credential is a separate
+   admin action (force-flip `agents.status = 'revoked'`); see §4
+   "Properties" and §2 scenario #9 for the two-step sequence.
 4. **Audit every rebind / rotation / suspicious event.** Every
    state change (rebind, rotation) and every detection signal
    (suspicious duplicate) writes an `audit_events` row in the same
@@ -698,6 +758,18 @@ before locking the wire.
    forward; the credential becomes a key pair instead of a shared
    secret. The audit shape, token lifecycle, and `agent_id`
    continuity all survive.
+6. **Fingerprint-drift detection precondition.** §6 makes the
+   `agent.suspicious_duplicate` audit signal contingent on a wire
+   addition (most naturally an optional `machine_fingerprint` on
+   the heartbeat body) so the control plane can compare against
+   the stored hash. Without that addition, the signal is a no-op
+   and the table rows tagged "Requires precondition" in §6
+   describe a behavior the implementation cannot deliver. Three
+   options are listed in §6: heartbeat additive field
+   (recommended), inventory additive field, or defer entirely to
+   Phase 6 mTLS. The implementer should pick before H-012 locks
+   its wire — and the choice belongs to operators, not the
+   design author.
 
 ## References
 
