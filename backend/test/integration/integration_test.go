@@ -69,6 +69,15 @@ func freshDatabase(t *testing.T, db *postgres.DB) {
 		stmts := []string{
 			"DELETE FROM sessions",
 			"DELETE FROM agent_enrollment_tokens",
+			// certificate_observations cascades off both agents
+			// (composite FK on org+agent_id ON DELETE CASCADE) and
+			// certificates (composite FK on org+certificate_id ON
+			// DELETE CASCADE) per migration 0005, so the explicit
+			// DELETE is belt-and-braces. The composite FK on the
+			// org column is RESTRICT, so we MUST clear observations
+			// and certificates before organizations regardless.
+			"DELETE FROM certificate_observations",
+			"DELETE FROM certificates",
 			// agents must go before deployment_packages because of the
 			// FK from agents.deployment_package_id (added in 0002).
 			"DELETE FROM agents",

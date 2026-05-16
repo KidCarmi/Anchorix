@@ -27,20 +27,54 @@ type Certificate struct {
 	ExtKeyUsages      []string  `json:"ext_key_usages"`
 	IsSelfSigned      bool      `json:"is_self_signed"`
 	IsCA              bool      `json:"is_ca"`
-	FirstSeenAt       time.Time `json:"first_seen_at"`
-	LastSeenAt        time.Time `json:"last_seen_at"`
+	// PEM is the public certificate PEM, stored verbatim. Private
+	// key material is rejected at the API boundary (CLAUDE.md §6.2,
+	// CERTIFICATE_INVENTORY.md §7) before reaching this struct.
+	PEM         string    `json:"pem"`
+	FirstSeenAt time.Time `json:"first_seen_at"`
+	LastSeenAt  time.Time `json:"last_seen_at"`
 }
 
-// CertificateObservation is a single (host, store) sighting of a certificate.
-// A single Certificate may have many CertificateObservations across an estate.
+// CertificateObservation is a single (agent, store) sighting of a
+// certificate. The observation row is the *current* state of one
+// (organization_id, certificate_id, agent_id, store_location)
+// pair — v0.1 keeps latest state only, with first_seen_at /
+// last_seen_at / removed_at carrying the lifecycle bookkeeping.
+//
+// Field meaning:
+//
+//   - OrganizationID anchors the row to a single org. The composite
+//     FKs in migration 0005 bind both (org, certificate_id) and
+//     (org, agent_id) to the same org as the parent rows; cross-org
+//     observations cannot exist at the DB level.
+//   - CertificateID points at the deduplicated certificates row.
+//   - AgentID is the stable identity axis (H-006 design: rebind
+//     preserves agent_id, so observations survive reinstalls).
+//   - StoreLocation is the host-side store path
+//     (e.g. "LocalMachine\\My"). Part of the unique key — the same
+//     cert can legitimately appear in multiple stores on the same
+//     host with different operational semantics.
+//   - FriendlyName is the operator-facing display label the agent
+//     reported. Descriptive only, NOT part of the unique key.
+//   - FirstSeenAt is the upload's collected_at at the moment this
+//     (org, cert, agent, store) was first observed.
+//   - LastSeenAt is the upload's collected_at at the most recent
+//     observation. Updated on every UPSERT that matches the unique
+//     key, subject to the out-of-order guard (older
+//     collected_at cannot overwrite newer state).
+//   - RemovedAt is non-NULL when the cert was absent from a
+//     reconciliation that covered the row's store_location. Cleared
+//     back to NULL when the cert reappears in a later batch.
 type CertificateObservation struct {
-	ID            string    `json:"id"`
-	CertificateID string    `json:"certificate_id"`
-	AgentID       string    `json:"agent_id"`
-	Hostname      string    `json:"hostname"`
-	StoreLocation string    `json:"store_location"` // e.g. LocalMachine\My
-	FriendlyName  string    `json:"friendly_name,omitempty"`
-	ObservedAt    time.Time `json:"observed_at"`
+	ID             string     `json:"id"`
+	OrganizationID string     `json:"organization_id"`
+	CertificateID  string     `json:"certificate_id"`
+	AgentID        string     `json:"agent_id"`
+	StoreLocation  string     `json:"store_location"`
+	FriendlyName   string     `json:"friendly_name,omitempty"`
+	FirstSeenAt    time.Time  `json:"first_seen_at"`
+	LastSeenAt     time.Time  `json:"last_seen_at"`
+	RemovedAt      *time.Time `json:"removed_at,omitempty"`
 }
 
 // InventoryBatch is the agent → control-plane upload for a single inventory

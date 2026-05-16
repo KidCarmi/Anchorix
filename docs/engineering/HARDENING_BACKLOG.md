@@ -16,30 +16,6 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
 
 ## Open Items
 
-### H-014 — Certificate inventory: storage layer
-
-- **Title:** `feat(inventory): certificate + observations storage layer`
-- **Risk:** medium (schema introduction, no-private-key
-  invariant, ingestion atomicity). H-011's design landed (see
-  References); this implementation PR is the schema half.
-- **Scope:** migration introducing `certificates` and
-  `certificate_observations` with the composite FK pattern
-  established in PR-019 H-009
-  (`(organization_id, agent_id) → agents(organization_id, id)`
-  and `(organization_id, certificate_id) → certificates(organization_id, id)`);
-  internal/inventory repository implementation (deduplication
-  by `(organization_id, fingerprint_sha256)`, reconciliation
-  with `removed_at` for store_coverage); indexes per
-  CERTIFICATE_INVENTORY.md §10. No HTTP surface yet.
-- **Recommended PR:** `feat(inventory): certificate + observations storage layer`.
-- **Reason not fixed now:** spawned by the H-011 design PR.
-  Land schema first so H-015 (the ingestion endpoint) has a
-  storage layer to wire against.
-- **References:**
-  [`docs/engineering/CERTIFICATE_INVENTORY.md`](./CERTIFICATE_INVENTORY.md)
-  §1, §8, §10; CLAUDE.md §6.2, §16; PR-019 H-009 composite-FK
-  precedent.
-
 ### H-015 — Certificate inventory: agent ingestion endpoint
 
 - **Title:** `feat(inventory): agent certificate ingestion endpoint`
