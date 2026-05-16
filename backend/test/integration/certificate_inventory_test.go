@@ -780,3 +780,213 @@ func TestGetCertificateCrossOrgReturnsNotFound(t *testing.T) {
 		t.Errorf("got.ID = %q, want %q", got.ID, cert.ID)
 	}
 }
+
+// --- H-014 post-merge hardening (adversarial review) ---------------
+
+// TestUpsertCertificateOutOfOrderFallbackReturnsExistingRow exercises
+// the fallback branch of UpsertCertificate that fires when the
+// ON CONFLICT WHERE clause suppresses the DO UPDATE (stored
+// last_seen_at is newer than the incoming observedAt). In that
+// case the RETURNING clause emits no rows; the repo falls through
+// to getCertificateByFingerprint and hands the caller the
+// canonical stored *Certificate.
+//
+// The existing TestOutOfOrderBatchDoesNotOverwriteNewerState
+// covers UpsertObservation's out-of-order behavior. This is the
+// symmetric coverage for UpsertCertificate that the merged H-014
+// did not exercise directly.
+func TestUpsertCertificateOutOfOrderFallbackReturnsExistingRow(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	repo := postgres.NewCertificateInventoryRepository(db)
+	ctx := context.Background()
+
+	tOld := time.Date(2026, 5, 16, 9, 0, 0, 0, time.UTC)
+	tNew := tOld.Add(1 * time.Hour)
+
+	// Newer first.
+	newer := newCertificate("anchorix", "fp-ooo-cert", "CN=newer-first", tNew.AddDate(1, 0, 0))
+	stored, err := repo.UpsertCertificate(ctx, newer, tNew)
+	if err != nil {
+		t.Fatalf("upsert (newer): %v", err)
+	}
+	if !stored.LastSeenAt.Equal(tNew) {
+		t.Fatalf("setup: stored last_seen_at = %v, want %v", stored.LastSeenAt, tNew)
+	}
+
+	// Older arrives second — should not overwrite; the call must
+	// nonetheless return the canonical existing row so a caller can
+	// chain into UpsertObservation with a valid certificate_id.
+	older := newCertificate("anchorix", "fp-ooo-cert", "CN=older-second", tNew.AddDate(1, 0, 0))
+	older.ID = "" // force the repo to mint, so we can confirm the returned id matches the stored row
+	got, err := repo.UpsertCertificate(ctx, older, tOld)
+	if err != nil {
+		t.Fatalf("upsert (older): %v", err)
+	}
+	if got.ID != stored.ID {
+		t.Errorf("returned id = %q, want existing %q", got.ID, stored.ID)
+	}
+	if !got.LastSeenAt.Equal(tNew) {
+		t.Errorf("last_seen_at = %v, want preserved %v (older batch suppressed)", got.LastSeenAt, tNew)
+	}
+	if got.Subject != "CN=newer-first" {
+		t.Errorf("returned subject = %q, want canonical stored value %q", got.Subject, "CN=newer-first")
+	}
+}
+
+// TestUpsertCertificateFirstSeenAtNotBumped pins down a behavior the
+// merged H-014 implies but never asserts: first_seen_at is set on
+// the initial INSERT and is NEVER updated by the DO UPDATE path.
+// Operators rely on this for "when did we first observe this cert
+// in the org" queries; an accidental future change to the DO
+// UPDATE SET clause would silently break that.
+func TestUpsertCertificateFirstSeenAtNotBumped(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	repo := postgres.NewCertificateInventoryRepository(db)
+	ctx := context.Background()
+
+	t0 := time.Date(2026, 5, 16, 8, 0, 0, 0, time.UTC)
+	t1 := t0.Add(2 * time.Hour)
+
+	first, err := repo.UpsertCertificate(ctx,
+		newCertificate("anchorix", "fp-fsa", "CN=fsa", t0.AddDate(1, 0, 0)), t0)
+	if err != nil {
+		t.Fatalf("upsert 1: %v", err)
+	}
+	if !first.FirstSeenAt.Equal(t0) {
+		t.Fatalf("setup: first_seen_at = %v, want %v", first.FirstSeenAt, t0)
+	}
+
+	second, err := repo.UpsertCertificate(ctx,
+		newCertificate("anchorix", "fp-fsa", "CN=fsa", t0.AddDate(1, 0, 0)), t1)
+	if err != nil {
+		t.Fatalf("upsert 2: %v", err)
+	}
+	if !second.FirstSeenAt.Equal(t0) {
+		t.Errorf("first_seen_at = %v after second upsert; want preserved %v",
+			second.FirstSeenAt, t0)
+	}
+	if !second.LastSeenAt.Equal(t1) {
+		t.Errorf("last_seen_at = %v after second upsert; want bumped to %v",
+			second.LastSeenAt, t1)
+	}
+}
+
+// TestUpsertObservationPreservesFriendlyNameOnEmpty pins the
+// post-merge fix: when a later batch sends an empty
+// friendly_name, the previously stored non-empty value is
+// preserved (mirrors the COALESCE(NULLIF(...)) pattern heartbeat
+// uses for version/hostname). Without this, an agent that
+// reported "Production Web Cert" once and then omitted the label
+// on subsequent batches would silently blank the operator-
+// visible name.
+func TestUpsertObservationPreservesFriendlyNameOnEmpty(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	repo := postgres.NewCertificateInventoryRepository(db)
+	ctx := context.Background()
+	agentID := seedAgent(t, db, "anchorix", "friendly-preserve")
+
+	t0 := time.Date(2026, 5, 16, 10, 0, 0, 0, time.UTC)
+	t1 := t0.Add(1 * time.Hour)
+	t2 := t1.Add(1 * time.Hour)
+
+	cert, err := repo.UpsertCertificate(ctx,
+		newCertificate("anchorix", "fp-friendly", "CN=friendly", t0.AddDate(1, 0, 0)), t0)
+	if err != nil {
+		t.Fatalf("upsert cert: %v", err)
+	}
+
+	// First observation supplies a non-empty friendly_name.
+	first := newObservation("anchorix", cert.ID, agentID, "LocalMachine\\My", "Production Web Cert")
+	if err := repo.UpsertObservation(ctx, first, t0); err != nil {
+		t.Fatalf("upsert 1: %v", err)
+	}
+
+	// Second observation (newer batch) sends an empty friendly_name.
+	// The stored label MUST be preserved.
+	blank := newObservation("anchorix", cert.ID, agentID, "LocalMachine\\My", "")
+	if err := repo.UpsertObservation(ctx, blank, t1); err != nil {
+		t.Fatalf("upsert 2: %v", err)
+	}
+
+	obs, err := repo.ListObservationsForCertificate(ctx, "anchorix", cert.ID)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(obs) != 1 {
+		t.Fatalf("observation count = %d, want 1", len(obs))
+	}
+	if obs[0].FriendlyName != "Production Web Cert" {
+		t.Errorf("friendly_name = %q after empty re-submit; want preserved %q",
+			obs[0].FriendlyName, "Production Web Cert")
+	}
+
+	// Third observation supplies a NEW non-empty value — the label
+	// MUST be updated. This proves the preservation is "empty
+	// means no change" not "label is frozen".
+	relabel := newObservation("anchorix", cert.ID, agentID, "LocalMachine\\My", "Production Web Cert v2")
+	if err := repo.UpsertObservation(ctx, relabel, t2); err != nil {
+		t.Fatalf("upsert 3: %v", err)
+	}
+
+	obs2, err := repo.ListObservationsForCertificate(ctx, "anchorix", cert.ID)
+	if err != nil {
+		t.Fatalf("list 2: %v", err)
+	}
+	if obs2[0].FriendlyName != "Production Web Cert v2" {
+		t.Errorf("friendly_name = %q after non-empty re-submit; want updated %q",
+			obs2[0].FriendlyName, "Production Web Cert v2")
+	}
+}
+
+// TestMarkMissingObservationsRemovedNoOpOnEmptyAgentStore exercises
+// the case where reconciliation runs against an (agent, store)
+// combination that has zero existing observations. The UPDATE
+// should affect zero rows and return nil — the repo MUST NOT
+// surface an error or any side effect.
+//
+// This is the realistic "first ever ingestion for an agent"
+// scenario: H-015 calls MarkMissingObservationsRemoved with an
+// empty observedCertIDs (or any list), and there's nothing yet
+// in the table for that agent.
+func TestMarkMissingObservationsRemovedNoOpOnEmptyAgentStore(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	repo := postgres.NewCertificateInventoryRepository(db)
+	ctx := context.Background()
+	agentID := seedAgent(t, db, "anchorix", "no-prior")
+
+	// Agent exists but has zero prior observations. Reconciliation
+	// with an empty observed set should be a clean no-op.
+	if err := repo.MarkMissingObservationsRemoved(ctx,
+		"anchorix", agentID,
+		[]string{"LocalMachine\\My"},
+		[]string{}, time.Now().UTC()); err != nil {
+		t.Fatalf("reconcile empty agent: %v", err)
+	}
+
+	// Confirm nothing was created.
+	n := countObservations(t, db,
+		"organization_id = $1 AND agent_id = $2", "anchorix", agentID)
+	if n != 0 {
+		t.Errorf("observations created by reconciliation? count = %d, want 0", n)
+	}
+
+	// Same case but reconciliation references a cert id that
+	// doesn't exist in the agent's set — must still be a no-op
+	// (the cert id is in the WHERE NOT-IN list, but there are no
+	// candidate rows to filter).
+	if err := repo.MarkMissingObservationsRemoved(ctx,
+		"anchorix", agentID,
+		[]string{"LocalMachine\\My"},
+		[]string{"nonexistent-cert-id"}, time.Now().UTC()); err != nil {
+		t.Fatalf("reconcile empty agent w/ phantom cert id: %v", err)
+	}
+	n = countObservations(t, db,
+		"organization_id = $1 AND agent_id = $2", "anchorix", agentID)
+	if n != 0 {
+		t.Errorf("observations created? count = %d, want 0", n)
+	}
+}

@@ -132,6 +132,14 @@ func (r *CertificateInventoryRepository) UpsertCertificate(
 // UPDATE clause bumps last_seen_at and clears removed_at, but
 // only when the incoming observedAt is at least as new as the
 // stored last_seen_at. An older batch leaves the row untouched.
+//
+// friendly_name semantics: an empty incoming friendly_name does
+// NOT overwrite a previously stored non-empty value. The
+// COALESCE + NULLIF idiom in the SQL below mirrors the pattern
+// the heartbeat handler uses for `version` and `hostname`
+// (PR-017): it preserves operator-visible descriptive data when
+// the agent's later report omits the label. The agent can still
+// update the label by sending a new non-empty value.
 func (r *CertificateInventoryRepository) UpsertObservation(
 	ctx context.Context,
 	o *inventory.CertificateObservation,
@@ -150,7 +158,10 @@ func (r *CertificateInventoryRepository) UpsertObservation(
 		ON CONFLICT (organization_id, certificate_id, agent_id, store_location)
 		DO UPDATE
 		   SET last_seen_at = EXCLUDED.last_seen_at,
-		       friendly_name = EXCLUDED.friendly_name,
+		       friendly_name = COALESCE(
+		           NULLIF(EXCLUDED.friendly_name, ''),
+		           certificate_observations.friendly_name
+		       ),
 		       removed_at = NULL
 		 WHERE certificate_observations.last_seen_at <= EXCLUDED.last_seen_at`
 

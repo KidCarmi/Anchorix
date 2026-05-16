@@ -16,6 +16,76 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
 
 ## Open Items
 
+### H-017 — Certificate ingestion: serial-per-agent transaction
+
+- **Title:** `feat(inventory): serialize certificate ingestion per agent`
+- **Risk:** medium (real correctness gap under concurrent
+  ingestion; low-impact in single-flight v0.1 deployments). The
+  H-014 storage layer's set-reconciliation primitive
+  (`MarkMissingObservationsRemoved`) is correct **per batch**:
+  the out-of-order `last_seen_at <= collectedAt` guard prevents
+  an older batch from overwriting a newer one's state. But two
+  batches arriving CONCURRENTLY for the same agent can race:
+  batch A's reconciliation can mark batch B's freshly-upserted
+  observation as `removed_at` before batch A's own
+  `UpsertObservation` calls land. The post-merge H-014 review
+  walked through this race and confirmed the storage layer
+  cannot solve it alone — the **caller** (H-015) must serialize
+  ingestion per agent (either an advisory lock on the
+  `agents.id` key, or a SERIALIZABLE-isolation transaction
+  wrapping the whole batch).
+- **Scope:** in H-015, wrap the entire ingestion flow
+  (`UpsertCertificate` × N, `UpsertObservation` × N,
+  `MarkMissingObservationsRemoved`) in a single transaction via
+  the `Transactor` pattern (already used by
+  `enrollment.Service`), AND take a `pg_advisory_xact_lock`
+  on the agent id at the top of the transaction. Two concurrent
+  batches for the same agent then queue rather than interleave.
+  Add an integration test that drives two concurrent
+  ingestion flows for the same agent and asserts the final
+  state matches a serial-execution outcome.
+- **Recommended PR:** ships with H-015 — the storage primitives
+  exist; the orchestration choice belongs in the ingestion
+  service.
+- **Reason not fixed now:** the storage layer correctly
+  surfaces the primitives. Serial-per-agent is an orchestration
+  concern; making the storage layer take advisory locks would
+  hide the requirement from H-015's contract.
+- **References:**
+  [`docs/engineering/CERTIFICATE_INVENTORY.md`](./CERTIFICATE_INVENTORY.md)
+  §5; H-014 post-merge hardening review notes (PR with this
+  entry); CLAUDE.md §8.10 (concurrency discipline).
+
+### H-018 — first_seen_at preservation on out-of-order arrival
+
+- **Title:** `fix(inventory): preserve true first_seen_at across out-of-order ingestion`
+- **Risk:** low (display-only; no security or correctness
+  impact on reconciliation). The H-014 storage layer sets
+  `first_seen_at` on the row's initial INSERT and never
+  updates it. If batches arrive in order, this is correct —
+  the FIRST batch sets `first_seen_at` to its own
+  `collected_at`. If a newer batch arrives FIRST and an older
+  batch arrives second, the older batch's `collected_at`
+  (which is semantically the *true* first observation) is
+  silently lost; the operator-visible `first_seen_at` reflects
+  the order of arrival, not the order of observation.
+- **Scope:** in H-015, the ingestion service can additionally
+  set `first_seen_at = LEAST(first_seen_at, $collected_at)`
+  inside the DO UPDATE clause for both UpsertCertificate and
+  UpsertObservation. The change is one line of SQL per query
+  plus an integration test exercising the out-of-order arrival
+  on a fresh row.
+- **Recommended PR:** small focused storage-layer follow-on
+  (or fold into H-015 if convenient).
+- **Reason not fixed now:** the audit identified the
+  divergence but the impact is operator-cosmetic, not a
+  correctness gap. The fix is small but adds wire commitments
+  worth landing alongside H-015 so the ingestion test suite
+  exercises it as part of the broader flow.
+- **References:**
+  [`docs/engineering/CERTIFICATE_INVENTORY.md`](./CERTIFICATE_INVENTORY.md)
+  §1, §3; H-014 post-merge hardening review notes.
+
 ### H-015 — Certificate inventory: agent ingestion endpoint
 
 - **Title:** `feat(inventory): agent certificate ingestion endpoint`
