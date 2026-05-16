@@ -636,29 +636,52 @@ Failure responses:
 Audit policy: read-only. No `audit_events` row is emitted
 (CLAUDE.md §9 — audits record state changes).
 
-### Certificate inventory (deferred)
+### Certificate inventory (deferred — design landed; implementation in flight)
 
 Certificate inventory (PEM-bearing observation upload, deduplication
 by fingerprint, observations table) is intentionally NOT part of
-v0.1 PR-018; it ships in a later phase under a separate endpoint
-contract. The original v0.1 schema proposal hinted at a
-certificate-shaped `POST /agents/{id}/inventory` payload; that
-shape is **not** the contract for `POST /agent/inventory` above.
+PR-018; the snapshot endpoint above carries machine inventory only.
+The **design** for the certificate-inventory ingestion model has
+landed in
+[`docs/engineering/CERTIFICATE_INVENTORY.md`](../engineering/CERTIFICATE_INVENTORY.md);
+the implementation lands in **H-014** (storage layer), **H-015**
+(agent endpoint), and **H-016** (operator read endpoints) — see
+[`HARDENING_BACKLOG.md`](../engineering/HARDENING_BACKLOG.md).
+
+The future agent endpoint is `POST /api/v1/agent/certificates`
+(NOT `POST /agent/inventory`, which remains the machine-inventory
+snapshot endpoint). The future operator read endpoints are listed
+in the "Certificates" table below.
+
+The original v0.1 schema proposal hinted at a certificate-shaped
+`POST /agents/{id}/inventory` payload; that shape is **not** the
+contract for `POST /agent/inventory` above and is **not** the
+contract for the future `POST /agent/certificates` either. The
+authoritative request/response shapes live in CERTIFICATE_INVENTORY.md
+§4.
 
 ## Certificates
 
-| Method | Path                  | Auth | Purpose                                |
-| ------ | --------------------- | ---- | -------------------------------------- |
-| GET    | `/certificates`       | user | Paginated list with filters            |
-| GET    | `/certificates/{id}`  | user | Single certificate + observations list |
+Future operator endpoints (implementation in H-016). The contracts
+below are the future-direction notes locked in by
+[`docs/engineering/CERTIFICATE_INVENTORY.md`](../engineering/CERTIFICATE_INVENTORY.md)
+§12; the rows currently return `501 not_implemented`.
 
-Supported filters on list:
+| Method | Path                                          | Auth | Purpose                                                              |
+| ------ | --------------------------------------------- | ---- | -------------------------------------------------------------------- |
+| GET    | `/certificates`                               | user | Paginated list of certificates with summary fields                   |
+| GET    | `/certificates/{id}`                          | user | Single certificate detail including full PEM                          |
+| GET    | `/certificates/{id}/observations`             | user | List of observations (agent + store) for one certificate              |
+| GET    | `/agents/{id}/certificates`                   | user | Certificates observed by one agent                                    |
+
+Supported filters on `/certificates` list (per CERTIFICATE_INVENTORY.md §12):
 
 - `q` — substring match against subject / SANs / issuer
 - `expiring_before` — RFC3339; returns certs with `not_after < value`
 - `is_ca` — boolean
-- `agent_id` — filter to a specific agent
-- `cursor`, `limit`
+- `agent_id` — filter to a specific agent (joins through observations)
+- `current_only` — boolean; default `true` (excludes observations with `removed_at IS NOT NULL`)
+- `cursor`, `limit` — pagination per the H-010 cursor convention
 
 ## Findings
 

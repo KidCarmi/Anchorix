@@ -112,18 +112,33 @@ in the UI as they enroll.
 
 ## Phase 3 — Inventory & Heartbeat (in progress)
 
-**Goal:** agents continuously upload certificate inventory.
+**Goal:** agents continuously upload machine + certificate inventory.
 
 - [x] Heartbeat endpoint (`POST /api/v1/agent/heartbeat`) — agent-
       keyed, bearer-authenticated, owns `agents.last_seen_at`.
       Operational telemetry only, no audit-row spam.
-- [ ] Inventory endpoint (`POST /api/v1/agent/inventory`) — agent-
-      keyed, bearer-authenticated, accepts a batch of certificate
-      observations.
+- [x] Machine inventory snapshot endpoint
+      (`POST /api/v1/agent/inventory`) — agent-keyed,
+      bearer-authenticated, single current snapshot per
+      `(organization_id, agent_id)`. Operational state sync (no
+      audit-row spam). Operator read endpoints
+      `GET /agents/{id}/inventory` and `GET /agent-inventory` (the
+      latter org-scoped, cursor-paginated, slim summary rows).
+- [x] Certificate inventory **design**
+      ([`docs/engineering/CERTIFICATE_INVENTORY.md`](./docs/engineering/CERTIFICATE_INVENTORY.md)).
+      Locks in the per-store set-reconciliation model,
+      observation continuity via stable `agent_id` (depends on
+      H-006), private-key-rejection policy, and the operator read
+      shape.
+- [ ] Certificate inventory **implementation** — H-014 (storage
+      layer + migration), H-015 (`POST /api/v1/agent/certificates`
+      ingestion endpoint), H-016 (operator read endpoints
+      `GET /certificates`, `/certificates/{id}`,
+      `/certificates/{id}/observations`, `/agents/{id}/certificates`).
 - [ ] Windows discovery: enumerate `LocalMachine\My`, `WebHosting`, etc.
 - [ ] Public-cert metadata only — explicit check that no private key
-      material is included in payloads
-- [ ] Upsert by `(fingerprint_sha256, source_host, source_store)`
+      material is included in payloads (binding; see
+      CERTIFICATE_INVENTORY.md §7)
 - [ ] UI: certificates list, certificate detail page
 
 **Exit criteria:** UI shows certificates discovered from a real Windows host.
