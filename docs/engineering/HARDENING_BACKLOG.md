@@ -56,36 +56,6 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
   §5; H-014 post-merge hardening review notes (PR with this
   entry); CLAUDE.md §8.10 (concurrency discipline).
 
-### H-018 — first_seen_at preservation on out-of-order arrival
-
-- **Title:** `fix(inventory): preserve true first_seen_at across out-of-order ingestion`
-- **Risk:** low (display-only; no security or correctness
-  impact on reconciliation). The H-014 storage layer sets
-  `first_seen_at` on the row's initial INSERT and never
-  updates it. If batches arrive in order, this is correct —
-  the FIRST batch sets `first_seen_at` to its own
-  `collected_at`. If a newer batch arrives FIRST and an older
-  batch arrives second, the older batch's `collected_at`
-  (which is semantically the *true* first observation) is
-  silently lost; the operator-visible `first_seen_at` reflects
-  the order of arrival, not the order of observation.
-- **Scope:** in H-015, the ingestion service can additionally
-  set `first_seen_at = LEAST(first_seen_at, $collected_at)`
-  inside the DO UPDATE clause for both UpsertCertificate and
-  UpsertObservation. The change is one line of SQL per query
-  plus an integration test exercising the out-of-order arrival
-  on a fresh row.
-- **Recommended PR:** small focused storage-layer follow-on
-  (or fold into H-015 if convenient).
-- **Reason not fixed now:** the audit identified the
-  divergence but the impact is operator-cosmetic, not a
-  correctness gap. The fix is small but adds wire commitments
-  worth landing alongside H-015 so the ingestion test suite
-  exercises it as part of the broader flow.
-- **References:**
-  [`docs/engineering/CERTIFICATE_INVENTORY.md`](./CERTIFICATE_INVENTORY.md)
-  §1, §3; H-014 post-merge hardening review notes.
-
 ### H-015 — Certificate inventory: agent ingestion endpoint
 
 - **Title:** `feat(inventory): agent certificate ingestion endpoint`

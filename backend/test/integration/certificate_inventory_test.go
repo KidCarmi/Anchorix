@@ -120,6 +120,31 @@ func countObservations(t *testing.T, db *postgres.DB, where string, args ...any)
 	return n
 }
 
+// readObservationTimestamps returns first_seen_at + last_seen_at +
+// removed_at for one observation row. The full triple is needed
+// for H-018 assertions where all three timestamps can diverge
+// across out-of-order arrival.
+func readObservationTimestamps(t *testing.T, db *postgres.DB, orgID, certID, agentID, store string) (time.Time, time.Time, *time.Time) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var (
+		firstSeen, lastSeen time.Time
+		removedAt           *time.Time
+	)
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT first_seen_at, last_seen_at, removed_at FROM certificate_observations
+			  WHERE organization_id = $1 AND certificate_id = $2
+			    AND agent_id = $3 AND store_location = $4`,
+			orgID, certID, agentID, store,
+		).Scan(&firstSeen, &lastSeen, &removedAt)
+	}); err != nil {
+		t.Fatalf("read observation timestamps: %v", err)
+	}
+	return firstSeen, lastSeen, removedAt
+}
+
 // readObservationState returns last_seen_at + removed_at for one
 // observation row.
 func readObservationState(t *testing.T, db *postgres.DB, orgID, certID, agentID, store string) (time.Time, *time.Time) {
@@ -531,9 +556,11 @@ func TestMarkMissingObservationsRemovedAbsentCert(t *testing.T) {
 }
 
 // TestOutOfOrderBatchDoesNotOverwriteNewerState pins the
-// last_seen_at <= collectedAt guard for both UpsertObservation
-// and MarkMissingObservationsRemoved. An older batch arriving
-// after a newer one must NOT overwrite the newer state.
+// "older batch cannot retreat newer state" guarantee for both
+// UpsertObservation and MarkMissingObservationsRemoved, AND the
+// symmetric H-018 invariant that first_seen_at IS retreated by
+// the older batch (the earliest observation wins, regardless of
+// arrival order).
 func TestOutOfOrderBatchDoesNotOverwriteNewerState(t *testing.T) {
 	db := testDB(t)
 	freshDatabase(t, db)
@@ -555,15 +582,20 @@ func TestOutOfOrderBatchDoesNotOverwriteNewerState(t *testing.T) {
 		t.Fatalf("upsert (new): %v", err)
 	}
 
-	// Older batch arrives second — should be ignored.
+	// Older batch arrives second.
 	if err := repo.UpsertObservation(ctx,
 		newObservation("anchorix", cert.ID, agentID, "LocalMachine\\My", ""), tOld); err != nil {
 		t.Fatalf("upsert (old): %v", err)
 	}
 
-	lastSeen, removed := readObservationState(t, db, "anchorix", cert.ID, agentID, "LocalMachine\\My")
+	firstSeen, lastSeen, removed := readObservationTimestamps(t, db, "anchorix", cert.ID, agentID, "LocalMachine\\My")
+	// H-018: first_seen_at retreats to the older observedAt even
+	// though the older batch arrived second.
+	if !firstSeen.Equal(tOld) {
+		t.Errorf("first_seen_at = %v after out-of-order; want %v (LEAST wins)", firstSeen, tOld)
+	}
 	if !lastSeen.Equal(tNew) {
-		t.Errorf("last_seen_at = %v after out-of-order; want %v (newer wins)", lastSeen, tNew)
+		t.Errorf("last_seen_at = %v after out-of-order; want %v (GREATEST wins)", lastSeen, tNew)
 	}
 	if removed != nil {
 		t.Errorf("removed_at = %v after out-of-order upsert; want NULL", removed)
@@ -577,7 +609,7 @@ func TestOutOfOrderBatchDoesNotOverwriteNewerState(t *testing.T) {
 		[]string{}, tOld); err != nil {
 		t.Fatalf("mark removed (older): %v", err)
 	}
-	_, removedAfter := readObservationState(t, db, "anchorix", cert.ID, agentID, "LocalMachine\\My")
+	_, _, removedAfter := readObservationTimestamps(t, db, "anchorix", cert.ID, agentID, "LocalMachine\\My")
 	if removedAfter != nil {
 		t.Errorf("removed_at = %v after older reconciliation; want NULL (newer state preserved)", removedAfter)
 	}
@@ -783,19 +815,16 @@ func TestGetCertificateCrossOrgReturnsNotFound(t *testing.T) {
 
 // --- H-014 post-merge hardening (adversarial review) ---------------
 
-// TestUpsertCertificateOutOfOrderFallbackReturnsExistingRow exercises
-// the fallback branch of UpsertCertificate that fires when the
-// ON CONFLICT WHERE clause suppresses the DO UPDATE (stored
-// last_seen_at is newer than the incoming observedAt). In that
-// case the RETURNING clause emits no rows; the repo falls through
-// to getCertificateByFingerprint and hands the caller the
-// canonical stored *Certificate.
-//
-// The existing TestOutOfOrderBatchDoesNotOverwriteNewerState
-// covers UpsertObservation's out-of-order behavior. This is the
-// symmetric coverage for UpsertCertificate that the merged H-014
-// did not exercise directly.
-func TestUpsertCertificateOutOfOrderFallbackReturnsExistingRow(t *testing.T) {
+// TestUpsertCertificateOutOfOrderMergesTimestamps pins the H-018
+// fix: when a newer batch arrives before an older batch for the
+// same fingerprint, the older batch's observedAt correctly
+// retreats first_seen_at while leaving last_seen_at at the newer
+// value. The unconditional DO UPDATE makes RETURNING emit a row
+// on every conflict, so the canonical *Certificate is reachable
+// without a fallback — UpsertCertificate re-reads the row by id
+// to return canonical subject/issuer/PEM/etc., not the caller's
+// potentially stale input.
+func TestUpsertCertificateOutOfOrderMergesTimestamps(t *testing.T) {
 	db := testDB(t)
 	freshDatabase(t, db)
 	repo := postgres.NewCertificateInventoryRepository(db)
@@ -810,13 +839,14 @@ func TestUpsertCertificateOutOfOrderFallbackReturnsExistingRow(t *testing.T) {
 	if err != nil {
 		t.Fatalf("upsert (newer): %v", err)
 	}
+	if !stored.FirstSeenAt.Equal(tNew) {
+		t.Fatalf("setup: first_seen_at = %v, want %v (first insert wins)", stored.FirstSeenAt, tNew)
+	}
 	if !stored.LastSeenAt.Equal(tNew) {
-		t.Fatalf("setup: stored last_seen_at = %v, want %v", stored.LastSeenAt, tNew)
+		t.Fatalf("setup: last_seen_at = %v, want %v", stored.LastSeenAt, tNew)
 	}
 
-	// Older arrives second — should not overwrite; the call must
-	// nonetheless return the canonical existing row so a caller can
-	// chain into UpsertObservation with a valid certificate_id.
+	// Older arrives second.
 	older := newCertificate("anchorix", "fp-ooo-cert", "CN=older-second", tNew.AddDate(1, 0, 0))
 	older.ID = "" // force the repo to mint, so we can confirm the returned id matches the stored row
 	got, err := repo.UpsertCertificate(ctx, older, tOld)
@@ -826,9 +856,17 @@ func TestUpsertCertificateOutOfOrderFallbackReturnsExistingRow(t *testing.T) {
 	if got.ID != stored.ID {
 		t.Errorf("returned id = %q, want existing %q", got.ID, stored.ID)
 	}
-	if !got.LastSeenAt.Equal(tNew) {
-		t.Errorf("last_seen_at = %v, want preserved %v (older batch suppressed)", got.LastSeenAt, tNew)
+	// H-018: first_seen_at must retreat to the older observedAt.
+	if !got.FirstSeenAt.Equal(tOld) {
+		t.Errorf("first_seen_at = %v after older batch; want %v (LEAST wins)", got.FirstSeenAt, tOld)
 	}
+	// last_seen_at stays at the newer value (GREATEST wins).
+	if !got.LastSeenAt.Equal(tNew) {
+		t.Errorf("last_seen_at = %v, want preserved %v (newer wins)", got.LastSeenAt, tNew)
+	}
+	// The returned *Certificate carries canonical (first-inserted)
+	// metadata, not the caller's stale older input. UpsertCertificate
+	// re-reads after the upsert specifically to keep this contract.
 	if got.Subject != "CN=newer-first" {
 		t.Errorf("returned subject = %q, want canonical stored value %q", got.Subject, "CN=newer-first")
 	}
@@ -988,5 +1026,82 @@ func TestMarkMissingObservationsRemovedNoOpOnEmptyAgentStore(t *testing.T) {
 		"organization_id = $1 AND agent_id = $2", "anchorix", agentID)
 	if n != 0 {
 		t.Errorf("observations created? count = %d, want 0", n)
+	}
+}
+
+// TestUpsertObservationOutOfOrderMergesFirstSeenAt is the
+// dedicated regression for the H-018 fix on observations.
+// Mirrors TestUpsertCertificateOutOfOrderMergesTimestamps but at
+// the observation layer.
+//
+// Sequence:
+//
+//  1. Newer batch arrives first → first_seen_at = tNew,
+//     last_seen_at = tNew.
+//  2. Older batch arrives second → first_seen_at = tOld,
+//     last_seen_at remains tNew, removed_at remains NULL,
+//     friendly_name remains the newer batch's value.
+func TestUpsertObservationOutOfOrderMergesFirstSeenAt(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	repo := postgres.NewCertificateInventoryRepository(db)
+	ctx := context.Background()
+	agentID := seedAgent(t, db, "anchorix", "h018-obs")
+
+	tOld := time.Date(2026, 5, 16, 9, 0, 0, 0, time.UTC)
+	tNew := tOld.Add(1 * time.Hour)
+
+	cert, err := repo.UpsertCertificate(ctx,
+		newCertificate("anchorix", "fp-h018-obs", "CN=h018", tOld.AddDate(1, 0, 0)), tOld)
+	if err != nil {
+		t.Fatalf("upsert cert: %v", err)
+	}
+
+	// Newer batch arrives first with a non-empty friendly_name.
+	if err := repo.UpsertObservation(ctx,
+		newObservation("anchorix", cert.ID, agentID, "LocalMachine\\My", "Newer Label"), tNew); err != nil {
+		t.Fatalf("upsert (new): %v", err)
+	}
+	firstSeen, lastSeen, removed := readObservationTimestamps(t, db, "anchorix", cert.ID, agentID, "LocalMachine\\My")
+	if !firstSeen.Equal(tNew) || !lastSeen.Equal(tNew) || removed != nil {
+		t.Fatalf("setup: first=%v last=%v removed=%v; want both = %v, removed nil",
+			firstSeen, lastSeen, removed, tNew)
+	}
+
+	// Older batch arrives second. The older friendly_name is "Old
+	// Label" — must NOT overwrite the newer "Newer Label", because
+	// the older batch is older than stored.last_seen_at.
+	if err := repo.UpsertObservation(ctx,
+		newObservation("anchorix", cert.ID, agentID, "LocalMachine\\My", "Old Label"), tOld); err != nil {
+		t.Fatalf("upsert (old): %v", err)
+	}
+
+	firstSeen, lastSeen, removed = readObservationTimestamps(t, db, "anchorix", cert.ID, agentID, "LocalMachine\\My")
+	// H-018: first_seen_at retreats to tOld.
+	if !firstSeen.Equal(tOld) {
+		t.Errorf("first_seen_at = %v after older batch; want %v (LEAST wins)", firstSeen, tOld)
+	}
+	// last_seen_at stays at tNew (older batch cannot retreat it).
+	if !lastSeen.Equal(tNew) {
+		t.Errorf("last_seen_at = %v after older batch; want %v (GREATEST wins)", lastSeen, tNew)
+	}
+	// removed_at remains NULL — older batch is not the newest
+	// thing for the row.
+	if removed != nil {
+		t.Errorf("removed_at = %v after older batch; want NULL", removed)
+	}
+
+	// friendly_name remains the newer batch's label — the CASE
+	// guard suppresses friendly_name updates from older batches.
+	obs, err := repo.ListObservationsForCertificate(ctx, "anchorix", cert.ID)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(obs) != 1 {
+		t.Fatalf("observation count = %d, want 1", len(obs))
+	}
+	if obs[0].FriendlyName != "Newer Label" {
+		t.Errorf("friendly_name = %q after older batch; want preserved %q (older cannot overwrite)",
+			obs[0].FriendlyName, "Newer Label")
 	}
 }
