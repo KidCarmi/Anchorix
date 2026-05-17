@@ -16,6 +16,52 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
 
 ## Open Items
 
+### H-019 — Certificate ingestion: audit-row amplification under sustained rejected batches
+
+- **Title:** `feat(inventory): rate-limit per-agent batch-rejection audit rows`
+- **Risk:** low-medium (operational + storage). The certificate
+  ingestion service writes one `agent.certificate_batch_rejected`
+  / `agent.certificate_batch_invalid` audit row per rejected
+  batch (severity:"security" for the private-key case). A
+  compromised or buggy agent credential that submits malformed
+  batches at the endpoint's request rate produces one audit row
+  per request, with no in-product cap. Over hours or days this
+  inflates the `audit_events` table and dilutes the security
+  signal the rows are supposed to carry — exactly the
+  alert-fatigue failure mode CLAUDE.md §9 is trying to avoid by
+  labelling these `severity:"security"`.
+- **Scope:** per-agent + per-action sliding-window suppression
+  inside `internal/inventory` (e.g. coalesce repeated rejections
+  for the same `(agent_id, action)` within N minutes into a
+  single audit row with `count` metadata; emit a fresh row when
+  the agent's behavior changes — rejection reason flips, or the
+  window expires). Storage layer requires no change. The first
+  rejection in a fresh window always audits — alerting is never
+  silenced for a new event class. Coalescing state may live in
+  the existing `audit_events` table (query the last N minutes
+  before inserting a new row) or in a small in-memory LRU on the
+  Service; pick whichever survives a control-plane restart
+  cleanly (CLAUDE.md §5.3 stateless preference).
+- **Recommended PR:** `feat(inventory): rate-limit per-agent
+  batch-rejection audit rows`.
+- **Reason not fixed now:** rate-limiting is explicitly out of
+  scope for the post-PR-026 hardening pass per the operator's
+  framing — the pass exists to catch correctness gaps, not to
+  add new operational surface. The current behavior is
+  documented (one audit per batch; rejections are bounded by the
+  agent's request rate, which is itself bounded by the bearer
+  credential's privileges); the v0.1 trust model
+  (CLAUDE.md §12) places agents inside the operator-trusted
+  network boundary, so unbounded audit rows from a single
+  credential indicate a compromised credential and are exactly
+  the signal we want operators to investigate. Promoting this
+  to a hard limit is a v0.x concern once rate-limiting
+  primitives exist control-plane-wide.
+- **References:** CLAUDE.md §9 (severity:"security" alerting);
+  `docs/engineering/CERTIFICATE_INVENTORY.md` §6 (audit
+  cardinality); `internal/inventory/service.go`
+  `recordBatchRejection` / `recordBatchInvalid`.
+
 ### H-016 — Certificate inventory: operator read API
 
 - **Title:** `feat(inventory): operator certificate read endpoints`
