@@ -16,6 +16,46 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
 
 ## Open Items
 
+### H-017 — Certificate ingestion: serial-per-agent transaction
+
+- **Title:** `feat(inventory): serialize certificate ingestion per agent`
+- **Risk:** medium (real correctness gap under concurrent
+  ingestion; low-impact in single-flight v0.1 deployments). The
+  H-014 storage layer's set-reconciliation primitive
+  (`MarkMissingObservationsRemoved`) is correct **per batch**:
+  the out-of-order `last_seen_at <= collectedAt` guard prevents
+  an older batch from overwriting a newer one's state. But two
+  batches arriving CONCURRENTLY for the same agent can race:
+  batch A's reconciliation can mark batch B's freshly-upserted
+  observation as `removed_at` before batch A's own
+  `UpsertObservation` calls land. The post-merge H-014 review
+  walked through this race and confirmed the storage layer
+  cannot solve it alone — the **caller** (H-015) must serialize
+  ingestion per agent (either an advisory lock on the
+  `agents.id` key, or a SERIALIZABLE-isolation transaction
+  wrapping the whole batch).
+- **Scope:** in H-015, wrap the entire ingestion flow
+  (`UpsertCertificate` × N, `UpsertObservation` × N,
+  `MarkMissingObservationsRemoved`) in a single transaction via
+  the `Transactor` pattern (already used by
+  `enrollment.Service`), AND take a `pg_advisory_xact_lock`
+  on the agent id at the top of the transaction. Two concurrent
+  batches for the same agent then queue rather than interleave.
+  Add an integration test that drives two concurrent
+  ingestion flows for the same agent and asserts the final
+  state matches a serial-execution outcome.
+- **Recommended PR:** ships with H-015 — the storage primitives
+  exist; the orchestration choice belongs in the ingestion
+  service.
+- **Reason not fixed now:** the storage layer correctly
+  surfaces the primitives. Serial-per-agent is an orchestration
+  concern; making the storage layer take advisory locks would
+  hide the requirement from H-015's contract.
+- **References:**
+  [`docs/engineering/CERTIFICATE_INVENTORY.md`](./CERTIFICATE_INVENTORY.md)
+  §5; H-014 post-merge hardening review notes (PR with this
+  entry); CLAUDE.md §8.10 (concurrency discipline).
+
 ### H-015 — Certificate inventory: agent ingestion endpoint
 
 - **Title:** `feat(inventory): agent certificate ingestion endpoint`

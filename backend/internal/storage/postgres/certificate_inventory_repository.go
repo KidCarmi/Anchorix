@@ -32,17 +32,27 @@ func NewCertificateInventoryRepository(db *DB) *CertificateInventoryRepository {
 }
 
 // UpsertCertificate inserts the cert if no row exists for
-// (organization_id, fingerprint_sha256); otherwise bumps the
-// existing row's last_seen_at to observedAt. The out-of-order
-// guard suppresses the bump when the stored last_seen_at is
-// already newer than observedAt.
+// (organization_id, fingerprint_sha256); otherwise merges
+// timestamps with the existing row.
 //
-// On conflict the EXISTING row's id is returned, not the caller's
-// freshly minted one. Callers MUST use the returned ID as
-// authoritative — feeding the caller's minted id back to
-// UpsertObservation would violate the composite FK on the next
-// upsert if the caller's id never made it into the certificates
-// table.
+// Timestamp semantics (H-018 fix):
+//
+//   - first_seen_at = LEAST(stored, incoming) — the EARLIEST
+//     observedAt across all batches wins, regardless of arrival
+//     order. An older batch arriving after a newer one
+//     correctly retreats first_seen_at to the true first
+//     observation.
+//   - last_seen_at = GREATEST(stored, incoming) — the LATEST
+//     observedAt wins. An older batch cannot retreat
+//     last_seen_at; a newer batch advances it.
+//
+// On conflict the EXISTING row's id is returned, not the
+// caller's freshly minted one. The repo re-reads the canonical
+// row after the upsert so the returned *Certificate carries the
+// stored subject/issuer/PEM/etc., not the caller's potentially
+// stale input — important for out-of-order arrival where the
+// caller's metadata may differ from the canonical bytes already
+// in the DB.
 func (r *CertificateInventoryRepository) UpsertCertificate(
 	ctx context.Context,
 	c *inventory.Certificate,
@@ -61,11 +71,12 @@ func (r *CertificateInventoryRepository) UpsertCertificate(
 		return nil, fmt.Errorf("postgres: marshal ext_key_usages: %w", err)
 	}
 
-	// The caller-supplied id is the candidate id for an INSERT. On
-	// conflict, EXCLUDED.id is the candidate; we deliberately do
-	// NOT overwrite the stored id during DO UPDATE — RETURNING
-	// gives back the existing row's id so the caller can use it
-	// for the subsequent observation upsert.
+	// The DO UPDATE clause runs unconditionally (no WHERE guard).
+	// LEAST/GREATEST express the per-column policy directly so
+	// out-of-order arrival cannot leave first_seen_at reflecting
+	// the order of *arrival* instead of the order of
+	// *observation* (the H-018 fix). RETURNING always emits a row
+	// — there is no longer an out-of-order fallback path.
 	const q = `
 		INSERT INTO certificates (
 			id, organization_id, fingerprint_sha256, subject, issuer,
@@ -81,57 +92,60 @@ func (r *CertificateInventoryRepository) UpsertCertificate(
 			$18, $18
 		)
 		ON CONFLICT (organization_id, fingerprint_sha256) DO UPDATE
-		   SET last_seen_at = EXCLUDED.last_seen_at
-		 WHERE certificates.last_seen_at <= EXCLUDED.last_seen_at
-		RETURNING id, first_seen_at, last_seen_at`
+		   SET first_seen_at = LEAST(certificates.first_seen_at, EXCLUDED.first_seen_at),
+		       last_seen_at  = GREATEST(certificates.last_seen_at, EXCLUDED.last_seen_at)
+		RETURNING id`
 
 	candidateID := strings.TrimSpace(c.ID)
 	if candidateID == "" {
 		candidateID = ids.New()
 	}
 
-	// Note: when the ON CONFLICT WHERE clause is FALSE (stored
-	// last_seen_at is newer than the incoming observedAt), the
-	// UPDATE is suppressed AND no row is returned by RETURNING.
-	// We then need to SELECT the existing row to give the caller a
-	// canonical *Certificate to operate on.
-	row := r.db.querierFor(ctx).QueryRow(ctx, q,
+	var gotID string
+	if err := r.db.querierFor(ctx).QueryRow(ctx, q,
 		candidateID, c.OrganizationID, c.FingerprintSHA256, c.Subject, c.Issuer,
 		c.SerialNumberHex, c.SignatureAlg, c.PublicKeyAlg,
 		c.PublicKeyBits, c.NotBefore, c.NotAfter, sans, keyUsages,
 		extKeyUsages, c.IsSelfSigned, c.IsCA, c.PEM,
 		observedAt,
-	)
-	var (
-		gotID                     string
-		gotFirstSeen, gotLastSeen time.Time
-	)
-	if err := row.Scan(&gotID, &gotFirstSeen, &gotLastSeen); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			// Out-of-order arrival: stored last_seen_at is newer than
-			// observedAt, so the UPDATE was suppressed. Read the
-			// existing row by (org, fingerprint) and hand it back.
-			existing, err := r.getCertificateByFingerprint(ctx, c.OrganizationID, c.FingerprintSHA256)
-			if err != nil {
-				return nil, err
-			}
-			return existing, nil
-		}
+	).Scan(&gotID); err != nil {
 		return nil, fmt.Errorf("postgres: upsert certificate: %w", err)
 	}
 
-	cp := *c
-	cp.ID = gotID
-	cp.FirstSeenAt = gotFirstSeen
-	cp.LastSeenAt = gotLastSeen
-	return &cp, nil
+	// Re-read the canonical row by id. The DO UPDATE only touched
+	// first_seen_at and last_seen_at, so on conflict the stored
+	// subject/issuer/PEM/etc. may differ from the caller's input
+	// (the stored row carries the bytes from the FIRST insert,
+	// which IS the canonical certificate for this fingerprint).
+	// Returning the canonical row keeps the contract honest.
+	return r.GetCertificate(ctx, c.OrganizationID, gotID)
 }
 
-// UpsertObservation creates or refreshes the observation row.
-// On conflict (the same observation already exists), the DO
-// UPDATE clause bumps last_seen_at and clears removed_at, but
-// only when the incoming observedAt is at least as new as the
-// stored last_seen_at. An older batch leaves the row untouched.
+// UpsertObservation creates or merges the observation row for
+// (organization_id, certificate_id, agent_id, store_location).
+//
+// Timestamp + state semantics (H-018 fix):
+//
+//   - first_seen_at = LEAST(stored, incoming). The EARLIEST
+//     observedAt across all batches wins; an older batch
+//     arriving after a newer batch correctly retreats
+//     first_seen_at to the true first observation.
+//   - last_seen_at = GREATEST(stored, incoming). The LATEST
+//     observedAt wins; older batches cannot retreat this.
+//   - removed_at: cleared only when the incoming batch is at
+//     least as new as the stored last_seen_at (i.e., this is the
+//     most recent thing for the row). An older batch arriving
+//     after a newer batch leaves removed_at untouched.
+//   - friendly_name: updated only when the incoming batch is at
+//     least as new as the stored last_seen_at AND the incoming
+//     value is non-empty (COALESCE + NULLIF idiom — matches the
+//     heartbeat handler's preservation pattern from PR-017).
+//
+// The unconditional DO UPDATE (no WHERE guard) ensures
+// first_seen_at gets merged for every conflict, including
+// out-of-order arrival where the older batch's
+// observedAt is smaller than the stored last_seen_at — exactly
+// the case the prior WHERE-guarded variant suppressed entirely.
 func (r *CertificateInventoryRepository) UpsertObservation(
 	ctx context.Context,
 	o *inventory.CertificateObservation,
@@ -149,10 +163,17 @@ func (r *CertificateInventoryRepository) UpsertObservation(
 		)
 		ON CONFLICT (organization_id, certificate_id, agent_id, store_location)
 		DO UPDATE
-		   SET last_seen_at = EXCLUDED.last_seen_at,
-		       friendly_name = EXCLUDED.friendly_name,
-		       removed_at = NULL
-		 WHERE certificate_observations.last_seen_at <= EXCLUDED.last_seen_at`
+		   SET first_seen_at = LEAST(certificate_observations.first_seen_at, EXCLUDED.first_seen_at),
+		       last_seen_at  = GREATEST(certificate_observations.last_seen_at, EXCLUDED.last_seen_at),
+		       removed_at = CASE
+		           WHEN EXCLUDED.last_seen_at >= certificate_observations.last_seen_at THEN NULL
+		           ELSE certificate_observations.removed_at
+		       END,
+		       friendly_name = CASE
+		           WHEN EXCLUDED.last_seen_at >= certificate_observations.last_seen_at
+		               THEN COALESCE(NULLIF(EXCLUDED.friendly_name, ''), certificate_observations.friendly_name)
+		           ELSE certificate_observations.friendly_name
+		       END`
 
 	candidateID := strings.TrimSpace(o.ID)
 	if candidateID == "" {
@@ -292,33 +313,6 @@ func (r *CertificateInventoryRepository) ListObservationsForCertificate(
 		return nil, fmt.Errorf("postgres: iterate observations: %w", err)
 	}
 	return out, nil
-}
-
-// getCertificateByFingerprint is an internal lookup used by the
-// out-of-order branch of UpsertCertificate when the ON CONFLICT
-// guard suppresses the DO UPDATE. The stored row is fully
-// canonical; we hand it back unchanged.
-func (r *CertificateInventoryRepository) getCertificateByFingerprint(
-	ctx context.Context,
-	organizationID, fingerprint string,
-) (*inventory.Certificate, error) {
-	const q = `
-		SELECT id, organization_id, fingerprint_sha256, subject, issuer,
-		       serial_number_hex, signature_algorithm, public_key_algorithm,
-		       public_key_bits, not_before, not_after, sans, key_usages,
-		       ext_key_usages, is_self_signed, is_ca, pem,
-		       first_seen_at, last_seen_at
-		  FROM certificates
-		 WHERE organization_id = $1 AND fingerprint_sha256 = $2`
-	row := r.db.querierFor(ctx).QueryRow(ctx, q, organizationID, fingerprint)
-	c, err := scanCertificate(row)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, inventory.ErrCertificateNotFound
-		}
-		return nil, fmt.Errorf("postgres: get certificate by fingerprint: %w", err)
-	}
-	return c, nil
 }
 
 func scanCertificate(row pgx.Row) (*inventory.Certificate, error) {
