@@ -4,6 +4,7 @@ package integration
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -952,5 +953,285 @@ func TestOperatorReadsEmitNoAuditRows(t *testing.T) {
 	}
 	if after != before {
 		t.Errorf("audit_events grew from %d to %d on read-only operator endpoints", before, after)
+	}
+}
+
+// --- post-merge hardening pass (H-020 review) ----------------------
+//
+// The four tests below pin properties that an adversarial review
+// surfaced as silent-correctness / silent-leak risks. Each fails
+// loudly if a future change regresses the documented behavior.
+
+// TestOperatorListCertificatesQFilterEscapesUnderscore proves the
+// `q` filter treats SQL LIKE metacharacters as LITERAL bytes, not
+// as wildcards. Without escaping, `?q=foo_bar` would match both
+// `foo_bar.example` (intended) and `fooXbar.example` (unintended —
+// `_` is the LIKE single-char wildcard). The fix escapes `_`, `%`,
+// and `\` and adds `ESCAPE '\'` to each ILIKE clause.
+func TestOperatorListCertificatesQFilterEscapesUnderscore(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	submitCertBatch(t, srv.URL, credential, ingestRequestDTO{
+		CollectedAt:   nowRFC3339(),
+		StoreCoverage: []string{`LocalMachine\My`},
+		Certificates: []ingestCertDTO{
+			// Intentional underscore in the subject.
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: generatedCert(t, "foo_bar.example")},
+			// Same length, no underscore — would falsely match
+			// `foo_bar` under unescaped LIKE.
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: generatedCert(t, "fooXbar.example")},
+		},
+	}, http.StatusOK)
+
+	var list certListDTO
+	operatorGetJSON(t, srv.URL, adminClient,
+		"/api/v1/certificates?q=foo_bar", http.StatusOK, &list)
+	if len(list.Items) != 1 {
+		subjects := make([]string, 0, len(list.Items))
+		for _, it := range list.Items {
+			subjects = append(subjects, it.Subject)
+		}
+		t.Fatalf("q=foo_bar items = %d, want 1 (got %v); `_` must be literal, not LIKE wildcard",
+			len(list.Items), subjects)
+	}
+	if list.Items[0].Subject != "CN=foo_bar.example" {
+		t.Errorf("matched subject = %q, want CN=foo_bar.example", list.Items[0].Subject)
+	}
+}
+
+// TestOperatorListCertificatesQFilterEscapesPercent proves the
+// same property for the `%` LIKE wildcard. The fixture is chosen
+// so the test exercises the buggy behavior, not just the fixed
+// one: `amazon.example` contains `a` followed (eventually) by `z`,
+// so under unescaped LIKE the wrapped pattern `%a%z%` matches it
+// — and the test would fail. With the fix, the wrapped pattern
+// is `%a\%z%` ESCAPE '\', which requires the literal byte
+// sequence `a%z` that the subject does not contain. The unrelated
+// `xyz.example` row is along for the ride as a negative-space
+// check that the query is not silently broken in some other way.
+func TestOperatorListCertificatesQFilterEscapesPercent(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	submitCertBatch(t, srv.URL, credential, ingestRequestDTO{
+		CollectedAt:   nowRFC3339(),
+		StoreCoverage: []string{`LocalMachine\My`},
+		Certificates: []ingestCertDTO{
+			// `amazon.example` is the trap: under unescaped LIKE
+			// the pattern `%a%z%` matches it (a, then anything,
+			// then z appears inside `amazon`); under the fix, the
+			// literal byte sequence `a%z` is required and is
+			// absent, so this cert MUST NOT appear in results.
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: generatedCert(t, "amazon.example")},
+			// Unrelated row that does not match either form.
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: generatedCert(t, "xyz.example")},
+		},
+	}, http.StatusOK)
+
+	// `?q=a%25z` is `?q=a%z` after URL-decoding. With `%` escaped
+	// at the SQL layer, this is a literal-byte search and matches
+	// nothing. Without the escape, the same query would match
+	// `amazon.example` (a wildcard z somewhere later) — that is
+	// the regression this test is here to catch.
+	var list certListDTO
+	operatorGetJSON(t, srv.URL, adminClient,
+		"/api/v1/certificates?q=a%25z", http.StatusOK, &list)
+	if len(list.Items) != 0 {
+		subjects := make([]string, 0, len(list.Items))
+		for _, it := range list.Items {
+			subjects = append(subjects, it.Subject)
+		}
+		t.Errorf("q=a%%z items = %d, want 0 (got %v); `%%` must be literal, not LIKE wildcard",
+			len(list.Items), subjects)
+	}
+}
+
+// TestOperatorListCertificatesQFilterEscapesBackslash completes the
+// escapeLikePattern coverage matrix. The function explicitly
+// supports `\` because the SQL clause uses `ESCAPE '\'`: without
+// doubling the user's literal backslash to `\\`, PG would
+// interpret the `\` as an escape-the-next-char prefix rather than
+// a literal byte to match.
+//
+// Subject DNs legitimately contain `\` in their RFC 4514
+// rendering — e.g., a CN with an embedded comma is rendered as
+// `CN=name\,with\,commas`. The generated-cert helper does not
+// reach that case, so the fixture is seeded directly via SQL
+// with a literal backslash in the subject and a fingerprint /
+// org / timestamps in the home org. The composite-FK schema is
+// not exercised here (no observation is needed — the cert list
+// uses `current_only=false` so a no-observation cert still
+// surfaces).
+func TestOperatorListCertificatesQFilterEscapesBackslash(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		// `CN=path\to\thing` contains two literal backslashes.
+		// PG `standard_conforming_strings=on` (default) treats
+		// the single-quoted string literally — no escape
+		// processing on the SQL side.
+		_, err := tx.Exec(ctx,
+			`INSERT INTO certificates
+				(id, organization_id, fingerprint_sha256, subject, issuer,
+				 serial_number_hex, signature_algorithm, public_key_algorithm,
+				 public_key_bits, not_before, not_after,
+				 sans, key_usages, ext_key_usages,
+				 is_self_signed, is_ca, pem, first_seen_at, last_seen_at)
+			 VALUES ('backslash-cert', 'anchorix', 'bs-fingerprint',
+				 'CN=path\to\thing', 'CN=ca',
+				 'bb', 'sha256-rsa', 'RSA',
+				 2048, now() - interval '1 hour', now() + interval '365 days',
+				 '[]', '[]', '[]',
+				 false, false, '-----BEGIN CERTIFICATE-----\nseed\n-----END CERTIFICATE-----\n',
+				 now(), now())`)
+		return err
+	}); err != nil {
+		t.Fatalf("seed backslash cert: %v", err)
+	}
+
+	// Query `?q=path\to` (URL-encoded `path%5Cto`).
+	//
+	// Post-fix behavior: escapeLikePattern doubles the `\` so the
+	// pattern becomes `%path\\to%` ESCAPE '\', and PG interprets
+	// `\\` as one literal backslash → matches `path\to` in the
+	// seeded subject.
+	//
+	// Pre-fix (or wrongly-escaped) behavior: the pattern would be
+	// `%path\to%`. PG's default LIKE escape is `\`, and `\t`
+	// where `t` is not a LIKE metacharacter strips the backslash,
+	// turning the effective pattern into `%pathto%` — which does
+	// NOT match `path\to`. The test would fire with 0 items
+	// returned.
+	var list certListDTO
+	operatorGetJSON(t, srv.URL, adminClient,
+		`/api/v1/certificates?q=path%5Cto&current_only=false`,
+		http.StatusOK, &list)
+	if len(list.Items) != 1 {
+		subjects := make([]string, 0, len(list.Items))
+		for _, it := range list.Items {
+			subjects = append(subjects, it.Subject)
+		}
+		t.Fatalf("q=path\\to items = %d, want 1 (got %v); `\\` must be a literal byte, not a LIKE escape prefix",
+			len(list.Items), subjects)
+	}
+	if list.Items[0].Subject != `CN=path\to\thing` {
+		t.Errorf("matched subject = %q, want CN=path\\to\\thing", list.Items[0].Subject)
+	}
+}
+
+// TestOperatorListCertificatesAgentIDFilterCrossOrgReturnsEmpty
+// hardens the org-scoping promise on the agent_id filter. A
+// foreign agent's id passed as `?agent_id=...` on /certificates
+// (as opposed to the path-bound /agents/{id}/certificates which
+// 404s on cross-org) returns 200 with an empty items list — the
+// foreign agent has no observations IN THE HOME ORG by
+// construction of the composite FK
+// `(observations.organization_id, agent_id) REFERENCES
+// agents(organization_id, id)`.
+func TestOperatorListCertificatesAgentIDFilterCrossOrgReturnsEmpty(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	// Seed a real cert in the home org so the list isn't empty
+	// for unrelated reasons.
+	submitOneCert(t, srv.URL, credential,
+		generatedCert(t, "home-cert.example"),
+		`LocalMachine\My`, "")
+
+	// Seed a foreign agent in a different org. There is no path
+	// in the product that produces a cert observation for this
+	// agent in the home org — the composite FK prevents it.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	const foreignAgentID = "foreign-agent-h020-hardening"
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO organizations (id, name) VALUES ('other-org', 'Other Org')`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx,
+			`INSERT INTO agents (id, organization_id, hostname, version, status, enrolled_at, last_seen_at)
+			 VALUES ($1, 'other-org', 'foreign-host', '', 'active', now(), now())`,
+			foreignAgentID)
+		return err
+	}); err != nil {
+		t.Fatalf("seed foreign agent: %v", err)
+	}
+
+	// Filter the home org's list by the foreign agent id. The
+	// expected response is 200 OK with an empty items array — the
+	// agent_id filter is a content filter, not an identity check,
+	// so it MUST not 404 here even though the agent does not
+	// exist in the caller's org.
+	var list certListDTO
+	operatorGetJSON(t, srv.URL, adminClient,
+		"/api/v1/certificates?agent_id="+foreignAgentID, http.StatusOK, &list)
+	if len(list.Items) != 0 {
+		t.Errorf("foreign agent_id filter items = %d, want 0; got %+v", len(list.Items), list.Items)
+	}
+}
+
+// TestOperatorListCertificatesCursorIsNotIdentity proves that an
+// opaque cursor is a comparison anchor, not an authentication
+// token. A cursor whose embedded id is a real cert in a DIFFERENT
+// org (or no real cert at all) must still produce a valid
+// home-org response — it cannot leak data from another org and it
+// cannot crash. This is the negative-space test for "cursor is
+// just an ordering offset".
+func TestOperatorListCertificatesCursorIsNotIdentity(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	// Two home-org certs so the list is non-trivial.
+	submitCertBatch(t, srv.URL, credential, ingestRequestDTO{
+		CollectedAt:   nowRFC3339(),
+		StoreCoverage: []string{`LocalMachine\My`},
+		Certificates: []ingestCertDTO{
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: generatedCert(t, "home-a.example")},
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: generatedCert(t, "home-b.example")},
+		},
+	}, http.StatusOK)
+
+	// Craft a cursor anchored to a far-future timestamp + a
+	// fabricated id. The decoder sees this as valid (RFC3339 ok,
+	// non-empty fields). The repository uses it as a comparison
+	// anchor: with future timestamp, the WHERE clause matches
+	// everything in the home org. Result: 200 OK, items present,
+	// no leak.
+	farFuture := time.Date(2099, 1, 1, 0, 0, 0, 0, time.UTC).Format(time.RFC3339Nano)
+	rawCursor := farFuture + "|fabricated-cross-org-id-bytes"
+	cursor := base64.RawURLEncoding.EncodeToString([]byte(rawCursor))
+
+	var list certListDTO
+	operatorGetJSON(t, srv.URL, adminClient,
+		"/api/v1/certificates?cursor="+cursor+"&current_only=false", http.StatusOK, &list)
+	// The home org has 2 certs; both should be returned because
+	// every home cert has a last_seen_at strictly less than the
+	// year-2099 anchor.
+	if len(list.Items) != 2 {
+		t.Errorf("fabricated cursor items = %d, want 2 (both home-org certs)", len(list.Items))
+	}
+	for _, it := range list.Items {
+		if !strings.HasPrefix(it.Subject, "CN=home-") {
+			t.Errorf("foreign-looking subject in list: %q", it.Subject)
+		}
 	}
 }

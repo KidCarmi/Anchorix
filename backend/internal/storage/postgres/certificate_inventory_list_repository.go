@@ -39,10 +39,20 @@ func (r *CertificateInventoryRepository) ListCertificates(
 	conditions = append(conditions, "c.organization_id = $1")
 
 	if q.Search != "" {
-		args = append(args, "%"+q.Search+"%")
+		// Escape PostgreSQL LIKE metacharacters (`%`, `_`, `\`) in
+		// the user-supplied value before wrapping with `%...%`.
+		// Without this, `?q=foo_bar` matches `foo_bar.example`
+		// (intended) AND `fooXbar.example` (unintended — `_` is
+		// the single-char LIKE wildcard), and `?q=10%` matches
+		// every row containing `10` followed by anything. The
+		// ESCAPE clause below tells PostgreSQL `\` is the escape
+		// byte for these patterns. The pattern column type stays
+		// implicit text — pgx binds the Go string as text and
+		// PostgreSQL coerces it for each ILIKE in the disjunction.
+		args = append(args, "%"+escapeLikePattern(q.Search)+"%")
 		idx := len(args)
 		conditions = append(conditions, fmt.Sprintf(
-			"(c.subject ILIKE $%d OR c.issuer ILIKE $%d OR c.fingerprint_sha256 ILIKE $%d OR c.sans::text ILIKE $%d)",
+			"(c.subject ILIKE $%d ESCAPE '\\' OR c.issuer ILIKE $%d ESCAPE '\\' OR c.fingerprint_sha256 ILIKE $%d ESCAPE '\\' OR c.sans::text ILIKE $%d ESCAPE '\\')",
 			idx, idx, idx, idx,
 		))
 	}
@@ -293,4 +303,37 @@ func (r *CertificateInventoryRepository) AgentExistsInOrg(
 		return false, fmt.Errorf("postgres: agent existence check: %w", err)
 	}
 	return exists, nil
+}
+
+// escapeLikePattern escapes PostgreSQL LIKE / ILIKE metacharacters
+// in a user-supplied substring so the value matches literally
+// inside the `%...%` wrap. The caller MUST set `ESCAPE '\'` on the
+// corresponding ILIKE clause; otherwise the prefixed backslashes
+// are treated as literals and the escapes do nothing.
+//
+// The three metacharacters PostgreSQL recognizes for LIKE are:
+//
+//   - `%` matches any sequence (including empty)
+//   - `_` matches exactly one character
+//   - `\` is the default escape byte; doubling it keeps the
+//     literal backslash from triggering the escape mechanism for
+//     the character after it.
+//
+// Without this escape, `?q=foo_bar` matches `foo_bar` AND
+// `fooXbar` because `_` is a wildcard, and `?q=10%` matches
+// anything containing `10` because `%` is a wildcard.
+func escapeLikePattern(s string) string {
+	if !strings.ContainsAny(s, `%_\`) {
+		return s
+	}
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch r {
+		case '\\', '%', '_':
+			b.WriteByte('\\')
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
