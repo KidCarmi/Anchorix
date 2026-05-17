@@ -14,6 +14,7 @@ import (
 	"github.com/kidcarmi/anchorix/backend/internal/auth"
 	"github.com/kidcarmi/anchorix/backend/internal/config"
 	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
+	"github.com/kidcarmi/anchorix/backend/internal/inventory"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
 )
 
@@ -48,6 +49,7 @@ func testRouter(t *testing.T, register func(*Readiness)) http.Handler {
 		CookieSigner:          signer,
 		EnrollmentService:     &enrollment.Service{},
 		AgentInventoryService: &agentinventory.Service{},
+		InventoryService:      &inventory.Service{},
 	}
 	return newRouter(cfg, log, r, deps)
 }

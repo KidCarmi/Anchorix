@@ -77,39 +77,48 @@ type CertificateObservation struct {
 	RemovedAt      *time.Time `json:"removed_at,omitempty"`
 }
 
-// InventoryBatch is the agent → control-plane upload for a single inventory
-// run. The control plane MUST reject any batch that includes a private key
-// field, even one that is empty (CLAUDE.md §6.2).
-type InventoryBatch struct {
-	AgentID      string                  `json:"agent_id"`
-	Hostname     string                  `json:"hostname"`
-	CollectedAt  time.Time               `json:"collected_at"`
-	Certificates []DiscoveredCertificate `json:"certificates"`
+// IngestionInput is the validated input to Service.Submit. The HTTP
+// handler is responsible for:
+//
+//   - decoding the wire request body and enforcing byte/count caps
+//     (per CERTIFICATE_INVENTORY.md §4 size limits) BEFORE calling
+//     the service,
+//   - populating OrganizationID and AgentID from AgentFromContext
+//     (NEVER from the request body — the agent cannot ingest as
+//     another agent),
+//   - leaving semantic validation (private key detection, PEM
+//     parsing, store_coverage / duplicate checks) to the service.
+type IngestionInput struct {
+	OrganizationID string
+	AgentID        string
+	CollectedAt    time.Time
+	StoreCoverage  []string
+	Certificates   []IngestionCertificate
 }
 
-// DiscoveredCertificate is the wire format for a single certificate as
-// reported by an agent. It is named for the agent's perspective — the agent
-// discovered it in a certificate store — and carries only non-secret metadata
-// plus the public certificate PEM.
-type DiscoveredCertificate struct {
-	StoreLocation     string    `json:"store_location"`
-	FriendlyName      string    `json:"friendly_name,omitempty"`
-	FingerprintSHA256 string    `json:"fingerprint_sha256"`
-	Subject           string    `json:"subject"`
-	Issuer            string    `json:"issuer"`
-	SerialNumberHex   string    `json:"serial_number_hex"`
-	SignatureAlg      string    `json:"signature_algorithm"`
-	PublicKeyAlg      string    `json:"public_key_algorithm"`
-	PublicKeyBits     int       `json:"public_key_bits"`
-	NotBefore         time.Time `json:"not_before"`
-	NotAfter          time.Time `json:"not_after"`
-	SANs              []string  `json:"sans"`
-	KeyUsages         []string  `json:"key_usages"`
-	ExtKeyUsages      []string  `json:"ext_key_usages"`
-	IsSelfSigned      bool      `json:"is_self_signed"`
-	IsCA              bool      `json:"is_ca"`
-	// CertificatePEM is the base64-encoded PEM of the public certificate.
-	// The control plane parses and verifies fields against this PEM.
-	// PRIVATE KEY MATERIAL IS REJECTED.
-	CertificatePEM string `json:"certificate_pem"`
+// IngestionCertificate is a single agent-reported observation, in
+// the post-validation shape Service.Submit consumes. The server
+// parses CertificatePEM authoritatively — fingerprint, subject,
+// issuer, etc. are NEVER trusted from any wire-side struct.
+type IngestionCertificate struct {
+	StoreLocation  string
+	FriendlyName   string
+	CertificatePEM string
+}
+
+// IngestionOutput is what Service.Submit returns on success. The
+// HTTP handler echoes the counters back to the agent so it can
+// log the per-batch acceptance / reconciliation totals without
+// having to re-derive them.
+type IngestionOutput struct {
+	// Accepted is the number of (cert, store) observations
+	// successfully upserted (deduplicated by fingerprint at the
+	// certificates table; one row per (agent, cert, store) at the
+	// observations table).
+	Accepted int
+	// ReconciledAbsent is the number of pre-existing observations
+	// in the declared store_coverage that the batch did NOT
+	// include, and that consequently transitioned to removed_at
+	// in this submission.
+	ReconciledAbsent int
 }
