@@ -1,6 +1,7 @@
 package inventory
 
 import (
+	"bytes"
 	"crypto/dsa" //nolint:staticcheck // legacy CAs still issue DSA certs we need to inventory
 	"crypto/ecdsa"
 	"crypto/ed25519"
@@ -100,6 +101,29 @@ const MaxParsedSANCount = 1024
 //     cert's DER, so the stored PEM is byte-identical across
 //     differently-formatted inputs.
 //
+// Input contract (post-merge hardening): rawPEM MUST contain
+// exactly ONE PEM block, of type CERTIFICATE, surrounded only by
+// optional whitespace. Specifically rejected:
+//
+//   - empty input or whitespace-only input;
+//   - input where pem.Decode finds NO block at all;
+//   - input where the (first) block is not type CERTIFICATE
+//     (CSRs, certificate-request blocks, etc.);
+//   - input with any non-whitespace bytes BEFORE the BEGIN line
+//     (some agent serializers emit metadata preamble — we want
+//     clean canonical PEM only);
+//   - input with any non-whitespace bytes AFTER the END line,
+//     including a SECOND PEM block of any type. Cert chains
+//     (leaf + intermediate concatenated in one entry) are the
+//     real-world case this guards against — each entry in the
+//     batch's certificates array MUST be exactly one cert; chain
+//     entries belong in separate array entries.
+//
+// All rejections collapse to errMalformedPEM, which the caller
+// wraps in ErrInvalidCertificate for the wire envelope
+// (CLAUDE.md §6 deterministic auth — no enumeration via error
+// code).
+//
 // Returns ErrInvalidCertificate (wrapped) on parse failure. Does
 // NOT detect private-key material — that's containsPrivateKeyMarker's
 // job and the caller runs it BEFORE this function (so we never
@@ -109,27 +133,38 @@ func parseAndCanonicalize(rawPEM string) (*parsedCertificate, error) {
 		return nil, fmt.Errorf("%w: empty PEM", errMalformedPEM)
 	}
 
-	// pem.Decode handles one block. We require the FIRST block to
-	// be a CERTIFICATE; trailing bytes (other blocks, garbage,
-	// trailing whitespace) are tolerated because some agent
-	// serializers concatenate the leaf with an intermediate. The
-	// design treats each batch entry as ONE cert; we take the
-	// first CERTIFICATE block and ignore the rest.
-	rest := []byte(rawPEM)
-	var block *pem.Block
-	for {
-		block, rest = pem.Decode(rest)
-		if block == nil {
-			return nil, fmt.Errorf("%w: no CERTIFICATE block found", errMalformedPEM)
-		}
-		if block.Type == "CERTIFICATE" {
-			break
-		}
-		// Skip non-CERTIFICATE blocks (e.g., a stray "CERTIFICATE
-		// REQUEST" or "ATTRIBUTE CERTIFICATE") and try the next
-		// block. We do NOT honor private-key blocks — the caller
-		// rejects the entire batch BEFORE calling this function if
-		// any input string contains a private-key marker.
+	// Reject any non-whitespace content BEFORE the BEGIN line.
+	// pem.Decode silently skips arbitrary preamble; we don't want
+	// that — agents must send clean canonical PEM. The cheapest
+	// check: after trimming leading whitespace, the input must
+	// start with the BEGIN-CERTIFICATE marker.
+	trimmed := strings.TrimLeft(rawPEM, " \t\r\n")
+	const beginMarker = "-----BEGIN CERTIFICATE-----"
+	if !strings.HasPrefix(trimmed, beginMarker) {
+		return nil, fmt.Errorf("%w: input must start with %s (only whitespace allowed before)",
+			errMalformedPEM, beginMarker)
+	}
+
+	block, rest := pem.Decode([]byte(rawPEM))
+	if block == nil {
+		return nil, fmt.Errorf("%w: no PEM block found", errMalformedPEM)
+	}
+	if block.Type != "CERTIFICATE" {
+		// Defensive: HasPrefix above should have caught this
+		// already, but pem.Decode allows leading whitespace inside
+		// the BEGIN line region in some edge encodings. Belt + braces.
+		return nil, fmt.Errorf("%w: PEM block type %q is not CERTIFICATE",
+			errMalformedPEM, block.Type)
+	}
+
+	// Reject any non-whitespace content AFTER the END line. This
+	// includes a second PEM block of ANY type (cert chains, CSRs,
+	// stray private-key markers that the upstream scan would have
+	// caught anyway). Agents that legitimately want to report
+	// multiple certs put them in separate certificates[] entries.
+	if len(bytes.TrimSpace(rest)) > 0 {
+		return nil, fmt.Errorf("%w: trailing content after CERTIFICATE block (only whitespace allowed; additional certificates must be sent as separate batch entries)",
+			errMalformedPEM)
 	}
 
 	cert, err := x509.ParseCertificate(block.Bytes)

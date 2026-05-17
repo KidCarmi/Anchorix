@@ -663,6 +663,207 @@ func TestAgentCertificatesRejectsUnparseablePEM(t *testing.T) {
 	}
 }
 
+// --- PEM input-contract strictness ---------------------------------
+//
+// The parser is the trust boundary between the agent's local PEM
+// serializer (any whitespace habit, any number of blocks) and the
+// control plane's canonical PEM column. The four tests below pin
+// the post-PR-026 hardening contract: exactly one CERTIFICATE block
+// per entry, surrounded only by whitespace. Each test exercises a
+// distinct adversarial / malformed path the parser silently accepted
+// before the hardening pass.
+
+// TestAgentCertificatesRejectsMultiCertChain asserts that a single
+// certificates[] entry containing leaf+intermediate concatenated PEM
+// is rejected, not silently truncated to the first block. Agents
+// that legitimately want to report multiple certs must put each in
+// its own array entry — the per-entry parser refuses to guess which
+// cert to keep.
+func TestAgentCertificatesRejectsMultiCertChain(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	leaf := generatedCert(t, "leaf.example")
+	intermediate := generatedCert(t, "intermediate.example")
+	chain := leaf + intermediate
+
+	raw, _ := json.Marshal(ingestRequestDTO{
+		CollectedAt:   nowRFC3339(),
+		StoreCoverage: []string{`LocalMachine\My`},
+		Certificates: []ingestCertDTO{
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: chain},
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/agent/certificates", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+credential)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, body)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "certificate_unparseable") {
+		t.Errorf("envelope did not contain certificate_unparseable; body=%s", body)
+	}
+
+	// And critically: NO cert row was stored. A silent truncation
+	// bug would have inserted exactly the leaf — the assertion below
+	// makes regressions visible.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var certRows int
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM certificates`).Scan(&certRows)
+	}); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if certRows != 0 {
+		t.Errorf("certificates rows = %d, want 0 (chain entry must be wholly rejected, not partially stored)", certRows)
+	}
+}
+
+// TestAgentCertificatesRejectsNonCertificatePEM asserts the parser
+// refuses a PEM block whose type is anything other than CERTIFICATE
+// (CSR, PUBLIC KEY, etc.). Before the hardening pass, the parser
+// looped past non-CERTIFICATE blocks silently — a CSR followed by a
+// real cert would have been accepted with the CSR thrown away.
+func TestAgentCertificatesRejectsNonCertificatePEM(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	// A syntactically valid CERTIFICATE REQUEST PEM. The base64
+	// payload is just placeholder bytes — pem.Decode only looks at
+	// the markers, and the parser must reject on the block type
+	// before x509 parsing runs.
+	csr := "-----BEGIN CERTIFICATE REQUEST-----\nbm90LWEtcmVhbC1jc3I=\n-----END CERTIFICATE REQUEST-----\n"
+
+	raw, _ := json.Marshal(ingestRequestDTO{
+		CollectedAt:   nowRFC3339(),
+		StoreCoverage: []string{`LocalMachine\My`},
+		Certificates: []ingestCertDTO{
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: csr},
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/agent/certificates", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+credential)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, body)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "certificate_unparseable") {
+		t.Errorf("envelope did not contain certificate_unparseable; body=%s", body)
+	}
+}
+
+// TestAgentCertificatesRejectsTrailingGarbageAfterPEM asserts that
+// non-whitespace bytes after the END CERTIFICATE line cause the
+// whole entry to be rejected. encoding/pem.Decode returns the
+// trailing remainder in `rest`; the previous parser ignored it,
+// allowing an attacker (or a buggy serializer) to attach arbitrary
+// content the control plane never saw.
+func TestAgentCertificatesRejectsTrailingGarbageAfterPEM(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	good := generatedCert(t, "good-trailing.example")
+	// Append non-whitespace garbage AFTER the END CERTIFICATE line.
+	// Deliberately not a private-key marker (that would be caught by
+	// the upstream containsPrivateKeyMarker scan, not by the parser),
+	// and not a second CERTIFICATE block (that's the chain test). A
+	// plain text suffix is the minimum case we care about.
+	withGarbage := good + "trailing-non-whitespace-content\n"
+
+	raw, _ := json.Marshal(ingestRequestDTO{
+		CollectedAt:   nowRFC3339(),
+		StoreCoverage: []string{`LocalMachine\My`},
+		Certificates: []ingestCertDTO{
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: withGarbage},
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/agent/certificates", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+credential)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, body)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "certificate_unparseable") {
+		t.Errorf("envelope did not contain certificate_unparseable; body=%s", body)
+	}
+}
+
+// TestAgentCertificatesRejectsLeadingGarbageBeforePEM asserts that
+// non-whitespace bytes BEFORE the BEGIN CERTIFICATE line cause the
+// entry to be rejected. encoding/pem.Decode silently skips any
+// preamble before the first PEM marker; that's by design in the
+// stdlib but wrong for an ingestion endpoint where the wire shape
+// is supposed to be exactly one cert per entry.
+func TestAgentCertificatesRejectsLeadingGarbageBeforePEM(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	good := generatedCert(t, "good-leading.example")
+	// Prepend non-whitespace garbage BEFORE the BEGIN CERTIFICATE
+	// line. Leading whitespace (\n, spaces, tabs, CRLF) is and
+	// remains TOLERATED — TestAgentCertificatesNormalizationConsistency
+	// pins that case.
+	withGarbage := "leading-non-whitespace-content\n" + good
+
+	raw, _ := json.Marshal(ingestRequestDTO{
+		CollectedAt:   nowRFC3339(),
+		StoreCoverage: []string{`LocalMachine\My`},
+		Certificates: []ingestCertDTO{
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: withGarbage},
+		},
+	})
+	req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/agent/certificates", bytes.NewReader(raw))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+credential)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("submit: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusBadRequest {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("status = %d, want 400; body=%s", resp.StatusCode, body)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "certificate_unparseable") {
+		t.Errorf("envelope did not contain certificate_unparseable; body=%s", body)
+	}
+}
+
 // --- malformed JSON / trailing garbage -----------------------------
 
 func TestAgentCertificatesRejectsMalformedJSON(t *testing.T) {
