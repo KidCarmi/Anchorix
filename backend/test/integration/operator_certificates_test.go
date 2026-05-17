@@ -1053,6 +1053,84 @@ func TestOperatorListCertificatesQFilterEscapesPercent(t *testing.T) {
 	}
 }
 
+// TestOperatorListCertificatesQFilterEscapesBackslash completes the
+// escapeLikePattern coverage matrix. The function explicitly
+// supports `\` because the SQL clause uses `ESCAPE '\'`: without
+// doubling the user's literal backslash to `\\`, PG would
+// interpret the `\` as an escape-the-next-char prefix rather than
+// a literal byte to match.
+//
+// Subject DNs legitimately contain `\` in their RFC 4514
+// rendering — e.g., a CN with an embedded comma is rendered as
+// `CN=name\,with\,commas`. The generated-cert helper does not
+// reach that case, so the fixture is seeded directly via SQL
+// with a literal backslash in the subject and a fingerprint /
+// org / timestamps in the home org. The composite-FK schema is
+// not exercised here (no observation is needed — the cert list
+// uses `current_only=false` so a no-observation cert still
+// surfaces).
+func TestOperatorListCertificatesQFilterEscapesBackslash(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		// `CN=path\to\thing` contains two literal backslashes.
+		// PG `standard_conforming_strings=on` (default) treats
+		// the single-quoted string literally — no escape
+		// processing on the SQL side.
+		_, err := tx.Exec(ctx,
+			`INSERT INTO certificates
+				(id, organization_id, fingerprint_sha256, subject, issuer,
+				 serial_number_hex, signature_algorithm, public_key_algorithm,
+				 public_key_bits, not_before, not_after,
+				 sans, key_usages, ext_key_usages,
+				 is_self_signed, is_ca, pem, first_seen_at, last_seen_at)
+			 VALUES ('backslash-cert', 'anchorix', 'bs-fingerprint',
+				 'CN=path\to\thing', 'CN=ca',
+				 'bb', 'sha256-rsa', 'RSA',
+				 2048, now() - interval '1 hour', now() + interval '365 days',
+				 '[]', '[]', '[]',
+				 false, false, '-----BEGIN CERTIFICATE-----\nseed\n-----END CERTIFICATE-----\n',
+				 now(), now())`)
+		return err
+	}); err != nil {
+		t.Fatalf("seed backslash cert: %v", err)
+	}
+
+	// Query `?q=path\to` (URL-encoded `path%5Cto`).
+	//
+	// Post-fix behavior: escapeLikePattern doubles the `\` so the
+	// pattern becomes `%path\\to%` ESCAPE '\', and PG interprets
+	// `\\` as one literal backslash → matches `path\to` in the
+	// seeded subject.
+	//
+	// Pre-fix (or wrongly-escaped) behavior: the pattern would be
+	// `%path\to%`. PG's default LIKE escape is `\`, and `\t`
+	// where `t` is not a LIKE metacharacter strips the backslash,
+	// turning the effective pattern into `%pathto%` — which does
+	// NOT match `path\to`. The test would fire with 0 items
+	// returned.
+	var list certListDTO
+	operatorGetJSON(t, srv.URL, adminClient,
+		`/api/v1/certificates?q=path%5Cto&current_only=false`,
+		http.StatusOK, &list)
+	if len(list.Items) != 1 {
+		subjects := make([]string, 0, len(list.Items))
+		for _, it := range list.Items {
+			subjects = append(subjects, it.Subject)
+		}
+		t.Fatalf("q=path\\to items = %d, want 1 (got %v); `\\` must be a literal byte, not a LIKE escape prefix",
+			len(list.Items), subjects)
+	}
+	if list.Items[0].Subject != `CN=path\to\thing` {
+		t.Errorf("matched subject = %q, want CN=path\\to\\thing", list.Items[0].Subject)
+	}
+}
+
 // TestOperatorListCertificatesAgentIDFilterCrossOrgReturnsEmpty
 // hardens the org-scoping promise on the agent_id filter. A
 // foreign agent's id passed as `?agent_id=...` on /certificates
