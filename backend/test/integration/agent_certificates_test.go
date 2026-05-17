@@ -9,8 +9,10 @@ import (
 	"crypto/elliptic"
 	cryptorand "crypto/rand"
 	"crypto/rsa"
+	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"fmt"
@@ -337,85 +339,207 @@ func TestAgentCertificatesConcurrentBatchSafety(t *testing.T) {
 	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
 	agentID, credential := enrolledAgent(t, srv.URL, adminClient)
 
-	// Two batches submitted concurrently. Each batch reports a
-	// different cert. Without the per-agent advisory lock, batch
-	// A's reconciliation could mark batch B's freshly-upserted
-	// observation as removed (the H-017 race). With the lock,
-	// they serialize → the final state has at least the most-
-	// recent batch's cert active, and the absolute floor is 1
-	// active observation.
-	certA := generatedCert(t, "concurrent-a")
-	certB := generatedCert(t, "concurrent-b")
+	// Two batches submitted concurrently for the SAME agent. Each
+	// reports a distinct cert with the same store_coverage =
+	// [LocalMachine\My]. The advisory lock MUST serialize them.
+	//
+	// A correct serial execution produces ONE of TWO equivalent
+	// outcomes (order-dependent, but otherwise identical):
+	//
+	//   A-then-B:
+	//     1. A inserts certA, upserts observation (active).
+	//     2. A reconciles store=My, observed=[certA]: no other
+	//        observations → no-op.
+	//     3. B inserts certB, upserts observation (active).
+	//     4. B reconciles store=My, observed=[certB]: sees certA
+	//        not in observed → marks certA removed_at = B.collected_at.
+	//     Final: certB active, certA removed.
+	//
+	//   B-then-A: symmetric → certA active, certB removed.
+	//
+	// Either way the post-condition is identical:
+	//
+	//   - Total observations: exactly 2 (no rows lost).
+	//   - Active observations: exactly 1 (the second batch's cert).
+	//   - Removed observations: exactly 1 with removed_at set
+	//     (the first batch's cert).
+	//
+	// A BROKEN interleaving (no advisory lock) can produce:
+	//
+	//   - 0 active observations (both certs reconciled out by each
+	//     other's MarkMissing) — the original H-017 race.
+	//   - 2 active observations (neither reconciliation saw the
+	//     other's row) — possible if the upserts interleaved
+	//     between each transaction's reconcile step.
+	//
+	// We iterate the concurrent race (each iteration on a fresh
+	// agent, so the per-agent advisory lock starts each round at
+	// the clean state) to make the test a reliable regression
+	// detector. Without the lock the race manifests roughly 30%
+	// per attempt under our local test conditions; iterating
+	// 10× drops the false-pass probability to ~3% per CI run
+	// while running in well under 10 seconds. With the lock,
+	// every iteration must pass deterministically.
+	const concurrencyIterations = 10
+	for iter := 0; iter < concurrencyIterations; iter++ {
+		// Fresh agent per iteration so each starts from empty
+		// observations and the per-agent advisory lock applies
+		// to its own clean state.
+		iterAgentID, iterCred := enrolledAgent(t, srv.URL, adminClient)
+		certA := generatedCert(t, fmt.Sprintf("concurrent-a-%d", iter))
+		certB := generatedCert(t, fmt.Sprintf("concurrent-b-%d", iter))
 
-	var wg sync.WaitGroup
-	var aOK, bOK int32
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		raw, _ := json.Marshal(ingestRequestDTO{
-			CollectedAt:   nowRFC3339(),
-			StoreCoverage: []string{`LocalMachine\My`},
-			Certificates: []ingestCertDTO{
-				{StoreLocation: `LocalMachine\My`, CertificatePEM: certA},
-			},
-		})
-		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/agent/certificates", bytes.NewReader(raw))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+credential)
-		resp, _ := http.DefaultClient.Do(req)
-		if resp != nil && resp.StatusCode == http.StatusOK {
-			atomic.AddInt32(&aOK, 1)
-		}
-		if resp != nil {
-			resp.Body.Close()
-		}
-	}()
-	go func() {
-		defer wg.Done()
-		raw, _ := json.Marshal(ingestRequestDTO{
-			CollectedAt:   nowRFC3339(),
-			StoreCoverage: []string{`LocalMachine\My`},
-			Certificates: []ingestCertDTO{
-				{StoreLocation: `LocalMachine\My`, CertificatePEM: certB},
-			},
-		})
-		req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/agent/certificates", bytes.NewReader(raw))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("Authorization", "Bearer "+credential)
-		resp, _ := http.DefaultClient.Do(req)
-		if resp != nil && resp.StatusCode == http.StatusOK {
-			atomic.AddInt32(&bOK, 1)
-		}
-		if resp != nil {
-			resp.Body.Close()
-		}
-	}()
-	wg.Wait()
+		var wg sync.WaitGroup
+		var aOK, bOK int32
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			raw, _ := json.Marshal(ingestRequestDTO{
+				CollectedAt:   nowRFC3339(),
+				StoreCoverage: []string{`LocalMachine\My`},
+				Certificates: []ingestCertDTO{
+					{StoreLocation: `LocalMachine\My`, CertificatePEM: certA},
+				},
+			})
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/agent/certificates", bytes.NewReader(raw))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+iterCred)
+			resp, _ := http.DefaultClient.Do(req)
+			if resp != nil && resp.StatusCode == http.StatusOK {
+				atomic.AddInt32(&aOK, 1)
+			}
+			if resp != nil {
+				resp.Body.Close()
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			raw, _ := json.Marshal(ingestRequestDTO{
+				CollectedAt:   nowRFC3339(),
+				StoreCoverage: []string{`LocalMachine\My`},
+				Certificates: []ingestCertDTO{
+					{StoreLocation: `LocalMachine\My`, CertificatePEM: certB},
+				},
+			})
+			req, _ := http.NewRequest(http.MethodPost, srv.URL+"/api/v1/agent/certificates", bytes.NewReader(raw))
+			req.Header.Set("Content-Type", "application/json")
+			req.Header.Set("Authorization", "Bearer "+iterCred)
+			resp, _ := http.DefaultClient.Do(req)
+			if resp != nil && resp.StatusCode == http.StatusOK {
+				atomic.AddInt32(&bOK, 1)
+			}
+			if resp != nil {
+				resp.Body.Close()
+			}
+		}()
+		wg.Wait()
 
-	if aOK == 0 || bOK == 0 {
-		t.Fatalf("both batches should succeed; aOK=%d bOK=%d", aOK, bOK)
+		if aOK == 0 || bOK == 0 {
+			t.Fatalf("iter %d: both batches should succeed; aOK=%d bOK=%d", iter, aOK, bOK)
+		}
+
+		// Strict serial-equivalence assertions: count totals,
+		// count active vs removed, and verify the row identities
+		// map cleanly to one of the two valid serial outcomes.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		var totalRows, activeCount, removedCount int
+		if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+			if err := tx.QueryRow(ctx,
+				`SELECT COUNT(*) FROM certificate_observations
+				  WHERE agent_id = $1 AND store_location = $2`,
+				iterAgentID, `LocalMachine\My`).Scan(&totalRows); err != nil {
+				return err
+			}
+			if err := tx.QueryRow(ctx,
+				`SELECT COUNT(*) FROM certificate_observations
+				  WHERE agent_id = $1 AND store_location = $2 AND removed_at IS NULL`,
+				iterAgentID, `LocalMachine\My`).Scan(&activeCount); err != nil {
+				return err
+			}
+			return tx.QueryRow(ctx,
+				`SELECT COUNT(*) FROM certificate_observations
+				  WHERE agent_id = $1 AND store_location = $2 AND removed_at IS NOT NULL`,
+				iterAgentID, `LocalMachine\My`).Scan(&removedCount)
+		}); err != nil {
+			cancel()
+			t.Fatalf("iter %d: read: %v", iter, err)
+		}
+		if totalRows != 2 {
+			cancel()
+			t.Fatalf("iter %d: total observation rows = %d, want 2 (one per cert; serial execution preserves both rows)", iter, totalRows)
+		}
+		if activeCount != 1 {
+			cancel()
+			t.Fatalf("iter %d: active observation count = %d, want exactly 1 (serial execution leaves the SECOND batch's cert active; %d active observations proves a corrupted interleaving)", iter, activeCount, activeCount)
+		}
+		if removedCount != 1 {
+			cancel()
+			t.Fatalf("iter %d: removed observation count = %d, want exactly 1 (serial execution marks the FIRST batch's cert as removed; %d removed proves both batches reconciled each other out)", iter, removedCount, removedCount)
+		}
+
+		// The active observation must be exactly one of certA or
+		// certB (by fingerprint). Map the canonical PEMs through
+		// the same SHA-256(cert.Raw) the server uses so the test
+		// does not need access to the server's internal
+		// fingerprint logic.
+		certAFP := fingerprintOf(t, certA)
+		certBFP := fingerprintOf(t, certB)
+		var activeFP, removedFP string
+		if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+			if err := tx.QueryRow(ctx,
+				`SELECT c.fingerprint_sha256
+				   FROM certificate_observations o
+				   JOIN certificates c ON c.id = o.certificate_id
+				  WHERE o.agent_id = $1 AND o.store_location = $2 AND o.removed_at IS NULL`,
+				iterAgentID, `LocalMachine\My`).Scan(&activeFP); err != nil {
+				return err
+			}
+			return tx.QueryRow(ctx,
+				`SELECT c.fingerprint_sha256
+				   FROM certificate_observations o
+				   JOIN certificates c ON c.id = o.certificate_id
+				  WHERE o.agent_id = $1 AND o.store_location = $2 AND o.removed_at IS NOT NULL`,
+				iterAgentID, `LocalMachine\My`).Scan(&removedFP)
+		}); err != nil {
+			cancel()
+			t.Fatalf("iter %d: read fingerprints: %v", iter, err)
+		}
+		cancel()
+
+		// One serial outcome: certA active + certB removed.
+		// The other:        certB active + certA removed.
+		// Anything else (e.g., same cert appearing twice) is a corruption.
+		validAthenB := activeFP == certBFP && removedFP == certAFP
+		validBthenA := activeFP == certAFP && removedFP == certBFP
+		if !(validAthenB || validBthenA) {
+			t.Fatalf("iter %d: post-state inconsistent with any valid serial execution:\n"+
+				"  activeFP   = %s\n  removedFP  = %s\n  certA FP   = %s\n  certB FP   = %s",
+				iter, activeFP, removedFP, certAFP, certBFP)
+		}
 	}
 
-	// The key invariant: there is exactly ONE active observation
-	// in LocalMachine\My (the agent reported only one cert per
-	// batch and the latter batch's coverage marked the earlier
-	// one's cert absent). The CRITICAL check is that we do NOT
-	// have ZERO active observations — that would prove the race
-	// happened (both batches marked each other's cert removed).
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	var activeCount int
-	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
-		return tx.QueryRow(ctx,
-			`SELECT COUNT(*) FROM certificate_observations
-			  WHERE agent_id = $1 AND store_location = $2 AND removed_at IS NULL`,
-			agentID, `LocalMachine\My`).Scan(&activeCount)
-	}); err != nil {
-		t.Fatalf("read: %v", err)
+	// Static analysis: assertion that the unused-when-loop-fires
+	// `agentID` and `credential` from the test setup remain
+	// reachable (the test scaffolding allocates them up front).
+	_ = agentID
+	_ = credential
+}
+
+// fingerprintOf re-derives the SHA-256(cert.Raw) fingerprint the
+// server uses, for tests that need to assert on the canonical
+// stored fingerprint without depending on the internal package.
+func fingerprintOf(t *testing.T, certPEM string) string {
+	t.Helper()
+	block, _ := pem.Decode([]byte(certPEM))
+	if block == nil {
+		t.Fatalf("fingerprintOf: pem.Decode returned nil")
 	}
-	if activeCount < 1 {
-		t.Errorf("active observation count = %d after concurrent batches; want >= 1 (advisory lock should have prevented zero-state race)", activeCount)
+	parsed, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("fingerprintOf: parse: %v", err)
 	}
+	sum := sha256.Sum256(parsed.Raw)
+	return hex.EncodeToString(sum[:])
 }
 
 // --- private key rejection -----------------------------------------
@@ -859,6 +983,71 @@ func TestAgentCertificatesRejectsFutureCollectedAt(t *testing.T) {
 			{StoreLocation: `LocalMachine\My`, CertificatePEM: c},
 		},
 	}, http.StatusBadRequest)
+}
+
+// TestAgentCertificatesRejectsMissingCollectedAt (Blocker 1 / Codex
+// P1 regression). An omitted collected_at deserializes to Go's
+// zero time (year 0001). Without the IsZero check in
+// inventory.Service.Submit, the batch would persist 0001-01-01
+// into first_seen_at/last_seen_at and corrupt reconciliation
+// comparisons against future rows. Service rejects with
+// ErrInvalidBatch; handler maps to 400 bad_request; nothing is
+// written to certificates or certificate_observations.
+func TestAgentCertificatesRejectsMissingCollectedAt(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	c := generatedCert(t, "missing-collected-at.example")
+	// Hand-crafted body that intentionally omits collected_at.
+	// (json.Marshal of our DTO with an empty CollectedAt string
+	// would serialize as "" which is also invalid, but the bug
+	// the user flagged is the wire-omitted case — confirm both.)
+	rawOmitted := []byte(`{
+		"store_coverage": ["LocalMachine\\My"],
+		"certificates": [
+			{"store_location": "LocalMachine\\My", "certificate_pem": ` + jsonString(c) + `}
+		]
+	}`)
+	submitCertBatchRaw(t, srv.URL, credential, rawOmitted, http.StatusBadRequest)
+
+	// Also confirm explicit null is rejected.
+	rawNull := []byte(`{
+		"collected_at": null,
+		"store_coverage": ["LocalMachine\\My"],
+		"certificates": [
+			{"store_location": "LocalMachine\\My", "certificate_pem": ` + jsonString(c) + `}
+		]
+	}`)
+	submitCertBatchRaw(t, srv.URL, credential, rawNull, http.StatusBadRequest)
+
+	// Nothing should have been written on the rejection path.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var certRows, obsRows int
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `SELECT COUNT(*) FROM certificates`).Scan(&certRows); err != nil {
+			return err
+		}
+		return tx.QueryRow(ctx, `SELECT COUNT(*) FROM certificate_observations`).Scan(&obsRows)
+	}); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if certRows != 0 || obsRows != 0 {
+		t.Errorf("missing-collected_at reject leaked data: certRows=%d obsRows=%d, want 0/0", certRows, obsRows)
+	}
+}
+
+// jsonString returns the JSON-escaped string form of s, suitable
+// for inlining into a hand-crafted JSON literal. We use it only
+// in the missing-collected_at test where we deliberately bypass
+// json.Marshal of our wire DTO (which would always emit a
+// collected_at key, even if zero-valued).
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }
 
 // --- auth: operator cookie + anonymous + bearer rejection ----------

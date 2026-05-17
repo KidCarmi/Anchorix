@@ -108,6 +108,15 @@ func (s *Service) Submit(ctx context.Context, in IngestionInput) (*IngestionOutp
 		}
 		coverage[store] = struct{}{}
 	}
+	if in.CollectedAt.IsZero() {
+		// Required field. Go's encoding/json maps a missing /
+		// null collected_at to the zero time.Time, which is
+		// year 0001. Without this guard, a forgetful agent
+		// could write 0001-01-01 into first_seen_at /
+		// last_seen_at and pollute reconciliation comparisons
+		// against newer rows (Codex P1 / Blocker 1).
+		return nil, fmt.Errorf("%w: collected_at required", ErrInvalidBatch)
+	}
 	if in.CollectedAt.After(s.clock.Now().Add(maxClockSkew)) {
 		return nil, fmt.Errorf("%w: collected_at more than 24h in the future", ErrInvalidBatch)
 	}
