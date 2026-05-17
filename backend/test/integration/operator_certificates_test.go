@@ -835,7 +835,7 @@ func TestOperatorListCertificatesLimitOutOfBounds(t *testing.T) {
 	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
 
 	for _, q := range []string{
-		"limit=0",   // explicit zero is a caller-input bug, not "use default"
+		"limit=0", // explicit zero is a caller-input bug, not "use default"
 		"limit=-1",
 		"limit=201", // above MaxListLimit
 		"limit=notanumber",
