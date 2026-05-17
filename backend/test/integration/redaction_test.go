@@ -21,6 +21,7 @@ import (
 	"github.com/kidcarmi/anchorix/backend/internal/auth"
 	"github.com/kidcarmi/anchorix/backend/internal/clock"
 	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
+	"github.com/kidcarmi/anchorix/backend/internal/findings"
 	"github.com/kidcarmi/anchorix/backend/internal/httpapi"
 	"github.com/kidcarmi/anchorix/backend/internal/inventory"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
@@ -129,12 +130,21 @@ func TestNoPlaintextSecretsInLogs(t *testing.T) {
 		t.Fatalf("inventory.NewService: %v", err)
 	}
 
+	findingsRepo := postgres.NewFindingsRepository(db)
+	findingsSvc, err := findings.NewService(
+		findingsRepo, certRepo, db, auditRecorder, clock.System{}, findings.DefaultRules(),
+	)
+	if err != nil {
+		t.Fatalf("findings.NewService: %v", err)
+	}
+
 	apiServer, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{
 		AuthService:           svc,
 		CookieSigner:          signer,
 		EnrollmentService:     enrollSvc,
 		AgentInventoryService: inventorySvc,
 		InventoryService:      certSvc,
+		FindingsService:       findingsSvc,
 	})
 	if err != nil {
 		t.Fatalf("httpapi.NewServer: %v", err)

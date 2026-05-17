@@ -59,6 +59,7 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 	agentInventoryDeps := handlers.AgentInventoryDeps{Service: deps.AgentInventoryService}
 	agentCertificatesDeps := handlers.AgentCertificatesDeps{Service: deps.InventoryService}
 	certificatesDeps := handlers.CertificatesDeps{Service: deps.InventoryService}
+	findingsDeps := handlers.FindingsDeps{Service: deps.FindingsService}
 
 	// --- auth ---
 	// Login is anonymous; the session resolver runs but does not block.
@@ -145,9 +146,19 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 	mux.Handle("GET /agents/{id}/certificates",
 		resolver(mw.RequireAuth(handlers.AgentCertificatesList(certificatesDeps))))
 
-	// --- findings ---
-	mux.HandleFunc("GET /findings", handlers.FindingsList)
-	mux.HandleFunc("GET /findings/{id}", handlers.FindingsGet)
+	// --- findings (H-021) ---
+	// Operator-only. Same auth+org-scoping posture as the
+	// certificate read APIs: agent bearer rejected, cross-org
+	// ids surface as 404 not_found.
+	mux.Handle("POST /findings/recompute",
+		resolver(mw.RequireAuth(handlers.FindingsRecompute(findingsDeps))))
+	mux.Handle("GET /findings",
+		resolver(mw.RequireAuth(handlers.FindingsList(findingsDeps))))
+	mux.Handle("GET /findings/{id}",
+		resolver(mw.RequireAuth(handlers.FindingsGet(findingsDeps))))
+	// Acknowledge / suppress workflow is out of scope for H-021
+	// (see CERTIFICATE_FINDINGS.md "Non-goals"); the stubs stay
+	// so the route surface remains documented as future work.
 	mux.HandleFunc("POST /findings/{id}/acknowledge", handlers.FindingsAcknowledge)
 	mux.HandleFunc("POST /findings/{id}/suppress", handlers.FindingsSuppress)
 
