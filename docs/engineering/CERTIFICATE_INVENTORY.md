@@ -803,8 +803,11 @@ efficient:
 
 ## 12. Operator read model
 
-Future endpoints. **No implementation in this PR.** Shapes match
-the established v0.1 patterns from `PR-018` / `H-010` / `H-005`.
+Implemented in H-020. Shapes match the established v0.1 patterns
+from `PR-018` / `H-010` / `H-005`. See
+[`docs/api/REST_API.md`](../api/REST_API.md) "Certificates" for the
+wire contract; this section captures the design constraints and
+trade-offs.
 
 ### `GET /api/v1/certificates`
 
@@ -836,7 +839,7 @@ Slim row format (similar to `GET /agent-inventory`):
       "is_ca": false,
       "is_self_signed": false,
       "observation_count": 3,
-      "current_observation_count": 1,
+      "active_observation_count": 1,
       "last_seen_at": "2026-05-16T14:00:00Z"
     }
   ],
@@ -846,7 +849,19 @@ Slim row format (similar to `GET /agent-inventory`):
 
 The full PEM is NOT in the list payload (same pattern as
 machine-inventory's exclusion of `local_ips` — list summaries
-stay small).
+stay small). The H-020 wire shape adds the full normalized field
+set (serial number, signature algorithm, key bits, first/last seen
+timestamps); see REST_API.md for the exact JSON.
+
+### Naming: `active_observation_count`
+
+This earlier design draft used `current_observation_count`; H-020
+ships `active_observation_count` (matching the `status: "active"`
+value the observation list returns). The "active" vocabulary is
+chosen so the count and the per-row status mean the same thing in
+the same sentence — an observation is `active` when
+`removed_at IS NULL`, and `active_observation_count` is how many
+such rows the certificate has.
 
 ### `GET /api/v1/certificates/{id}`
 
@@ -935,8 +950,8 @@ PRs it spawns:
 | H-014 storage layer | **shipped** (PR #24) + adversarial review (PR #25) |
 | H-017 concurrent-batch advisory lock | **shipped** as part of H-015 — `WithTxLockedAgent` in `internal/storage/postgres/postgres.go` |
 | H-018 first_seen_at out-of-order merge | **shipped** (PR #25) |
-| H-015 agent ingestion endpoint | **shipped** (this PR) |
-| H-016 operator read API | open |
+| H-015 agent ingestion endpoint | **shipped** (PR #26) + post-ingestion hardening (PR #27) |
+| H-020 operator read API | **shipped** (this PR) |
 | (Phase 4) findings integration | future |
 
 ## Recommended PR sequence after this design
@@ -944,16 +959,14 @@ PRs it spawns:
 1. ~~H-011 design~~ — shipped.
 2. ~~H-014 storage layer~~ — shipped.
 3. ~~H-015 agent ingestion endpoint~~ — `POST /api/v1/agent/certificates` shipped. Uses the H-014 storage layer plus a size-configurable variant of the H-009 strict JSON decoder (`envelope.DecodeStrictJSONWithLimit` — 4 MiB cap for cert batches). Implements §4 (request/response), §5 (idempotency via set reconciliation), §6 (audit), §7 (private-key rejection), and §"Why store_coverage is required" (required + non-empty). Per-agent advisory lock (H-017) prevents concurrent-batch races. PEM normalization done server-side via `pem.Encode` of the parsed DER so different agent serializers' formatting deduplicates to the same fingerprint.
-4. **H-016 — `feat(inventory): operator certificate read API`.**
-   `GET /api/v1/certificates`, `/certificates/{id}`,
-   `/certificates/{id}/observations`, `/agents/{id}/certificates`.
-   All operator-side, paginated per H-010 pattern.
+4. ~~H-020 — `feat(inventory): operator certificate read API`~~ —
+   shipped (this PR). `GET /api/v1/certificates`,
+   `/certificates/{id}`, `/certificates/{id}/observations`,
+   `/agents/{id}/certificates`. All operator-side, paginated per
+   H-010 pattern. Filters: `q`, `expiring_before`, `is_ca`,
+   `agent_id`, `current_only` (default `true`).
 5. **(Phase 4) Findings integration** — separate design, separate
    PR. The schema landed in H-014 is the substrate.
-
-H-016 is loosely independent of H-015 — it could ship before
-H-015 (with no real observations to read) but the operator-useful
-state is after H-015.
 
 ## Unresolved questions
 

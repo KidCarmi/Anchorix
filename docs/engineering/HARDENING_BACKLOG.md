@@ -62,30 +62,6 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
   cardinality); `internal/inventory/service.go`
   `recordBatchRejection` / `recordBatchInvalid`.
 
-### H-016 — Certificate inventory: operator read API
-
-- **Title:** `feat(inventory): operator certificate read endpoints`
-- **Risk:** low-medium (read-only operator surface; org-scoping
-  is the only security concern, and the H-010 pattern already
-  has the recipe).
-- **Scope:** four operator-side endpoints —
-  `GET /api/v1/certificates`,
-  `GET /api/v1/certificates/{id}`,
-  `GET /api/v1/certificates/{id}/observations`,
-  `GET /api/v1/agents/{id}/certificates`. Cursor pagination
-  matching the H-010 pattern; slim summary rows for list
-  endpoints, full detail (including PEM) for the single-cert
-  endpoint. Filters per CERTIFICATE_INVENTORY.md §12.
-  Cross-org → 404 not_found.
-- **Recommended PR:** `feat(inventory): operator certificate read endpoints`.
-- **Reason not fixed now:** depends on H-014. Can ship before
-  or after H-015 — without H-015 the read endpoints return
-  empty pages, but they still build the operator-facing query
-  surface.
-- **References:**
-  [`docs/engineering/CERTIFICATE_INVENTORY.md`](./CERTIFICATE_INVENTORY.md)
-  §11, §12; H-010 (operator-side list pattern).
-
 ### H-012 — Agent rebind: admin token issuance + redemption
 
 - **Title:** `feat(enrollment): admin rebind-token issuance + agent rebind execution`

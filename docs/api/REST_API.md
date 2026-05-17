@@ -721,27 +721,157 @@ Failure responses:
 
 ## Certificates
 
-Future operator endpoints (implementation in H-016). The contracts
-below are the future-direction notes locked in by
-[`docs/engineering/CERTIFICATE_INVENTORY.md`](../engineering/CERTIFICATE_INVENTORY.md)
-§12. The "Current state" column reflects what each path returns
-**today**, before H-016 wires the real handlers:
+Operator-facing read endpoints (H-020). Session cookie required;
+agent bearer credentials are NOT honored. Org-scoped by the
+authenticated user's `organization_id` — cross-org ids return
+`404 not_found` (never `403`), so an operator in one org cannot
+enumerate the presence of resources in another (CLAUDE.md §6).
 
-| Method | Path                                          | Auth | Purpose                                                              | Current state          |
-| ------ | --------------------------------------------- | ---- | -------------------------------------------------------------------- | ---------------------- |
-| GET    | `/certificates`                               | user | Paginated list of certificates with summary fields                   | `501 not_implemented` (stub routed) |
-| GET    | `/certificates/{id}`                          | user | Single certificate detail including full PEM                          | `501 not_implemented` (stub routed) |
-| GET    | `/certificates/{id}/observations`             | user | List of observations (agent + store) for one certificate              | `404 not_found` (route not mounted yet — H-016) |
-| GET    | `/agents/{id}/certificates`                   | user | Certificates observed by one agent                                    | `404 not_found` (route not mounted yet — H-016) |
+| Method | Path                              | Auth | Purpose                                                  |
+| ------ | --------------------------------- | ---- | -------------------------------------------------------- |
+| GET    | `/certificates`                   | user | Paginated certificate summary list (no PEM)              |
+| GET    | `/certificates/{id}`              | user | Single certificate detail including full PEM             |
+| GET    | `/certificates/{id}/observations` | user | List of observations (agent + store) for one certificate |
+| GET    | `/agents/{id}/certificates`       | user | Certificates observed by one agent                       |
 
-Supported filters on `/certificates` list (per CERTIFICATE_INVENTORY.md §12):
+### `GET /certificates`
 
-- `q` — substring match against subject / SANs / issuer
-- `expiring_before` — RFC3339; returns certs with `not_after < value`
-- `is_ca` — boolean
-- `agent_id` — filter to a specific agent (joins through observations)
-- `current_only` — boolean; default `true` (excludes observations with `removed_at IS NOT NULL`)
-- `cursor`, `limit` — pagination per the H-010 cursor convention
+Slim summary rows; the full PEM is NOT returned (see
+`GET /certificates/{id}` for that). Each row carries two
+observation counters:
+
+- `observation_count` — total observations across all agents and
+  stores, including rows where `removed_at` is set.
+- `active_observation_count` — observations with `removed_at IS NULL`.
+
+Query parameters (all optional):
+
+| Name              | Type     | Default | Meaning                                                                                  |
+| ----------------- | -------- | ------- | ---------------------------------------------------------------------------------------- |
+| `q`               | string   | —       | Case-insensitive substring against `subject`, `issuer`, `fingerprint_sha256`, and SANs.  |
+| `expiring_before` | RFC3339  | —       | Returns rows with `not_after < value`.                                                   |
+| `is_ca`           | boolean  | —       | Exact-match filter on `is_ca`.                                                           |
+| `agent_id`        | string   | —       | Returns only certs observed by this agent (via `EXISTS` on `certificate_observations`). |
+| `current_only`    | boolean  | `true`  | When true, returns only certs that have ≥1 observation with `removed_at IS NULL`.        |
+| `limit`           | integer  | 50      | 1–200 inclusive. Out-of-bounds returns 400.                                              |
+| `cursor`          | base64url| —       | Opaque cursor from a previous response's `next_cursor`.                                  |
+
+Ordering: `last_seen_at DESC, id ASC`. The `(last_seen_at, id)`
+tuple is stable (id is unique) and is what the cursor encodes.
+
+Sample response:
+
+```json
+{
+  "items": [
+    {
+      "id": "01J4...",
+      "fingerprint_sha256": "ab12...",
+      "subject": "CN=ws-001.corp.example",
+      "issuer": "CN=Internal Issuing CA",
+      "serial_number_hex": "0a1b...",
+      "signature_algorithm": "SHA256-RSA",
+      "public_key_algorithm": "RSA",
+      "public_key_bits": 2048,
+      "not_before": "2025-05-01T00:00:00Z",
+      "not_after":  "2026-05-01T00:00:00Z",
+      "is_self_signed": false,
+      "is_ca": false,
+      "first_seen_at": "2025-05-02T14:00:00Z",
+      "last_seen_at":  "2026-05-16T14:00:00Z",
+      "observation_count": 3,
+      "active_observation_count": 1
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+### `GET /certificates/{id}`
+
+Single certificate detail. Returns the full PEM along with the
+normalized field set:
+
+```json
+{
+  "id": "01J4...",
+  "fingerprint_sha256": "ab12...",
+  "subject": "CN=ws-001.corp.example",
+  "issuer": "CN=Internal Issuing CA",
+  "serial_number_hex": "0a1b...",
+  "signature_algorithm": "SHA256-RSA",
+  "public_key_algorithm": "RSA",
+  "public_key_bits": 2048,
+  "not_before": "2025-05-01T00:00:00Z",
+  "not_after":  "2026-05-01T00:00:00Z",
+  "sans": ["ws-001.corp.example"],
+  "key_usages": ["DigitalSignature", "KeyEncipherment"],
+  "ext_key_usages": ["ServerAuth"],
+  "is_self_signed": false,
+  "is_ca": false,
+  "pem": "-----BEGIN CERTIFICATE-----\n...",
+  "first_seen_at": "2025-05-02T14:00:00Z",
+  "last_seen_at":  "2026-05-16T14:00:00Z",
+  "observation_count": 3,
+  "active_observation_count": 1
+}
+```
+
+Cross-org or missing id → `404 not_found`.
+
+### `GET /certificates/{id}/observations`
+
+List of observations for one certificate. The endpoint joins
+through `agent_inventory_snapshots` to surface `hostname`
+best-effort — empty string when the agent has never submitted a
+machine inventory snapshot.
+
+Query parameters: `current_only` (default `true`), `cursor`,
+`limit` (same bounds as `/certificates`).
+
+Ordering: `last_seen_at DESC, agent_id ASC, store_location ASC`.
+
+Sample response:
+
+```json
+{
+  "items": [
+    {
+      "id": "01J5...",
+      "agent_id": "01J3...",
+      "hostname": "ws-001.corp.example",
+      "store_location": "LocalMachine\\My",
+      "friendly_name": "Workstation Identity",
+      "first_seen_at": "2025-05-02T14:00:00Z",
+      "last_seen_at":  "2026-05-16T14:00:00Z",
+      "removed_at": null,
+      "status": "active"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+`status` is `"active"` when `removed_at IS NULL`, `"removed"`
+otherwise. Cross-org or missing certificate id → `404 not_found`.
+
+### `GET /agents/{id}/certificates`
+
+Same row shape as `GET /certificates`, scoped to one agent.
+Same query parameters apply (the path-bound `agent_id` wins
+over any `?agent_id=...` query value).
+
+Cross-org or missing agent id → `404 not_found`. An agent that
+exists with zero certificates → `200 OK` with `items: []` — the
+empty case is distinguishable only by the surrounding URL
+structure, not by content.
+
+### Audit policy
+
+No audit row is emitted for any of these endpoints. They are
+read-only; CLAUDE.md §9 reserves `audit_events` for state
+changes. Failed authentication is already audited upstream by
+the session resolver.
 
 ## Findings
 

@@ -58,6 +58,7 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 	}
 	agentInventoryDeps := handlers.AgentInventoryDeps{Service: deps.AgentInventoryService}
 	agentCertificatesDeps := handlers.AgentCertificatesDeps{Service: deps.InventoryService}
+	certificatesDeps := handlers.CertificatesDeps{Service: deps.InventoryService}
 
 	// --- auth ---
 	// Login is anonymous; the session resolver runs but does not block.
@@ -128,9 +129,21 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 	// longer routed; certificate inventory is a separate Phase 3+
 	// concern (internal/inventory) and remains unimplemented.
 
-	// --- certificates ---
-	mux.HandleFunc("GET /certificates", handlers.CertificatesList)
-	mux.HandleFunc("GET /certificates/{id}", handlers.CertificatesGet)
+	// --- certificates (operator read; H-020) ---
+	// Org-scoped via the authenticated operator session. Agent
+	// bearer credentials are NOT honored on these routes (operator
+	// and agent identity remain separate axes per CLAUDE.md §8.6).
+	// Cross-org ids surface as 404 not_found — never 403 — so an
+	// operator in org A cannot enumerate the presence of resources
+	// in org B (CLAUDE.md §6 deterministic auth).
+	mux.Handle("GET /certificates",
+		resolver(mw.RequireAuth(handlers.CertificatesList(certificatesDeps))))
+	mux.Handle("GET /certificates/{id}",
+		resolver(mw.RequireAuth(handlers.CertificatesGet(certificatesDeps))))
+	mux.Handle("GET /certificates/{id}/observations",
+		resolver(mw.RequireAuth(handlers.CertificateObservationsList(certificatesDeps))))
+	mux.Handle("GET /agents/{id}/certificates",
+		resolver(mw.RequireAuth(handlers.AgentCertificatesList(certificatesDeps))))
 
 	// --- findings ---
 	mux.HandleFunc("GET /findings", handlers.FindingsList)

@@ -85,12 +85,47 @@ type Repository interface {
 	// ListObservationsForCertificate returns every observation
 	// (current and removed) for one certificate within an
 	// organization, ordered by last_seen_at DESC then agent_id
-	// ASC. Used by tests and the future H-016 operator endpoint
-	// GET /api/v1/certificates/{id}/observations.
+	// ASC. Returns the full set without pagination; used by the
+	// inventory test suite and other callers that need the
+	// complete picture at small scale. Operator-facing pagination
+	// goes through ListObservationsPage.
 	ListObservationsForCertificate(
 		ctx context.Context,
 		organizationID, certificateID string,
 	) ([]CertificateObservation, error)
+
+	// ListCertificates returns one page of CertificateSummary
+	// rows for the H-020 operator list endpoints
+	// (`GET /certificates` and `GET /agents/{id}/certificates`).
+	// The query carries already-validated filter values; the
+	// repository is responsible for the SQL translation but NOT
+	// for argument validation (that lives in the service).
+	//
+	// Ordering: last_seen_at DESC, id ASC. The caller asked for
+	// q.Limit rows (Limit already includes the +1 sentinel — the
+	// service strips it before returning to the HTTP layer).
+	ListCertificates(ctx context.Context, q CertificateListQuery) ([]CertificateSummary, error)
+
+	// CountObservations returns (total, active) observation
+	// counts for one certificate in one organization. Used by
+	// GetCertificateDetail to populate the same two counters the
+	// list endpoint already includes per row.
+	CountObservations(ctx context.Context, organizationID, certificateID string) (total int, active int, err error)
+
+	// ListObservationsPage returns one page of ObservationListItem
+	// rows for the H-020 `GET /certificates/{id}/observations`
+	// endpoint. Joins to the agent_inventory_snapshots table to
+	// populate Hostname (best-effort — empty when the agent has
+	// never submitted an inventory snapshot). Ordering:
+	// last_seen_at DESC, agent_id ASC, store_location ASC.
+	ListObservationsPage(ctx context.Context, q ObservationListQuery) ([]ObservationListItem, error)
+
+	// AgentExistsInOrg reports whether an agent row exists for
+	// (organization_id, agent_id). Used by ListAgentCertificates
+	// so the HTTP layer can return 404 for cross-org / missing
+	// agent ids without enumerating per-agent state via an
+	// empty-items 200.
+	AgentExistsInOrg(ctx context.Context, organizationID, agentID string) (bool, error)
 }
 
 // Transactor runs fn inside a single transaction with an exclusive
@@ -108,17 +143,4 @@ type Repository interface {
 // Interface owned by the consumer per CLAUDE.md §8.8.
 type Transactor interface {
 	WithTxLockedAgent(ctx context.Context, agentID string, fn func(ctx context.Context) error) error
-}
-
-// ListQuery captures the supported filters for the future
-// operator-facing list endpoint GET /api/v1/certificates (H-016).
-// Carried in the storage layer's surface so the H-016
-// implementation can translate URL query params into this struct
-// without changing the public interface.
-type ListQuery struct {
-	OrganizationID string
-	Search         string
-	ExpiringBefore string
-	Limit          int
-	Cursor         string
 }
