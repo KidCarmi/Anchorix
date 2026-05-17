@@ -153,12 +153,13 @@ func TestReadyzMixedProbesFailClosed(t *testing.T) {
 // shape that clients rely on:  { "error": { "code": ..., "message": ... } }.
 // Every handler that still returns notImplemented must produce this
 // shape; this test catches regressions in the helper or the router
-// wiring. We exercise a still-stub route (GET /certificates) so the
+// wiring. We exercise a still-stub route (GET /findings) so the
 // test stays valid as more handlers gain real implementations.
-// GET /agents was the original target but it became real in PR-013.
+// GET /agents became real in PR-013; GET /certificates became
+// real in H-020.
 func TestNotImplementedRouteEnvelope(t *testing.T) {
 	h := testRouter(t, nil)
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/certificates", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/findings", nil)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 

@@ -15,6 +15,13 @@ import "errors"
 // enumeration via error code).
 var ErrCertificateNotFound = errors.New("inventory: certificate not found")
 
+// ErrAgentNotFound is returned by Service.ListAgentCertificates
+// when the (organization_id, agent_id) pair does not match an
+// existing agent row. Cross-org and truly-missing both collapse
+// to this sentinel for the same enumeration-safety reason as
+// ErrCertificateNotFound. HTTP layer maps to 404 not_found.
+var ErrAgentNotFound = errors.New("inventory: agent not found")
+
 // ErrInvalidReconciliation is returned by
 // Repository.MarkMissingObservationsRemoved when its inputs are
 // structurally invalid for reconciliation — currently:
