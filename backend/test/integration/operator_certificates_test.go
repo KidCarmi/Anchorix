@@ -121,10 +121,23 @@ func TestOperatorListCertificatesHappyPath(t *testing.T) {
 	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
 	_, credential := enrolledAgent(t, srv.URL, adminClient)
 
+	// Two certs must be submitted in the SAME batch — the H-015
+	// ingestion contract is set-reconciliation per declared
+	// store_coverage, so a second batch covering the same store
+	// without the first cert would mark the first cert's
+	// observation as removed. Multi-cert single batch is the
+	// only way two certs coexist as active observations in one
+	// store under the contract this PR consumes.
 	a := generatedCert(t, "alpha.example")
 	b := generatedCert(t, "beta.example")
-	submitOneCert(t, srv.URL, credential, a, `LocalMachine\My`, "alpha-friendly")
-	submitOneCert(t, srv.URL, credential, b, `LocalMachine\My`, "beta-friendly")
+	submitCertBatch(t, srv.URL, credential, ingestRequestDTO{
+		CollectedAt:   nowRFC3339(),
+		StoreCoverage: []string{`LocalMachine\My`},
+		Certificates: []ingestCertDTO{
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: a, FriendlyName: "alpha-friendly"},
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: b, FriendlyName: "beta-friendly"},
+		},
+	}, http.StatusOK)
 
 	var out certListDTO
 	operatorGetJSON(t, srv.URL, adminClient, "/api/v1/certificates", http.StatusOK, &out)
@@ -388,24 +401,34 @@ func TestOperatorObservationsCurrentOnlyDefault(t *testing.T) {
 	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
 	_, credential := enrolledAgent(t, srv.URL, adminClient)
 
-	pem := generatedCert(t, "removed-obs.example")
-	// First batch: cert present in My.
-	submitOneCert(t, srv.URL, credential, pem, `LocalMachine\My`, "")
-	// Second batch: same store_coverage, no certificates → cert
-	// from previous batch transitions to removed_at.
+	originalPEM := generatedCert(t, "removed-obs.example")
+	replacementPEM := generatedCert(t, "replacement-obs.example")
+	// First batch: original cert present in My.
+	submitOneCert(t, srv.URL, credential, originalPEM, `LocalMachine\My`, "")
+	// Second batch: a DIFFERENT cert covers the same store. Set
+	// reconciliation marks the original cert's observation as
+	// removed because it is absent from this batch's
+	// certificates[] in the declared coverage. The H-015 handler
+	// rejects empty `certificates` arrays as bad_request, so the
+	// only way to drive an observation to removed via the public
+	// API is to submit a replacement batch.
 	submitCertBatch(t, srv.URL, credential, ingestRequestDTO{
 		CollectedAt:   time.Now().UTC().Add(1 * time.Second).Format(time.RFC3339),
 		StoreCoverage: []string{`LocalMachine\My`},
-		Certificates:  []ingestCertDTO{},
+		Certificates: []ingestCertDTO{
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: replacementPEM},
+		},
 	}, http.StatusOK)
 
-	// Find the cert id via the list with current_only=false so the
-	// removed-only cert still surfaces.
+	// Find the ORIGINAL cert's id (the one now in the removed
+	// state). `q=removed-obs` matches the original's subject
+	// uniquely. current_only=false so the removed-only cert
+	// still surfaces.
 	var list certListDTO
 	operatorGetJSON(t, srv.URL, adminClient,
-		"/api/v1/certificates?current_only=false", http.StatusOK, &list)
+		"/api/v1/certificates?current_only=false&q=removed-obs", http.StatusOK, &list)
 	if len(list.Items) != 1 {
-		t.Fatalf("certs = %d, want 1", len(list.Items))
+		t.Fatalf("certs by q=removed-obs = %d, want 1", len(list.Items))
 	}
 	certID := list.Items[0].ID
 
@@ -577,8 +600,16 @@ func TestOperatorListCertificatesQFilter(t *testing.T) {
 	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
 	_, credential := enrolledAgent(t, srv.URL, adminClient)
 
-	submitOneCert(t, srv.URL, credential, generatedCert(t, "match-needle.example"), `LocalMachine\My`, "")
-	submitOneCert(t, srv.URL, credential, generatedCert(t, "no-relation.example"), `LocalMachine\My`, "")
+	// Single batch — see TestOperatorListCertificatesHappyPath
+	// for the set-reconciliation rationale.
+	submitCertBatch(t, srv.URL, credential, ingestRequestDTO{
+		CollectedAt:   nowRFC3339(),
+		StoreCoverage: []string{`LocalMachine\My`},
+		Certificates: []ingestCertDTO{
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: generatedCert(t, "match-needle.example")},
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: generatedCert(t, "no-relation.example")},
+		},
+	}, http.StatusOK)
 
 	var list certListDTO
 	operatorGetJSON(t, srv.URL, adminClient,
@@ -736,29 +767,39 @@ func TestOperatorListCertificatesCurrentOnlyHidesRemoved(t *testing.T) {
 	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
 	_, credential := enrolledAgent(t, srv.URL, adminClient)
 
-	pem := generatedCert(t, "to-be-removed.example")
-	submitOneCert(t, srv.URL, credential, pem, `LocalMachine\My`, "")
+	// Two certs: original gets reconciled away by a replacement
+	// batch (the H-015 handler rejects empty `certificates`
+	// arrays, so a replacement cert is the only way to push the
+	// original's observation to removed_at via the public API).
+	originalPEM := generatedCert(t, "to-be-removed.example")
+	replacementPEM := generatedCert(t, "still-active.example")
+	submitOneCert(t, srv.URL, credential, originalPEM, `LocalMachine\My`, "")
 	submitCertBatch(t, srv.URL, credential, ingestRequestDTO{
 		CollectedAt:   time.Now().UTC().Add(1 * time.Second).Format(time.RFC3339),
 		StoreCoverage: []string{`LocalMachine\My`},
-		Certificates:  []ingestCertDTO{},
+		Certificates: []ingestCertDTO{
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: replacementPEM},
+		},
 	}, http.StatusOK)
 
-	// Default: cert has no active observations → hidden.
-	var def certListDTO
+	// Default current_only=true: the ORIGINAL cert is hidden (no
+	// active observations). The replacement cert is active, so it
+	// shows up. We filter by the original's subject to scope the
+	// assertion to "the cert we drove to removed is hidden".
+	var defOriginal certListDTO
 	operatorGetJSON(t, srv.URL, adminClient,
-		"/api/v1/certificates", http.StatusOK, &def)
-	if len(def.Items) != 0 {
-		t.Errorf("default current_only items = %d, want 0", len(def.Items))
+		"/api/v1/certificates?q=to-be-removed", http.StatusOK, &defOriginal)
+	if len(defOriginal.Items) != 0 {
+		t.Errorf("default current_only with q=to-be-removed items = %d, want 0", len(defOriginal.Items))
 	}
 
-	// Explicit current_only=false: cert surfaces with
-	// active_observation_count = 0.
+	// Explicit current_only=false with the same subject scope:
+	// the original surfaces with active_observation_count = 0.
 	var withRemoved certListDTO
 	operatorGetJSON(t, srv.URL, adminClient,
-		"/api/v1/certificates?current_only=false", http.StatusOK, &withRemoved)
+		"/api/v1/certificates?current_only=false&q=to-be-removed", http.StatusOK, &withRemoved)
 	if len(withRemoved.Items) != 1 {
-		t.Fatalf("current_only=false items = %d, want 1", len(withRemoved.Items))
+		t.Fatalf("current_only=false with q=to-be-removed items = %d, want 1", len(withRemoved.Items))
 	}
 	if withRemoved.Items[0].ActiveObservationCount != 0 {
 		t.Errorf("active_observation_count = %d, want 0",
@@ -779,14 +820,25 @@ func TestOperatorListCertificatesPaginationLimitAndCursor(t *testing.T) {
 	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
 	_, credential := enrolledAgent(t, srv.URL, adminClient)
 
+	// All 5 certs in a single batch — sequential batches with
+	// the same store_coverage would reconcile earlier certs away.
+	// They share a last_seen_at by design here; the id-ASC
+	// tiebreaker keeps cursor pagination deterministic and the
+	// test only asserts page sizes + no-shared-ids, not which
+	// specific cert lands on which page.
 	const n = 5
+	certs := make([]ingestCertDTO, 0, n)
 	for i := 0; i < n; i++ {
-		submitOneCert(t, srv.URL, credential,
-			generatedCert(t, "page-"+strconv.Itoa(i)+".example"),
-			`LocalMachine\My`, "")
-		// Distinct last_seen_at per cert so ordering is deterministic.
-		time.Sleep(2 * time.Millisecond)
+		certs = append(certs, ingestCertDTO{
+			StoreLocation:  `LocalMachine\My`,
+			CertificatePEM: generatedCert(t, "page-"+strconv.Itoa(i)+".example"),
+		})
 	}
+	submitCertBatch(t, srv.URL, credential, ingestRequestDTO{
+		CollectedAt:   nowRFC3339(),
+		StoreCoverage: []string{`LocalMachine\My`},
+		Certificates:  certs,
+	}, http.StatusOK)
 
 	var first certListDTO
 	operatorGetJSON(t, srv.URL, adminClient,
