@@ -477,7 +477,7 @@ func TestUpsertObservationReappearClearsRemovedAt(t *testing.T) {
 
 	// Reconcile with an empty observation set — the cert disappears
 	// from coverage, so removed_at gets set.
-	if err := repo.MarkMissingObservationsRemoved(ctx,
+	if _, err := repo.MarkMissingObservationsRemoved(ctx,
 		"anchorix", agentID,
 		[]string{"LocalMachine\\My"},
 		[]string{}, t1); err != nil {
@@ -536,7 +536,7 @@ func TestMarkMissingObservationsRemovedAbsentCert(t *testing.T) {
 
 	// Reconcile with only certA present; certB should be marked
 	// removed_at.
-	if err := repo.MarkMissingObservationsRemoved(ctx,
+	if _, err := repo.MarkMissingObservationsRemoved(ctx,
 		"anchorix", agentID,
 		[]string{"LocalMachine\\My"},
 		[]string{certA.ID}, t1); err != nil {
@@ -603,7 +603,7 @@ func TestOutOfOrderBatchDoesNotOverwriteNewerState(t *testing.T) {
 
 	// Older reconciliation also cannot overwrite the newer state.
 	// Try to mark the cert removed with the older timestamp.
-	if err := repo.MarkMissingObservationsRemoved(ctx,
+	if _, err := repo.MarkMissingObservationsRemoved(ctx,
 		"anchorix", agentID,
 		[]string{"LocalMachine\\My"},
 		[]string{}, tOld); err != nil {
@@ -661,7 +661,7 @@ func TestMarkMissingObservationsRemovedRejectsEmptyCoverage(t *testing.T) {
 	ctx := context.Background()
 	agentID := seedAgent(t, db, "anchorix", "empty-coverage")
 
-	err := repo.MarkMissingObservationsRemoved(ctx,
+	_, err := repo.MarkMissingObservationsRemoved(ctx,
 		"anchorix", agentID,
 		nil,
 		[]string{}, time.Now().UTC())
@@ -669,7 +669,7 @@ func TestMarkMissingObservationsRemovedRejectsEmptyCoverage(t *testing.T) {
 		t.Errorf("nil coverage err = %v, want ErrInvalidReconciliation", err)
 	}
 
-	err = repo.MarkMissingObservationsRemoved(ctx,
+	_, err = repo.MarkMissingObservationsRemoved(ctx,
 		"anchorix", agentID,
 		[]string{},
 		[]string{}, time.Now().UTC())
@@ -712,7 +712,7 @@ func TestMarkMissingObservationsRemovedHandlesNilObservedCertIDs(t *testing.T) {
 	// Pass nil — semantically equivalent to "the batch reported
 	// zero certs in the covered stores". Both observations must
 	// be marked removed_at.
-	if err := repo.MarkMissingObservationsRemoved(ctx,
+	if _, err := repo.MarkMissingObservationsRemoved(ctx,
 		"anchorix", agentID,
 		[]string{"LocalMachine\\My"},
 		nil, // <-- the case under test
@@ -763,7 +763,7 @@ func TestMarkMissingObservationsRemovedStoreCoverageScoping(t *testing.T) {
 
 	// Reconcile only My — empty batch → mark cert removed in My
 	// only; Root must stay untouched.
-	if err := repo.MarkMissingObservationsRemoved(ctx,
+	if _, err := repo.MarkMissingObservationsRemoved(ctx,
 		"anchorix", agentID,
 		[]string{"LocalMachine\\My"},
 		[]string{}, t1); err != nil {
@@ -998,7 +998,7 @@ func TestMarkMissingObservationsRemovedNoOpOnEmptyAgentStore(t *testing.T) {
 
 	// Agent exists but has zero prior observations. Reconciliation
 	// with an empty observed set should be a clean no-op.
-	if err := repo.MarkMissingObservationsRemoved(ctx,
+	if _, err := repo.MarkMissingObservationsRemoved(ctx,
 		"anchorix", agentID,
 		[]string{"LocalMachine\\My"},
 		[]string{}, time.Now().UTC()); err != nil {
@@ -1016,7 +1016,7 @@ func TestMarkMissingObservationsRemovedNoOpOnEmptyAgentStore(t *testing.T) {
 	// doesn't exist in the agent's set — must still be a no-op
 	// (the cert id is in the WHERE NOT-IN list, but there are no
 	// candidate rows to filter).
-	if err := repo.MarkMissingObservationsRemoved(ctx,
+	if _, err := repo.MarkMissingObservationsRemoved(ctx,
 		"anchorix", agentID,
 		[]string{"LocalMachine\\My"},
 		[]string{"nonexistent-cert-id"}, time.Now().UTC()); err != nil {

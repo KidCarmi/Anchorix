@@ -103,6 +103,41 @@ func (db *DB) WithTx(ctx context.Context, fn func(ctx context.Context) error) er
 	})
 }
 
+// WithTxLockedAgent runs fn inside a single transaction with an
+// exclusive transaction-scope advisory lock keyed by agentID,
+// namespaced to certificate ingestion. The lock serializes
+// concurrent ingestion batches for the same agent — exactly the
+// guarantee H-017 calls for, and the guarantee
+// CERTIFICATE_INVENTORY.md §3 requires for set reconciliation
+// (two concurrent batches for the same agent could otherwise mark
+// each other's freshly-upserted observations as removed_at).
+//
+// Lock namespace + key: pg_advisory_xact_lock takes two int32s;
+// we hash 'cert-inventory' for the namespace and the agent id for
+// the key. PostgreSQL's hashtext is stable and deterministic
+// across the same major version, which is the only stability
+// promise we need (the lock keyspace lives only for the
+// transaction's lifetime).
+//
+// The advisory lock is released automatically when the transaction
+// commits or rolls back; the caller never has to release it
+// explicitly. Two batches for the SAME agent serialize; batches
+// for DIFFERENT agents run in parallel.
+//
+// CLAUDE.md §8.10 concurrency discipline: the lock has a documented
+// owner (this function), a deterministic release path (tx end),
+// and a bounded lifetime (the caller's transaction).
+func (db *DB) WithTxLockedAgent(ctx context.Context, agentID string, fn func(ctx context.Context) error) error {
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		if _, err := db.querierFor(ctx).Exec(ctx,
+			`SELECT pg_advisory_xact_lock(hashtext('cert-inventory'), hashtext($1))`,
+			agentID); err != nil {
+			return fmt.Errorf("postgres: advisory lock agent %s: %w", agentID, err)
+		}
+		return fn(ctx)
+	})
+}
+
 // WithTxRaw exposes the underlying pgx.Tx for callers inside this
 // package (migrations.go) and for integration tests that need to
 // exercise raw SQL (audit-events-are-append-only). Production

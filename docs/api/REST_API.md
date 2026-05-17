@@ -283,6 +283,7 @@ primitive.
 | GET    | `/agent/me`                           | agent    | Authenticated agent identity (bearer credential)       |
 | POST   | `/agent/heartbeat`                    | agent    | Liveness heartbeat (bumps `last_seen_at`)              |
 | POST   | `/agent/inventory`                    | agent    | Submit / replace the agent's machine-inventory snapshot |
+| POST   | `/agent/certificates`                 | agent    | Submit a batch of certificate observations with set-reconciliation per declared `store_coverage` |
 
 The original v0.1 schema proposal included a
 `POST /agents/enrollment-tokens` endpoint for issuing single-use
@@ -636,29 +637,87 @@ Failure responses:
 Audit policy: read-only. No `audit_events` row is emitted
 (CLAUDE.md §9 — audits record state changes).
 
-### Certificate inventory (deferred — design landed; implementation in flight)
+### `POST /agent/certificates`
 
-Certificate inventory (PEM-bearing observation upload, deduplication
-by fingerprint, observations table) is intentionally NOT part of
-PR-018; the snapshot endpoint above carries machine inventory only.
-The **design** for the certificate-inventory ingestion model has
-landed in
-[`docs/engineering/CERTIFICATE_INVENTORY.md`](../engineering/CERTIFICATE_INVENTORY.md);
-the implementation lands in **H-014** (storage layer), **H-015**
-(agent endpoint), and **H-016** (operator read endpoints) — see
-[`HARDENING_BACKLOG.md`](../engineering/HARDENING_BACKLOG.md).
+**Agent-authenticated** endpoint. The agent submits a batch of
+observed certificates for set reconciliation against its declared
+`store_coverage`. Single transaction per batch, serialized with
+other batches from the SAME agent via `pg_advisory_xact_lock`
+(H-017); batches from DIFFERENT agents run in parallel.
 
-The future agent endpoint is `POST /api/v1/agent/certificates`
-(NOT `POST /agent/inventory`, which remains the machine-inventory
-snapshot endpoint). The future operator read endpoints are listed
-in the "Certificates" table below.
+The server parses every `certificate_pem` authoritatively: the
+fingerprint is `SHA-256` of the DER bytes (`cert.Raw`), not of the
+input PEM, so two agents reporting the same cert with different
+PEM formatting (CRLF vs LF, extra blank lines, wrapping
+differences) deduplicate to the same `certificates` row.
 
-The original v0.1 schema proposal hinted at a certificate-shaped
-`POST /agents/{id}/inventory` payload; that shape is **not** the
-contract for `POST /agent/inventory` above and is **not** the
-contract for the future `POST /agent/certificates` either. The
-authoritative request/response shapes live in CERTIFICATE_INVENTORY.md
-§4.
+The agent id and organization id come from the authenticated
+agent principal — body-supplied identity is rejected.
+
+**Audit policy (CERTIFICATE_INVENTORY.md §6):** no per-cert audit
+rows; no per-successful-batch audit row. Private-key rejection
+writes one `agent.certificate_batch_rejected` row with
+`severity:"security"` and metadata `{reason, agent_id, batch_size}`
+— never cert content or marker text. Certificate-parse failure
+writes `agent.certificate_batch_invalid` with the same metadata
+shape. Audit-write failure on a rejection path surfaces as 500
+(CLAUDE.md §9 — audits are not optional on security-significant
+flows).
+
+Request body:
+
+```json
+{
+  "collected_at": "2026-05-16T14:00:00Z",
+  "store_coverage": ["LocalMachine\\My", "LocalMachine\\WebHosting"],
+  "certificates": [
+    {
+      "store_location": "LocalMachine\\My",
+      "friendly_name": "Production Web Cert",
+      "certificate_pem": "-----BEGIN CERTIFICATE-----\n..."
+    }
+  ]
+}
+```
+
+Field rules and caps (CERTIFICATE_INVENTORY.md §4):
+
+| Field                  | Constraint                                                   |
+| ---------------------- | ------------------------------------------------------------ |
+| `collected_at`         | RFC3339. Future > now + 24h → `400 bad_request`              |
+| `store_coverage`       | Required, non-empty. ≤ 64 entries. No duplicates within the list. Each entry 1–255 bytes. |
+| `certificates`         | Required, non-empty. ≤ 5000 entries.                         |
+| `certificates[].store_location` | 1–255 bytes. MUST be in `store_coverage`.            |
+| `certificates[].friendly_name`  | Optional. ≤ 255 bytes.                              |
+| `certificates[].certificate_pem`| Required. 1–32 KiB. ANY `BEGIN ... PRIVATE KEY` marker rejects the entire batch. MUST contain at least one valid X.509 `-----BEGIN CERTIFICATE-----` block. |
+| Body size              | ≤ 4 MiB total                                                |
+| Duplicate (fingerprint, store_location) inside same batch | → `400 bad_request` |
+
+Successful response — `200 OK`:
+
+```json
+{
+  "status": "ok",
+  "received_at": "2026-05-16T14:00:00Z",
+  "accepted": 47,
+  "reconciled_absent": 3
+}
+```
+
+- `accepted` is the number of (cert, store) observations upserted.
+- `reconciled_absent` is the number of pre-existing observations in
+  the declared `store_coverage` that the batch did NOT include and
+  that consequently transitioned to `removed_at`.
+
+Failure responses:
+
+| Status | `code`                    | When                                                                                                                  |
+| ------ | ------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| 400    | `bad_request`             | Malformed JSON, trailing JSON / garbage, body > 4 MiB, missing/empty `store_coverage`, duplicate store_coverage entry, `store_location` outside `store_coverage`, duplicate `(fingerprint, store_location)` inside batch, oversize PEM, oversize friendly_name, > 5000 certs, `collected_at` > now + 24h |
+| 400    | `private_key_rejected`    | ANY cert in the batch contains a recognized private-key PEM marker. Entire batch rejected (CERTIFICATE_INVENTORY.md §7 whole-batch reject). Audited `severity:"security"`. |
+| 400    | `certificate_unparseable` | ANY cert in the batch fails to parse as a single X.509 CERTIFICATE block. Entire batch rejected.                    |
+| 401    | `agent_unauthorized`      | Bearer missing, malformed, unknown, or agent revoked/disabled                                                         |
+| 500    | `internal_error`          | DB / transaction / audit-write failure                                                                                |
 
 ## Certificates
 

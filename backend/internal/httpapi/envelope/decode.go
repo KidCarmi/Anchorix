@@ -64,7 +64,26 @@ var ErrInvalidJSONBody = errors.New("envelope: invalid JSON body")
 // to signal request-body limits back to net/http; this helper
 // itself never writes a response.
 func DecodeStrictOptionalJSON(w http.ResponseWriter, r *http.Request, dst any) error {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, MaxJSONBodyBytes))
+	return DecodeStrictJSONWithLimit(w, r, dst, MaxJSONBodyBytes)
+}
+
+// DecodeStrictJSONWithLimit is the size-configurable variant of
+// DecodeStrictOptionalJSON for endpoints whose payload legitimately
+// exceeds the default 64 KiB cap — currently only certificate
+// ingestion (CERTIFICATE_INVENTORY.md §4 documents up to 4 MiB
+// for a batch of hundreds of certs × multi-KiB PEMs).
+//
+// The single behavior delta is `maxBytes`: callers pass the cap
+// their endpoint enforces. Everything else (empty-body OK,
+// single-object, second-Decode-must-EOF, ErrInvalidJSONBody on
+// failure) is identical to DecodeStrictOptionalJSON.
+//
+// maxBytes MUST be positive; a zero or negative value is a caller
+// bug. Pass via a named constant (e.g.
+// inventory.MaxCertificateBatchBodyBytes) rather than a magic
+// number at the call site.
+func DecodeStrictJSONWithLimit(w http.ResponseWriter, r *http.Request, dst any, maxBytes int64) error {
+	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxBytes))
 	if err := dec.Decode(dst); err != nil && !errors.Is(err, io.EOF) {
 		return ErrInvalidJSONBody
 	}

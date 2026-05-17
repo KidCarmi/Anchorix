@@ -27,6 +27,7 @@ import (
 	"github.com/kidcarmi/anchorix/backend/internal/config"
 	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
 	"github.com/kidcarmi/anchorix/backend/internal/httpapi"
+	"github.com/kidcarmi/anchorix/backend/internal/inventory"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
 	"github.com/kidcarmi/anchorix/backend/internal/storage/postgres"
 )
@@ -150,11 +151,18 @@ func testServer(t *testing.T, db *postgres.DB) (*httptest.Server, *auth.Service)
 		t.Fatalf("agentinventory.NewService: %v", err)
 	}
 
+	certRepo := postgres.NewCertificateInventoryRepository(db)
+	certSvc, err := inventory.NewService(certRepo, db, auditRecorder, clock.System{})
+	if err != nil {
+		t.Fatalf("inventory.NewService: %v", err)
+	}
+
 	srv, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{
 		AuthService:           svc,
 		CookieSigner:          signer,
 		EnrollmentService:     enrollSvc,
 		AgentInventoryService: inventorySvc,
+		InventoryService:      certSvc,
 	})
 	if err != nil {
 		t.Fatalf("httpapi.NewServer: %v", err)

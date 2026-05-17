@@ -57,6 +57,7 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 		PublicBaseURL: cfg.PublicBaseURL,
 	}
 	agentInventoryDeps := handlers.AgentInventoryDeps{Service: deps.AgentInventoryService}
+	agentCertificatesDeps := handlers.AgentCertificatesDeps{Service: deps.InventoryService}
 
 	// --- auth ---
 	// Login is anonymous; the session resolver runs but does not block.
@@ -103,6 +104,12 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 	// heartbeat: no audit row on success; one snapshot row per
 	// (organization_id, agent_id) UPSERTed in place.
 	mux.Handle("POST /agent/inventory", agentAuth(handlers.AgentInventorySubmit(agentInventoryDeps)))
+	// POST /agent/certificates (H-015) — agent reports a batch of
+	// observed certificates. Set-reconciliation per declared
+	// store_coverage; private-key material rejected wholesale;
+	// transactional with pg_advisory_xact_lock per agent (H-017)
+	// so concurrent batches for the same agent serialize.
+	mux.Handle("POST /agent/certificates", agentAuth(handlers.AgentCertificatesIngest(agentCertificatesDeps)))
 	// GET /agents/{id}/inventory (PR-018) — operator read of the
 	// snapshot above. Org-scoped via the session; cross-org id
 	// surfaces as 404 not_found.

@@ -54,22 +54,26 @@ type Repository interface {
 	//
 	// storeCoverage MUST be non-empty (per
 	// CERTIFICATE_INVENTORY.md §3 / §4: an empty store_coverage
-	// would silently disable reconciliation). The caller (the
-	// future H-015 ingestion service) enforces this at the API
-	// boundary; the repository surfaces an explicit error if it
-	// receives an empty slice as defense in depth.
+	// would silently disable reconciliation). The H-015 ingestion
+	// service enforces this at the API boundary; the repository
+	// surfaces an explicit error if it receives an empty slice as
+	// defense in depth.
 	//
 	// observedCertIDs may be empty — that case means "the batch
 	// reported NO certs in the covered stores, mark ALL existing
 	// observations in those stores as removed". This is a valid
 	// real-world state (e.g. an agent emptied its trust store).
+	//
+	// Returns the number of observation rows affected — used by
+	// the HTTP handler to populate `reconciled_absent` in the
+	// response envelope (CERTIFICATE_INVENTORY.md §4).
 	MarkMissingObservationsRemoved(
 		ctx context.Context,
 		organizationID, agentID string,
 		storeCoverage []string,
 		observedCertIDs []string,
 		collectedAt time.Time,
-	) error
+	) (int, error)
 
 	// GetCertificate returns a single certificate row by id within
 	// an organization. Returns ErrCertificateNotFound when no row
@@ -87,6 +91,23 @@ type Repository interface {
 		ctx context.Context,
 		organizationID, certificateID string,
 	) ([]CertificateObservation, error)
+}
+
+// Transactor runs fn inside a single transaction with an exclusive
+// transaction-scope advisory lock keyed by the agent id. The
+// implementation (storage/postgres.DB) binds the tx to ctx so
+// repository calls inside fn auto-enlist, and takes
+// pg_advisory_xact_lock so two concurrent ingestion batches for
+// the same agent serialize (H-017: without serialization, batch A
+// can mark batch B's freshly-upserted observation as removed
+// before A's own upserts land).
+//
+// The lock is released automatically on commit / rollback;
+// batches for DIFFERENT agents run in parallel.
+//
+// Interface owned by the consumer per CLAUDE.md §8.8.
+type Transactor interface {
+	WithTxLockedAgent(ctx context.Context, agentID string, fn func(ctx context.Context) error) error
 }
 
 // ListQuery captures the supported filters for the future

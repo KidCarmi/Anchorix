@@ -927,22 +927,23 @@ PRs it spawns:
   modeling is deferred. Path validation is a query-time concern,
   not a storage-time one.
 
+## Status
+
+| Phase | Status |
+|---|---|
+| H-011 design (this doc) | **shipped** (PR #23) |
+| H-014 storage layer | **shipped** (PR #24) + adversarial review (PR #25) |
+| H-017 concurrent-batch advisory lock | **shipped** as part of H-015 — `WithTxLockedAgent` in `internal/storage/postgres/postgres.go` |
+| H-018 first_seen_at out-of-order merge | **shipped** (PR #25) |
+| H-015 agent ingestion endpoint | **shipped** (this PR) |
+| H-016 operator read API | open |
+| (Phase 4) findings integration | future |
+
 ## Recommended PR sequence after this design
 
-1. **This PR (H-011 design)** — docs only. No code.
-2. **H-014 — `feat(inventory): certificate + observations storage layer`.**
-   Migration introducing `certificates` and `certificate_observations`
-   with composite FKs to `agents` (PR-019 H-009 pattern), the
-   internal/inventory repository implementation, the deduplication
-   model, and the reconciliation SQL pattern. Indexes per §10. No
-   HTTP surface yet.
-3. **H-015 — `feat(inventory): agent certificate ingestion endpoint`.**
-   `POST /api/v1/agent/certificates` wired behind
-   `RequireAuthenticatedAgent`. Uses the H-014 storage layer plus
-   the existing `envelope.DecodeStrictOptionalJSON` helper
-   (`H-009`). Implements §4 (request/response), §5 (idempotency),
-   §6 (audit), §7 (private-key rejection). Full unit + integration
-   test coverage.
+1. ~~H-011 design~~ — shipped.
+2. ~~H-014 storage layer~~ — shipped.
+3. ~~H-015 agent ingestion endpoint~~ — `POST /api/v1/agent/certificates` shipped. Uses the H-014 storage layer plus a size-configurable variant of the H-009 strict JSON decoder (`envelope.DecodeStrictJSONWithLimit` — 4 MiB cap for cert batches). Implements §4 (request/response), §5 (idempotency via set reconciliation), §6 (audit), §7 (private-key rejection), and §"Why store_coverage is required" (required + non-empty). Per-agent advisory lock (H-017) prevents concurrent-batch races. PEM normalization done server-side via `pem.Encode` of the parsed DER so different agent serializers' formatting deduplicates to the same fingerprint.
 4. **H-016 — `feat(inventory): operator certificate read API`.**
    `GET /api/v1/certificates`, `/certificates/{id}`,
    `/certificates/{id}/observations`, `/agents/{id}/certificates`.
@@ -950,10 +951,9 @@ PRs it spawns:
 5. **(Phase 4) Findings integration** — separate design, separate
    PR. The schema landed in H-014 is the substrate.
 
-H-014 and H-015 must ship in order (H-015 depends on the schema
-landing first). H-016 is loosely independent — it could ship
-between H-014 and H-015 (with no real observations to read) but
-the operator-useful state is after H-015.
+H-016 is loosely independent of H-015 — it could ship before
+H-015 (with no real observations to read) but the operator-useful
+state is after H-015.
 
 ## Unresolved questions
 

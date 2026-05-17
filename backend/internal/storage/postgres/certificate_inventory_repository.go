@@ -208,15 +208,15 @@ func (r *CertificateInventoryRepository) MarkMissingObservationsRemoved(
 	storeCoverage []string,
 	observedCertIDs []string,
 	collectedAt time.Time,
-) error {
+) (int, error) {
 	if strings.TrimSpace(organizationID) == "" {
-		return fmt.Errorf("%w: organization id required", inventory.ErrInvalidReconciliation)
+		return 0, fmt.Errorf("%w: organization id required", inventory.ErrInvalidReconciliation)
 	}
 	if strings.TrimSpace(agentID) == "" {
-		return fmt.Errorf("%w: agent id required", inventory.ErrInvalidReconciliation)
+		return 0, fmt.Errorf("%w: agent id required", inventory.ErrInvalidReconciliation)
 	}
 	if len(storeCoverage) == 0 {
-		return fmt.Errorf("%w: store_coverage must be non-empty", inventory.ErrInvalidReconciliation)
+		return 0, fmt.Errorf("%w: store_coverage must be non-empty", inventory.ErrInvalidReconciliation)
 	}
 
 	// observedCertIDs may legitimately be empty (the batch reported
@@ -241,12 +241,13 @@ func (r *CertificateInventoryRepository) MarkMissingObservationsRemoved(
 		   AND NOT (certificate_id = ANY($5::text[]))
 		   AND removed_at IS NULL
 		   AND last_seen_at <= $4`
-	if _, err := r.db.querierFor(ctx).Exec(ctx, q,
+	tag, err := r.db.querierFor(ctx).Exec(ctx, q,
 		organizationID, agentID, storeCoverage, collectedAt, observedCertIDs,
-	); err != nil {
-		return fmt.Errorf("postgres: mark missing observations removed: %w", err)
+	)
+	if err != nil {
+		return 0, fmt.Errorf("postgres: mark missing observations removed: %w", err)
 	}
-	return nil
+	return int(tag.RowsAffected()), nil
 }
 
 // GetCertificate returns the certificate row for the

@@ -28,3 +28,41 @@ var ErrCertificateNotFound = errors.New("inventory: certificate not found")
 // it reaches the storage layer, but the repository surfaces the
 // sentinel as a defense-in-depth check.
 var ErrInvalidReconciliation = errors.New("inventory: invalid reconciliation input")
+
+// ErrInvalidBatch is returned by Service.Submit when an ingestion
+// batch fails any of the structural / shape validations the
+// service enforces beyond the HTTP handler's byte/count caps:
+//
+//   - missing organization id or agent id,
+//   - empty store_coverage or duplicate entries in it,
+//   - cert.store_location not declared in store_coverage,
+//   - duplicate (fingerprint, store_location) inside the batch,
+//   - duplicate raw PEM bytes inside the batch,
+//   - collected_at > now + 24h (clock-skew guard).
+//
+// HTTP handler maps to 400 bad_request.
+var ErrInvalidBatch = errors.New("inventory: invalid certificate batch")
+
+// ErrPrivateKeyMaterial is returned by Service.Submit when any
+// certificate_pem in the batch contains a recognized private-key
+// marker. Per CLAUDE.md §6.2 and CERTIFICATE_INVENTORY.md §7 the
+// ENTIRE batch is rejected — partial accept would let an agent
+// probe which markers trigger the reject. HTTP handler maps to
+// 400 private_key_rejected.
+var ErrPrivateKeyMaterial = errors.New("inventory: private key material rejected")
+
+// ErrInvalidCertificate is returned by Service.Submit when any
+// certificate_pem in the batch fails to parse as a single X.509
+// CERTIFICATE block. Whole-batch reject for the same reasons as
+// ErrPrivateKeyMaterial. HTTP handler maps to 400
+// certificate_unparseable.
+var ErrInvalidCertificate = errors.New("inventory: certificate failed to parse")
+
+// ErrInternalAudit is returned by Service.Submit when a security-
+// significant audit write fails (private-key rejection,
+// certificate-unparseable rejection). The audit row is the only
+// visible trail for those rejection signals; failing the request
+// rather than silently dropping the audit upholds the §9 invariant
+// that audits are not optional on security-significant flows. HTTP
+// handler maps to 500 internal_error.
+var ErrInternalAudit = errors.New("inventory: audit write failed")

@@ -16,6 +16,7 @@ import (
 	"github.com/kidcarmi/anchorix/backend/internal/auth"
 	"github.com/kidcarmi/anchorix/backend/internal/config"
 	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
+	"github.com/kidcarmi/anchorix/backend/internal/inventory"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
 )
 
@@ -27,6 +28,7 @@ type Dependencies struct {
 	CookieSigner          *auth.SignedCookie
 	EnrollmentService     *enrollment.Service
 	AgentInventoryService *agentinventory.Service
+	InventoryService      *inventory.Service
 }
 
 // Server owns the HTTP listener and graceful shutdown lifecycle.
@@ -51,8 +53,8 @@ func NewServer(cfg *config.Config, log *logger.Logger, deps Dependencies) (*Serv
 	if log == nil {
 		return nil, errors.New("nil logger")
 	}
-	if deps.AuthService == nil || deps.CookieSigner == nil || deps.EnrollmentService == nil || deps.AgentInventoryService == nil {
-		return nil, errors.New("httpapi: incomplete Dependencies (AuthService + CookieSigner + EnrollmentService + AgentInventoryService required)")
+	if deps.AuthService == nil || deps.CookieSigner == nil || deps.EnrollmentService == nil || deps.AgentInventoryService == nil || deps.InventoryService == nil {
+		return nil, errors.New("httpapi: incomplete Dependencies (AuthService + CookieSigner + EnrollmentService + AgentInventoryService + InventoryService required)")
 	}
 	readiness := NewReadiness()
 	router := newRouter(cfg, log, readiness, deps)
