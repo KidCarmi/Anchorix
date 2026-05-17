@@ -315,14 +315,26 @@ func AgentInventoryList(deps AgentInventoryDeps) http.HandlerFunc {
 
 // parseLimitQuery converts a raw `limit` query parameter into the
 // integer the service expects. An empty value is "use the service
-// default"; a non-integer is rejected. Out-of-bounds limits are
-// validated by the service itself (ErrInvalidListInput) so the
-// rule lives in one place — this helper only catches non-numeric
-// input, which the service can't usefully diagnose because it
-// arrives pre-typed.
+// default"; a non-integer or non-positive value is rejected at the
+// HTTP boundary. Out-of-bounds upper-limits (above MaxListLimit)
+// are still validated by the service's normalizeLimit so the
+// MaxListLimit constant lives in one place — this helper only
+// catches non-numeric input and the explicit-zero case the service
+// cannot distinguish from "use default" once both collapse to int.
 func parseLimitQuery(raw string) (int, error) {
 	if raw == "" {
 		return 0, nil
 	}
-	return strconv.Atoi(raw)
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0, err
+	}
+	if n <= 0 {
+		// Explicit `?limit=0` and negative values are caller-input
+		// bugs; rejecting them here preserves the documented 1–200
+		// bounds and prevents the service from silently treating
+		// "0" as "use default".
+		return 0, errors.New("limit must be positive")
+	}
+	return n, nil
 }

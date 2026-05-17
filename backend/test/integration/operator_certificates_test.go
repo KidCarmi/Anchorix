@@ -124,7 +124,6 @@ func TestOperatorListCertificatesHappyPath(t *testing.T) {
 	a := generatedCert(t, "alpha.example")
 	b := generatedCert(t, "beta.example")
 	submitOneCert(t, srv.URL, credential, a, `LocalMachine\My`, "alpha-friendly")
-	time.Sleep(2 * time.Millisecond)
 	submitOneCert(t, srv.URL, credential, b, `LocalMachine\My`, "beta-friendly")
 
 	var out certListDTO
@@ -135,20 +134,26 @@ func TestOperatorListCertificatesHappyPath(t *testing.T) {
 	if out.NextCursor != nil {
 		t.Errorf("next_cursor = %v, want nil", *out.NextCursor)
 	}
-	// Latest cert ingested (beta) must be first under
-	// last_seen_at DESC ordering.
-	if out.Items[0].Subject != "CN=beta.example" {
-		t.Errorf("first row subject = %q, want CN=beta.example", out.Items[0].Subject)
-	}
-	// Active observation count is per-cert: each cert has exactly
-	// one observation in one store.
+	// Assert set membership rather than position. The wire
+	// `collected_at` is RFC3339 second-precision (the agent test
+	// helper formats it that way), so two submits within the same
+	// second produce identical `last_seen_at` and the id-ASC
+	// tiebreaker takes over — that ordering is implementation-
+	// derived and not part of the operator contract worth pinning
+	// in this test. Ordering correctness is exercised by the
+	// pagination test, which seeds 5 certs and walks the cursor.
+	subjects := map[string]bool{}
 	for _, item := range out.Items {
+		subjects[item.Subject] = true
 		if item.ObservationCount != 1 {
 			t.Errorf("%s observation_count = %d, want 1", item.Subject, item.ObservationCount)
 		}
 		if item.ActiveObservationCount != 1 {
 			t.Errorf("%s active_observation_count = %d, want 1", item.Subject, item.ActiveObservationCount)
 		}
+	}
+	if !subjects["CN=alpha.example"] || !subjects["CN=beta.example"] {
+		t.Errorf("subjects = %v, want both CN=alpha.example and CN=beta.example", subjects)
 	}
 }
 
@@ -830,6 +835,7 @@ func TestOperatorListCertificatesLimitOutOfBounds(t *testing.T) {
 	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
 
 	for _, q := range []string{
+		"limit=0",   // explicit zero is a caller-input bug, not "use default"
 		"limit=-1",
 		"limit=201", // above MaxListLimit
 		"limit=notanumber",
