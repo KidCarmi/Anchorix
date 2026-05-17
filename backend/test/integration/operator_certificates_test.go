@@ -1004,7 +1004,15 @@ func TestOperatorListCertificatesQFilterEscapesUnderscore(t *testing.T) {
 }
 
 // TestOperatorListCertificatesQFilterEscapesPercent proves the
-// same property for the `%` LIKE wildcard.
+// same property for the `%` LIKE wildcard. The fixture is chosen
+// so the test exercises the buggy behavior, not just the fixed
+// one: `amazon.example` contains `a` followed (eventually) by `z`,
+// so under unescaped LIKE the wrapped pattern `%a%z%` matches it
+// — and the test would fail. With the fix, the wrapped pattern
+// is `%a\%z%` ESCAPE '\', which requires the literal byte
+// sequence `a%z` that the subject does not contain. The unrelated
+// `xyz.example` row is along for the ride as a negative-space
+// check that the query is not silently broken in some other way.
 func TestOperatorListCertificatesQFilterEscapesPercent(t *testing.T) {
 	db := testDB(t)
 	freshDatabase(t, db)
@@ -1012,24 +1020,26 @@ func TestOperatorListCertificatesQFilterEscapesPercent(t *testing.T) {
 	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
 	_, credential := enrolledAgent(t, srv.URL, adminClient)
 
-	// Subject CNs must be DNS-name-compatible for the generated
-	// certificate template, so we cannot embed `%` in the subject.
-	// Instead seed two certs whose subjects bracket the literal
-	// query string and verify the query does NOT match them.
 	submitCertBatch(t, srv.URL, credential, ingestRequestDTO{
 		CollectedAt:   nowRFC3339(),
 		StoreCoverage: []string{`LocalMachine\My`},
 		Certificates: []ingestCertDTO{
-			{StoreLocation: `LocalMachine\My`, CertificatePEM: generatedCert(t, "abc.example")},
+			// `amazon.example` is the trap: under unescaped LIKE
+			// the pattern `%a%z%` matches it (a, then anything,
+			// then z appears inside `amazon`); under the fix, the
+			// literal byte sequence `a%z` is required and is
+			// absent, so this cert MUST NOT appear in results.
+			{StoreLocation: `LocalMachine\My`, CertificatePEM: generatedCert(t, "amazon.example")},
+			// Unrelated row that does not match either form.
 			{StoreLocation: `LocalMachine\My`, CertificatePEM: generatedCert(t, "xyz.example")},
 		},
 	}, http.StatusOK)
 
-	// `?q=a%z` under unescaped LIKE matches anything starting with
-	// `a` and containing `z` (e.g., `xyz.example` once the
-	// surrounding `%...%` wrap is applied, the pattern becomes
-	// `%a%z%`). With escaping, the literal `a%z` byte sequence is
-	// not present in either subject, so zero items match.
+	// `?q=a%25z` is `?q=a%z` after URL-decoding. With `%` escaped
+	// at the SQL layer, this is a literal-byte search and matches
+	// nothing. Without the escape, the same query would match
+	// `amazon.example` (a wildcard z somewhere later) — that is
+	// the regression this test is here to catch.
 	var list certListDTO
 	operatorGetJSON(t, srv.URL, adminClient,
 		"/api/v1/certificates?q=a%25z", http.StatusOK, &list)
