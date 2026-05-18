@@ -16,6 +16,95 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
 
 ## Open Items
 
+### H-022 — Findings: scheduled recompute
+
+- **Title:** `feat(findings): scheduled background recompute`
+- **Risk:** low-medium (operational). v0.1 `recompute` is
+  operator-triggered only — an operator who forgets to recompute
+  after the underlying inventory changes will see stale
+  findings until the next manual run. The H-021 implementation
+  is synchronous and idempotent, so a scheduler can just call
+  `Service.Recompute` on a tick.
+- **Scope:** a background goroutine owned by the composition
+  root (CLAUDE.md §8.10 — documented owner, context-cancelled,
+  bounded retry). Tick interval is configurable via
+  `internal/config` (no hot-reload — CLAUDE.md §8.9). One tick
+  per org. Failures emit a structured log line and bump a
+  metric counter; the next tick retries (recompute is
+  idempotent, so retries are safe). No audit row for tick
+  start; the existing `findings.recomputed` row IS the audit
+  trail.
+- **Recommended PR:** `feat(findings): scheduled background recompute`.
+- **Reason not fixed now:** H-021 explicitly scopes out
+  background workers. The synchronous endpoint is the v0.1
+  surface; scheduled recompute is an additive deployment-shape
+  change that benefits from being in its own PR with operational
+  knobs (tick interval, jitter, per-org enable/disable).
+- **References:** CLAUDE.md §8.10 (concurrency discipline);
+  `docs/engineering/CERTIFICATE_FINDINGS.md` §5 (recompute
+  lifecycle).
+
+### H-023 — Findings: acknowledge / suppress workflow
+
+- **Title:** `feat(findings): operator acknowledge + suppress workflow`
+- **Risk:** medium (operational + UX). The `findings` schema
+  reserves the `acknowledged` and `suppressed` status values
+  via the migration 0001 CHECK constraint, but the H-021
+  recompute only writes `open` / `resolved`. Operators who want
+  to silence a finding they have triaged (or suppressed
+  temporarily for a known false-positive) currently have no
+  in-product surface — they would have to filter the finding
+  out at presentation time, which doesn't survive recompute
+  cycles or operator handoffs.
+- **Scope:** two POST endpoints
+  (`POST /findings/{id}/acknowledge`,
+  `POST /findings/{id}/suppress`) with required `reason`
+  bodies, an audit row per state change
+  (`finding.acknowledged`, `finding.suppressed`), and a small
+  service path that updates the existing row's status without
+  reopening it on the next recompute. Suppression carries an
+  expiry; acknowledgement does not. Recompute's diff logic
+  needs a "do not reopen suppressed/acknowledged findings on
+  re-match" rule.
+- **Recommended PR:** `feat(findings): operator acknowledge + suppress workflow`.
+- **Reason not fixed now:** H-021 explicitly scopes out the
+  override workflow. The stubs in
+  `internal/httpapi/handlers/findings.go` keep the route
+  surface documented as future work.
+- **References:** CLAUDE.md §6 (audit policy on state
+  changes); `docs/engineering/CERTIFICATE_FINDINGS.md` §7
+  (non-goals); migration `0001_init.sql` (status CHECK
+  reserves the values).
+
+### H-024 — Findings: recompute scan performance at fleet scale
+
+- **Title:** `perf(findings): paginate Recompute's full-org cert + finding loads`
+- **Risk:** low-medium (operational). `Service.Recompute`
+  loads ALL certs and ALL findings for the organization into
+  memory in one query each. At the v0.1 fleet sizing target
+  (≤ 1K certs per org per
+  [`CERTIFICATE_INVENTORY.md`](./CERTIFICATE_INVENTORY.md) §10)
+  this is fast and small (~1 MB total). At findings-era load
+  (10K–100K certs per org), the in-memory diff stage stays
+  acceptable but the cert-load query crosses past O(seconds)
+  and the request budget pressure becomes real.
+- **Scope:** replace the single `ListAllCertificateSummariesForOrg`
+  + `ListAllForOrg` reads with batched cursor-paginated scans
+  that the diff logic streams over. The existing rule
+  pipeline already operates row-by-row, so batching is
+  additive — no architectural change to the rule layer.
+  Background tick (H-022) is the natural consumer of this
+  optimization; until then, the synchronous endpoint covers
+  v0.1 scale comfortably.
+- **Recommended PR:** `perf(findings): paginate Recompute scans`.
+- **Reason not fixed now:** H-021 explicitly scopes out
+  performance optimization, and the v0.1 fleet target is
+  comfortably under the threshold where this becomes a real
+  problem. Adding speculative pagination now would conflict
+  with the "real items only" backlog rule (CLAUDE.md §19).
+- **References:** `docs/engineering/CERTIFICATE_FINDINGS.md`
+  §5 (recompute lifecycle, fleet sizing assumption).
+
 ### H-019 — Certificate ingestion: audit-row amplification under sustained rejected batches
 
 - **Title:** `feat(inventory): rate-limit per-agent batch-rejection audit rows`

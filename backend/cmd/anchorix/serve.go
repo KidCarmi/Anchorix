@@ -11,6 +11,7 @@ import (
 	"github.com/kidcarmi/anchorix/backend/internal/clock"
 	"github.com/kidcarmi/anchorix/backend/internal/config"
 	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
+	"github.com/kidcarmi/anchorix/backend/internal/findings"
 	"github.com/kidcarmi/anchorix/backend/internal/httpapi"
 	"github.com/kidcarmi/anchorix/backend/internal/inventory"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
@@ -91,6 +92,14 @@ func cmdServe(ctx context.Context, cfg *config.Config, log *logger.Logger) error
 		return fmt.Errorf("inventory service: %w", err)
 	}
 
+	findingsRepo := postgres.NewFindingsRepository(db)
+	findingsService, err := findings.NewService(
+		findingsRepo, certInventoryRepo, db, auditRecorder, clock.System{}, findings.DefaultRules(),
+	)
+	if err != nil {
+		return fmt.Errorf("findings service: %w", err)
+	}
+
 	// HTTP layer.
 	srv, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{
 		AuthService:           authService,
@@ -98,6 +107,7 @@ func cmdServe(ctx context.Context, cfg *config.Config, log *logger.Logger) error
 		EnrollmentService:     enrollmentService,
 		AgentInventoryService: agentInventoryService,
 		InventoryService:      inventoryService,
+		FindingsService:       findingsService,
 	})
 	if err != nil {
 		return fmt.Errorf("init server: %w", err)

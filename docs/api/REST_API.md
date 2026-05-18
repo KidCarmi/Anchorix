@@ -875,15 +875,108 @@ the session resolver.
 
 ## Findings
 
-| Method | Path                                | Auth | Purpose                            |
-| ------ | ----------------------------------- | ---- | ---------------------------------- |
-| GET    | `/findings`                         | user | Paginated, filterable list         |
-| GET    | `/findings/{id}`                    | user | Single finding with evidence       |
-| POST   | `/findings/{id}/acknowledge`        | user | Acknowledge with required reason   |
-| POST   | `/findings/{id}/suppress`           | user | Suppress with reason + expiry      |
+Certificate findings (H-021). Findings are **derived state**:
+deterministic rules read the certificate inventory and produce
+finding rows. See
+[`docs/engineering/CERTIFICATE_FINDINGS.md`](../engineering/CERTIFICATE_FINDINGS.md)
+for the rule registry, evidence shapes, and recompute lifecycle.
 
-Acknowledge / suppress bodies require a non-empty `reason`. Both actions
-emit `audit_events`.
+Operator-only (session cookie required); agent bearer
+credentials are NOT honored. Org-scoped by the authenticated
+user's `organization_id` — cross-org ids return `404 not_found`,
+never `403`.
+
+| Method | Path                                | Auth | Purpose                                                                  |
+| ------ | ----------------------------------- | ---- | ------------------------------------------------------------------------ |
+| POST   | `/findings/recompute`               | user | Synchronously recompute findings for the operator's organization         |
+| GET    | `/findings`                         | user | Paginated, filterable list                                               |
+| GET    | `/findings/{id}`                    | user | Single finding with evidence                                             |
+| POST   | `/findings/{id}/acknowledge`        | user | `501 not_implemented` — reserved by schema; out of scope for H-021       |
+| POST   | `/findings/{id}/suppress`           | user | `501 not_implemented` — reserved by schema; out of scope for H-021       |
+
+### `POST /findings/recompute`
+
+Synchronous. Returns the recompute counter set:
+
+```json
+{
+  "status": "ok",
+  "evaluated_certificates": 42,
+  "opened": 3,
+  "updated": 17,
+  "resolved": 1,
+  "unchanged": 0,
+  "rule_count": 6
+}
+```
+
+Counters are mutually exclusive — every finding ends up in
+exactly one bucket per run. `opened` includes both first-time
+detections and reopened previously-resolved findings.
+
+**Audit:** one `findings.recomputed` row is written per call
+inside the same transaction as the finding state changes. If
+the audit write fails, the entire recompute is rolled back —
+either the audit row AND the state changes land together, or
+neither does.
+
+### `GET /findings`
+
+Query parameters (all optional):
+
+| Name             | Default | Meaning                                                                      |
+| ---------------- | ------- | ---------------------------------------------------------------------------- |
+| `status`         | `open`  | One of `open` / `resolved` / `all`                                           |
+| `severity`       | —       | Exact match: `info` / `low` / `medium` / `high` / `critical`                 |
+| `rule_id`        | —       | Exact match against the rule id (e.g. `weak_rsa_key`)                        |
+| `certificate_id` | —       | Exact match — useful for "all findings for one cert"                         |
+| `limit`          | 50      | 1–200 inclusive. Out-of-bounds returns 400. Explicit `?limit=0` also rejected. |
+| `cursor`         | —       | Opaque cursor from a previous response's `next_cursor`.                      |
+
+Ordering: `last_seen_at DESC, id ASC` (matches H-010 cursor
+pattern).
+
+Response:
+
+```json
+{
+  "items": [
+    {
+      "id": "01J5...",
+      "rule_id": "weak_rsa_key",
+      "rule_version": 1,
+      "title": "RSA key below 2048 bits",
+      "severity": "high",
+      "status": "open",
+      "certificate_id": "01J4...",
+      "evidence": {
+        "public_key_algorithm": "RSA",
+        "public_key_bits": 1024,
+        "threshold_bits": 2048
+      },
+      "first_seen_at": "2026-05-17T14:00:00Z",
+      "last_seen_at":  "2026-05-17T18:30:00Z",
+      "resolved_at":   null,
+      "updated_at":    "2026-05-17T18:30:00Z"
+    }
+  ],
+  "next_cursor": null
+}
+```
+
+`first_seen_at` is preserved across resolve → reopen cycles;
+`last_seen_at` bumps on every recompute that re-confirms the
+match; `resolved_at` is non-null when `status == "resolved"`.
+
+### `GET /findings/{id}`
+
+Same row shape as one entry of the list response. Cross-org or
+missing id → `404 not_found`.
+
+### Audit policy
+
+`POST /findings/recompute` writes one `findings.recomputed`
+audit row per call. The read endpoints write no audit rows.
 
 ## Audit
 
