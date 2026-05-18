@@ -62,20 +62,37 @@ const (
 //     that re-confirms a match bumps both; a recompute that
 //     resolves a finding bumps UpdatedAt and stamps ResolvedAt
 //     but leaves LastSeenAt at the prior re-confirmation time.
+//
+// Certificate context (JOIN-populated, NOT stored on the
+// findings row):
+//
+//   - FingerprintSHA256 — the referenced certificate's
+//     fingerprint, populated by GetFinding / ListFindings via
+//     a JOIN to the `certificates` table. Empty when the
+//     finding is loaded by ListAllForOrg (recompute path) —
+//     that path doesn't need cert context.
+//   - Subject — same: JOIN-populated cert subject DN.
+//
+// These two are response-shaping context, not finding identity.
+// The UpdateFinding / InsertFinding paths ignore them; only the
+// scan paths that need to surface them to operators populate
+// them.
 type Finding struct {
-	ID             string
-	OrganizationID string
-	CertificateID  string
-	RuleID         string
-	RuleVersion    int
-	Severity       Severity
-	Status         Status
-	Title          string
-	Evidence       json.RawMessage
-	FirstSeenAt    time.Time
-	LastSeenAt     time.Time
-	ResolvedAt     *time.Time
-	UpdatedAt      time.Time
+	ID                string
+	OrganizationID    string
+	CertificateID     string
+	RuleID            string
+	RuleVersion       int
+	Severity          Severity
+	Status            Status
+	Title             string
+	Evidence          json.RawMessage
+	FirstSeenAt       time.Time
+	LastSeenAt        time.Time
+	ResolvedAt        *time.Time
+	UpdatedAt         time.Time
+	FingerprintSHA256 string
+	Subject           string
 }
 
 // RecomputeResult is the counter set returned by Service.Recompute.

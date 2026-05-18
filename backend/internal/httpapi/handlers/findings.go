@@ -23,6 +23,14 @@ type FindingsDeps struct {
 // detail are minimal at v0.1 (evidence is included in both —
 // the schema is small and v0.1 doesn't yet generate huge
 // evidence payloads), so one shape covers both.
+//
+// `fingerprint_sha256` and `subject` are response-shaping
+// context populated by the repository's JOIN to `certificates`.
+// They are part of the documented H-021 wire contract; the
+// fields appear in every response, defaulting to empty strings
+// only when the underlying cert row is gone (LEFT JOIN
+// degraded; not reachable in v0.1 because ON DELETE CASCADE
+// removes the finding with the cert).
 type findingRow struct {
 	ID                string          `json:"id"`
 	RuleID            string          `json:"rule_id"`
@@ -31,8 +39,8 @@ type findingRow struct {
 	Severity          string          `json:"severity"`
 	Status            string          `json:"status"`
 	CertificateID     string          `json:"certificate_id"`
-	FingerprintSHA256 string          `json:"fingerprint_sha256,omitempty"`
-	Subject           string          `json:"subject,omitempty"`
+	FingerprintSHA256 string          `json:"fingerprint_sha256"`
+	Subject           string          `json:"subject"`
 	Evidence          json.RawMessage `json:"evidence"`
 	FirstSeenAt       string          `json:"first_seen_at"`
 	LastSeenAt        string          `json:"last_seen_at"`
@@ -256,17 +264,19 @@ func findingToRow(f *findings.Finding) findingRow {
 		evidence = json.RawMessage(`{}`)
 	}
 	return findingRow{
-		ID:            f.ID,
-		RuleID:        f.RuleID,
-		RuleVersion:   f.RuleVersion,
-		Title:         f.Title,
-		Severity:      string(f.Severity),
-		Status:        string(f.Status),
-		CertificateID: f.CertificateID,
-		Evidence:      evidence,
-		FirstSeenAt:   f.FirstSeenAt.UTC().Format(time.RFC3339),
-		LastSeenAt:    f.LastSeenAt.UTC().Format(time.RFC3339),
-		ResolvedAt:    resolvedAt,
-		UpdatedAt:     f.UpdatedAt.UTC().Format(time.RFC3339),
+		ID:                f.ID,
+		RuleID:            f.RuleID,
+		RuleVersion:       f.RuleVersion,
+		Title:             f.Title,
+		Severity:          string(f.Severity),
+		Status:            string(f.Status),
+		CertificateID:     f.CertificateID,
+		FingerprintSHA256: f.FingerprintSHA256,
+		Subject:           f.Subject,
+		Evidence:          evidence,
+		FirstSeenAt:       f.FirstSeenAt.UTC().Format(time.RFC3339),
+		LastSeenAt:        f.LastSeenAt.UTC().Format(time.RFC3339),
+		ResolvedAt:        resolvedAt,
+		UpdatedAt:         f.UpdatedAt.UTC().Format(time.RFC3339),
 	}
 }

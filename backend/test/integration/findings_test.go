@@ -552,6 +552,147 @@ func TestFindingsRecomputeAuditAccompaniesStateChange(t *testing.T) {
 	}
 }
 
+// TestFindingsRecomputeAuditCarriesRealActorID pins the Codex
+// P2 fix on PR #30: the findings.recomputed audit row's
+// `actor` column MUST carry the authenticated operator's user
+// id, NOT the previous generic "operator" placeholder. Without
+// the real actor, post-hoc filtering by user is broken and
+// incident investigation can't point at who triggered a
+// recompute.
+func TestFindingsRecomputeAuditCarriesRealActorID(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	seedCert(t, db, mustWeakCertFixture("actor-attribution"))
+	recompute(t, srv.URL, adminClient)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Find the seeded admin's user id directly from the users
+	// table — signInAdmin doesn't surface it to the test, and
+	// the audit row should match.
+	var adminUserID string
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT id FROM users WHERE email = $1`, testEmail,
+		).Scan(&adminUserID)
+	}); err != nil {
+		t.Fatalf("lookup admin id: %v", err)
+	}
+
+	// Latest findings.recomputed audit row for the org.
+	var actor, actorType string
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT actor, actor_type
+			   FROM audit_events
+			  WHERE action = 'findings.recomputed'
+			    AND organization_id = 'anchorix'
+			  ORDER BY occurred_at DESC
+			  LIMIT 1`,
+		).Scan(&actor, &actorType)
+	}); err != nil {
+		t.Fatalf("lookup audit row: %v", err)
+	}
+
+	if actor == "operator" {
+		t.Fatal("audit actor = 'operator' (generic placeholder); want real user id")
+	}
+	if actor != adminUserID {
+		t.Errorf("audit actor = %q, want admin user id %q", actor, adminUserID)
+	}
+	if actorType != "user" {
+		t.Errorf("audit actor_type = %q, want user", actorType)
+	}
+}
+
+// TestFindingsListResponseIncludesCertContext pins the second
+// Codex P2 fix on PR #30: the GET /findings response shape
+// promises `fingerprint_sha256` and `subject`. The handler must
+// populate both via the repository's JOIN to `certificates` —
+// not leave them empty.
+func TestFindingsListResponseIncludesCertContext(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	// Cert with a recognizable subject so the assertion is
+	// strict, not just "non-empty".
+	cert := defaultCertFixture("cert-context-target", "context-target.example")
+	cert.PublicKeyBits = 1024 // fires weak_rsa_key
+	seedCert(t, db, cert)
+	recompute(t, srv.URL, adminClient)
+
+	// List path.
+	list := findingsList(t, srv.URL, adminClient, "")
+	if len(list.Items) != 1 {
+		t.Fatalf("list items = %d, want 1", len(list.Items))
+	}
+	got := list.Items[0]
+	if got.Subject != "CN=context-target.example" {
+		t.Errorf("list[0].subject = %q, want CN=context-target.example", got.Subject)
+	}
+	if got.FingerprintSHA256 != "fp-cert-context-target" {
+		t.Errorf("list[0].fingerprint_sha256 = %q, want fp-cert-context-target", got.FingerprintSHA256)
+	}
+
+	// Detail path.
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/findings/"+got.ID, nil)
+	resp, err := adminClient.Do(req)
+	if err != nil {
+		t.Fatalf("detail GET: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("detail status = %d, want 200", resp.StatusCode)
+	}
+	var detail findingRowDTO
+	if err := json.NewDecoder(resp.Body).Decode(&detail); err != nil {
+		t.Fatalf("decode detail: %v", err)
+	}
+	if detail.Subject != "CN=context-target.example" {
+		t.Errorf("detail.subject = %q, want CN=context-target.example", detail.Subject)
+	}
+	if detail.FingerprintSHA256 != "fp-cert-context-target" {
+		t.Errorf("detail.fingerprint_sha256 = %q, want fp-cert-context-target", detail.FingerprintSHA256)
+	}
+}
+
+// TestFindingsListResponseAlwaysHasCertContextFields catches
+// `omitempty`-style regressions: the cert-context fields must
+// be PRESENT in the JSON object even when (hypothetically)
+// empty. A future change that adds `omitempty` would drop the
+// keys from the JSON, breaking the documented contract; this
+// raw-JSON probe fails on that regression.
+func TestFindingsListResponseAlwaysHasCertContextFields(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	cert := defaultCertFixture("schema-shape-cert", "schema-shape.example")
+	cert.PublicKeyBits = 1024
+	seedCert(t, db, cert)
+	recompute(t, srv.URL, adminClient)
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/findings", nil)
+	resp, err := adminClient.Do(req)
+	if err != nil {
+		t.Fatalf("list GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	for _, key := range []string{`"fingerprint_sha256"`, `"subject"`} {
+		if !strings.Contains(string(body), key) {
+			t.Errorf("list payload missing field %s; body=%s", key, body)
+		}
+	}
+}
+
 func mustWeakCertFixture(id string) certFixture {
 	f := defaultCertFixture(id, id+".example")
 	f.PublicKeyBits = 1024

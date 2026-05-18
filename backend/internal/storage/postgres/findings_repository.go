@@ -111,19 +111,29 @@ func (r *FindingsRepository) UpdateFinding(ctx context.Context, f *findings.Find
 }
 
 // GetFinding returns the (org, finding) row or ErrFindingNotFound.
+// JOINs `certificates` to populate the response-shaping context
+// fields (FingerprintSHA256, Subject) that the operator API
+// surfaces. The composite FK on (organization_id,
+// certificate_id) introduced in migration 0006 guarantees the
+// join row exists in the SAME organization.
 func (r *FindingsRepository) GetFinding(
 	ctx context.Context,
 	organizationID, findingID string,
 ) (*findings.Finding, error) {
 	const q = `
-		SELECT id, organization_id, certificate_id,
-		       rule_id, rule_version,
-		       severity, status, title, evidence,
-		       opened_at, last_seen_at, resolved_at, updated_at
-		  FROM findings
-		 WHERE id = $1 AND organization_id = $2`
+		SELECT f.id, f.organization_id, f.certificate_id,
+		       f.rule_id, f.rule_version,
+		       f.severity, f.status, f.title, f.evidence,
+		       f.opened_at, f.last_seen_at, f.resolved_at, f.updated_at,
+		       COALESCE(c.fingerprint_sha256, ''),
+		       COALESCE(c.subject, '')
+		  FROM findings f
+		  LEFT JOIN certificates c
+		    ON c.organization_id = f.organization_id
+		   AND c.id = f.certificate_id
+		 WHERE f.id = $1 AND f.organization_id = $2`
 	row := r.db.querierFor(ctx).QueryRow(ctx, q, findingID, organizationID)
-	f, err := scanFinding(row)
+	f, err := scanFindingWithCert(row)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, findings.ErrFindingNotFound
@@ -174,9 +184,18 @@ func (r *FindingsRepository) ListAllForOrg(
 // operator GET /findings endpoint. Filters compose with AND;
 // no filter falls back to "all rows for the org".
 //
-// Ordering: last_seen_at DESC, id ASC. Cursor encodes the same
-// tuple; "after" is the strict-less + tiebreaker comparison
-// matching the H-010 pattern.
+// Joins `certificates` to populate the response-shaping
+// FingerprintSHA256 + Subject fields per the H-021 API
+// contract. The composite FK on (organization_id,
+// certificate_id) introduced in migration 0006 keeps the join
+// org-scoped — the LEFT JOIN's degraded-to-NULL case only
+// arises if a finding's cert has been deleted (CASCADE would
+// remove the finding too in v0.1, so the LEFT JOIN is defense
+// in depth).
+//
+// Ordering: f.last_seen_at DESC, f.id ASC. Cursor encodes the
+// same tuple; "after" is the strict-less + tiebreaker
+// comparison matching the H-010 pattern.
 func (r *FindingsRepository) ListFindings(
 	ctx context.Context,
 	q findings.ListQuery,
@@ -186,28 +205,28 @@ func (r *FindingsRepository) ListFindings(
 		args       []any
 	)
 	args = append(args, q.OrganizationID)
-	conditions = append(conditions, "organization_id = $1")
+	conditions = append(conditions, "f.organization_id = $1")
 
 	switch q.Status {
 	case findings.StatusFilterOpen:
-		conditions = append(conditions, "status = 'open'")
+		conditions = append(conditions, "f.status = 'open'")
 	case findings.StatusFilterResolved:
-		conditions = append(conditions, "status = 'resolved'")
+		conditions = append(conditions, "f.status = 'resolved'")
 	case findings.StatusFilterAll:
 		// no filter — both open and resolved.
 	}
 
 	if q.Severity != "" {
 		args = append(args, string(q.Severity))
-		conditions = append(conditions, fmt.Sprintf("severity = $%d", len(args)))
+		conditions = append(conditions, fmt.Sprintf("f.severity = $%d", len(args)))
 	}
 	if q.RuleID != "" {
 		args = append(args, q.RuleID)
-		conditions = append(conditions, fmt.Sprintf("rule_id = $%d", len(args)))
+		conditions = append(conditions, fmt.Sprintf("f.rule_id = $%d", len(args)))
 	}
 	if q.CertificateID != "" {
 		args = append(args, q.CertificateID)
-		conditions = append(conditions, fmt.Sprintf("certificate_id = $%d", len(args)))
+		conditions = append(conditions, fmt.Sprintf("f.certificate_id = $%d", len(args)))
 	}
 	if !q.CursorLastSeenAt.IsZero() {
 		args = append(args, q.CursorLastSeenAt)
@@ -219,7 +238,7 @@ func (r *FindingsRepository) ListFindings(
 		//   last_seen_at < cursor.last_seen_at
 		//   OR (last_seen_at = cursor.last_seen_at AND id > cursor.id)
 		conditions = append(conditions, fmt.Sprintf(
-			"(last_seen_at < $%d OR (last_seen_at = $%d AND id > $%d))",
+			"(f.last_seen_at < $%d OR (f.last_seen_at = $%d AND f.id > $%d))",
 			atIdx, atIdx, idIdx,
 		))
 	}
@@ -228,13 +247,18 @@ func (r *FindingsRepository) ListFindings(
 	limitIdx := len(args)
 
 	sql := fmt.Sprintf(`
-		SELECT id, organization_id, certificate_id,
-		       rule_id, rule_version,
-		       severity, status, title, evidence,
-		       opened_at, last_seen_at, resolved_at, updated_at
-		  FROM findings
+		SELECT f.id, f.organization_id, f.certificate_id,
+		       f.rule_id, f.rule_version,
+		       f.severity, f.status, f.title, f.evidence,
+		       f.opened_at, f.last_seen_at, f.resolved_at, f.updated_at,
+		       COALESCE(c.fingerprint_sha256, ''),
+		       COALESCE(c.subject, '')
+		  FROM findings f
+		  LEFT JOIN certificates c
+		    ON c.organization_id = f.organization_id
+		   AND c.id = f.certificate_id
 		 WHERE %s
-		 ORDER BY last_seen_at DESC, id ASC
+		 ORDER BY f.last_seen_at DESC, f.id ASC
 		 LIMIT $%d`,
 		strings.Join(conditions, " AND "), limitIdx,
 	)
@@ -247,7 +271,7 @@ func (r *FindingsRepository) ListFindings(
 
 	var out []findings.Finding
 	for rows.Next() {
-		f, err := scanFinding(rows)
+		f, err := scanFindingWithCert(rows)
 		if err != nil {
 			return nil, fmt.Errorf("postgres: scan finding: %w", err)
 		}
@@ -282,6 +306,43 @@ func scanFinding(row pgx.Row) (*findings.Finding, error) {
 		f.Evidence = json.RawMessage(evidenceRaw)
 	}
 	f.ResolvedAt = resolvedAt
+	return &f, nil
+}
+
+// scanFindingWithCert is the JOIN variant used by GetFinding /
+// ListFindings. The trailing two columns are
+// COALESCE(c.fingerprint_sha256, ”) and COALESCE(c.subject, ”)
+// — they degrade to "" only if the LEFT JOIN found no
+// certificate row (which v0.1's ON DELETE CASCADE makes
+// unreachable in practice, but defense-in-depth keeps the scan
+// total).
+func scanFindingWithCert(row pgx.Row) (*findings.Finding, error) {
+	var (
+		f           findings.Finding
+		severity    string
+		status      string
+		evidenceRaw []byte
+		resolvedAt  *time.Time
+		fingerprint string
+		subject     string
+	)
+	if err := row.Scan(
+		&f.ID, &f.OrganizationID, &f.CertificateID,
+		&f.RuleID, &f.RuleVersion,
+		&severity, &status, &f.Title, &evidenceRaw,
+		&f.FirstSeenAt, &f.LastSeenAt, &resolvedAt, &f.UpdatedAt,
+		&fingerprint, &subject,
+	); err != nil {
+		return nil, err
+	}
+	f.Severity = findings.Severity(severity)
+	f.Status = findings.Status(status)
+	if len(evidenceRaw) > 0 {
+		f.Evidence = json.RawMessage(evidenceRaw)
+	}
+	f.ResolvedAt = resolvedAt
+	f.FingerprintSHA256 = fingerprint
+	f.Subject = subject
 	return &f, nil
 }
 
