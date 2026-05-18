@@ -80,7 +80,10 @@ func FindingsRecompute(deps FindingsDeps) http.HandlerFunc {
 			return
 		}
 
-		result, err := deps.Service.Recompute(r.Context(), user.OrganizationID)
+		result, err := deps.Service.Recompute(r.Context(), findings.RecomputeInput{
+			OrganizationID: user.OrganizationID,
+			ActorUserID:    user.ID,
+		})
 		if err != nil {
 			if errors.Is(err, findings.ErrInvalidRecomputeInput) {
 				envelope.WriteError(w, http.StatusBadRequest, "bad_request",

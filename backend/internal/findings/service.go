@@ -76,6 +76,17 @@ func NewService(
 	}, nil
 }
 
+// RecomputeInput is the validated input to Service.Recompute.
+// OrganizationID is required; ActorUserID is the operator
+// whose session triggered the recompute (used as the audit
+// event's Actor so post-hoc filtering by user works). The HTTP
+// handler MUST populate ActorUserID from the authenticated
+// session — never from a request body or query parameter.
+type RecomputeInput struct {
+	OrganizationID string
+	ActorUserID    string
+}
+
 // Recompute evaluates every registered rule against every
 // certificate in the organization and applies the diff against
 // the existing findings table state.
@@ -96,9 +107,20 @@ func NewService(
 //   - Existing row in `resolved` state + rule does NOT match →
 //     no DB write (counted: Unchanged).
 //
+// Concurrency: a per-organization advisory lock
+// (Transactor.WithTxLockedFindings) serializes simultaneous
+// recompute calls for the same org. Without the lock, two
+// callers' in-memory snapshots could both miss a row and both
+// attempt to INSERT the same
+// `(organization_id, certificate_id, rule_id)` triple — the
+// second INSERT would fail the unique constraint and surface as
+// 500. With the lock, the second caller sees the first caller's
+// inserts (and counts them as Updated, not Opened).
+//
 // Audit policy:
 //
 //   - ONE audit row per Recompute call, action="findings.recomputed".
+//   - Actor is in.ActorUserID, ActorType is "user".
 //   - Audit row is inserted in the same transaction as the
 //     finding state changes. An audit failure ROLLS BACK the
 //     entire recompute (H-021 brief).
@@ -111,15 +133,15 @@ func NewService(
 // unchanged cert inventory and unchanged time, Recompute is a
 // no-op (all matched findings move to Updated, no Opened or
 // Resolved). Re-running is therefore safe.
-func (s *Service) Recompute(ctx context.Context, organizationID string) (*RecomputeResult, error) {
-	if strings.TrimSpace(organizationID) == "" {
+func (s *Service) Recompute(ctx context.Context, in RecomputeInput) (*RecomputeResult, error) {
+	if strings.TrimSpace(in.OrganizationID) == "" {
 		return nil, fmt.Errorf("%w: organization id required", ErrInvalidRecomputeInput)
 	}
 	now := s.clock.Now()
 
 	var result RecomputeResult
-	if err := s.tx.WithTx(ctx, func(ctx context.Context) error {
-		evaluated, opened, updated, resolved, unchanged, err := s.runDiff(ctx, organizationID, now)
+	if err := s.tx.WithTxLockedFindings(ctx, in.OrganizationID, func(ctx context.Context) error {
+		evaluated, opened, updated, resolved, unchanged, err := s.runDiff(ctx, in.OrganizationID, now)
 		if err != nil {
 			return err
 		}
@@ -131,7 +153,7 @@ func (s *Service) Recompute(ctx context.Context, organizationID string) (*Recomp
 			Unchanged:             unchanged,
 			RuleCount:             len(s.rules),
 		}
-		if err := s.recordRecomputeAudit(ctx, organizationID, &result, now); err != nil {
+		if err := s.recordRecomputeAudit(ctx, in, &result, now); err != nil {
 			return err
 		}
 		return nil
@@ -277,12 +299,12 @@ type recomputeAuditMetadata struct {
 
 func (s *Service) recordRecomputeAudit(
 	ctx context.Context,
-	organizationID string,
+	in RecomputeInput,
 	r *RecomputeResult,
 	now time.Time,
 ) error {
 	md, _ := json.Marshal(recomputeAuditMetadata{
-		OrganizationID:        organizationID,
+		OrganizationID:        in.OrganizationID,
 		EvaluatedCertificates: r.EvaluatedCertificates,
 		Opened:                r.Opened,
 		Updated:               r.Updated,
@@ -290,25 +312,28 @@ func (s *Service) recordRecomputeAudit(
 		Unchanged:             r.Unchanged,
 		RuleCount:             r.RuleCount,
 	})
+	// ActorUserID comes from the authenticated operator session
+	// via the HTTP handler. If a future caller (CLI, test) omits
+	// it, fall back to the "system" sentinel rather than logging
+	// a misleading "operator" placeholder — operators reading
+	// audit history can then distinguish "real user did this"
+	// from "internal pathway did this". The handler MUST set it
+	// for any real recompute; this fallback is purely defensive.
+	actor := strings.TrimSpace(in.ActorUserID)
+	actorType := "user"
+	if actor == "" {
+		actor = "system"
+		actorType = "system"
+	}
 	if err := s.audit.Record(ctx, audit.Event{
-		OrganizationID: organizationID,
+		OrganizationID: in.OrganizationID,
 		OccurredAt:     now,
-		// The HTTP handler populates a real actor id when one
-		// is available; the service is called inside a request
-		// context, but the audit recorder accepts the actor on
-		// the event itself. Service.Recompute is called from the
-		// handler which sets the actor; the wire shape leaves
-		// the actor blank only when called from a tool or
-		// internal path. v0.1 has only one path (operator HTTP)
-		// — actor lives in the metadata via the request context
-		// when needed; the action+target are sufficient for
-		// the recompute envelope.
-		Actor:      "operator",
-		ActorType:  "user",
-		Action:     "findings.recomputed",
-		TargetType: "organization",
-		TargetID:   organizationID,
-		Metadata:   md,
+		Actor:          actor,
+		ActorType:      actorType,
+		Action:         "findings.recomputed",
+		TargetType:     "organization",
+		TargetID:       in.OrganizationID,
+		Metadata:       md,
 	}); err != nil {
 		return fmt.Errorf("%w: %v", ErrInternalAudit, err)
 	}

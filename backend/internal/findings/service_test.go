@@ -110,17 +110,23 @@ func (a *fakeAudit) List(_ context.Context, _ audit.ListQuery) ([]audit.Event, e
 	return nil, nil
 }
 
-// fakeTransactor.WithTx invokes fn and, on any error fn returns,
-// runs the registered rollback callbacks to mimic the
-// transactional rollback the real implementation provides. Each
-// repo mutation registers a rollback that reverses it; this lets
-// the audit-failure test prove that finding state changes get
-// undone.
+// fakeTransactor.WithTxLockedFindings invokes fn and, on any
+// error fn returns, runs the registered rollback callbacks to
+// mimic the transactional rollback the real implementation
+// provides. Each repo mutation registers a rollback that
+// reverses it; this lets the audit-failure test prove that
+// finding state changes get undone.
+//
+// The fake does NOT model the per-org advisory lock that the
+// real implementation acquires — the lock's serialization
+// behavior is exercised by the integration concurrency test
+// against real Postgres, where the lock has observable effect.
+// Unit tests here only exercise the rollback property.
 type fakeTransactor struct {
 	rollbacks []func()
 }
 
-func (t *fakeTransactor) WithTx(_ context.Context, fn func(ctx context.Context) error) error {
+func (t *fakeTransactor) WithTxLockedFindings(_ context.Context, _ string, fn func(ctx context.Context) error) error {
 	t.rollbacks = nil
 	err := fn(context.Background())
 	if err != nil {
@@ -231,7 +237,10 @@ func TestServiceRecompute_AuditFailureRollsBackFindings(t *testing.T) {
 		t.Fatalf("NewService: %v", err)
 	}
 
-	_, err = svc.Recompute(context.Background(), "anchorix")
+	_, err = svc.Recompute(context.Background(), RecomputeInput{
+		OrganizationID: "anchorix",
+		ActorUserID:    "test-user-id",
+	})
 	if err == nil {
 		t.Fatal("expected error from Recompute when audit fails")
 	}
@@ -275,7 +284,10 @@ func TestServiceRecompute_SuccessWritesAuditAndFinding(t *testing.T) {
 		t.Fatalf("NewService: %v", err)
 	}
 
-	out, err := svc.Recompute(context.Background(), "anchorix")
+	out, err := svc.Recompute(context.Background(), RecomputeInput{
+		OrganizationID: "anchorix",
+		ActorUserID:    "test-user-id",
+	})
 	if err != nil {
 		t.Fatalf("Recompute: %v", err)
 	}
@@ -291,6 +303,14 @@ func TestServiceRecompute_SuccessWritesAuditAndFinding(t *testing.T) {
 	if aud.calls[0].Action != "findings.recomputed" {
 		t.Errorf("audit action = %q, want findings.recomputed", aud.calls[0].Action)
 	}
+	// Codex P2: the audit row must carry the real user ID, not
+	// a hardcoded "operator" placeholder. ActorType must mirror.
+	if aud.calls[0].Actor != "test-user-id" {
+		t.Errorf("audit actor = %q, want test-user-id", aud.calls[0].Actor)
+	}
+	if aud.calls[0].ActorType != "user" {
+		t.Errorf("audit actor_type = %q, want user", aud.calls[0].ActorType)
+	}
 }
 
 // TestServiceRecompute_InvalidInput pins the empty-org rejection.
@@ -305,7 +325,7 @@ func TestServiceRecompute_InvalidInput(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
-	_, err = svc.Recompute(context.Background(), "   ")
+	_, err = svc.Recompute(context.Background(), RecomputeInput{OrganizationID: "   "})
 	if !errors.Is(err, ErrInvalidRecomputeInput) {
 		t.Errorf("err = %v, want ErrInvalidRecomputeInput", err)
 	}

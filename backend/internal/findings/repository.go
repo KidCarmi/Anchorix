@@ -68,15 +68,24 @@ type CertificateLister interface {
 	ListAllCertificateSummariesForOrg(ctx context.Context, organizationID string) ([]inventory.CertificateSummary, error)
 }
 
-// Transactor runs fn inside a single transaction. Used by
-// Service.Recompute so the diff-apply + audit-write live in one
-// atomic unit (an audit failure rolls back the finding state
-// changes per the H-021 brief).
+// Transactor runs fn inside a single transaction with a
+// per-organization advisory lock. Used by Service.Recompute so:
 //
-// Mirrors the storage/postgres.DB.WithTx signature; the concrete
-// type satisfies this interface.
+//   - the diff-apply + audit-write live in one atomic unit
+//     (an audit failure rolls back the finding state changes
+//     per the H-021 brief);
+//   - concurrent recomputes for the SAME org serialize at the
+//     advisory-lock barrier rather than racing on the
+//     `UNIQUE (organization_id, certificate_id, rule_id)`
+//     constraint (the racing scenario would otherwise surface
+//     as a 500 + rollback, making recompute non-idempotent
+//     under concurrent operator requests).
+//
+// Concrete implementation lives on storage/postgres.DB
+// (WithTxLockedFindings). Different orgs proceed in parallel —
+// the lock is keyed by organization_id.
 type Transactor interface {
-	WithTx(ctx context.Context, fn func(ctx context.Context) error) error
+	WithTxLockedFindings(ctx context.Context, organizationID string, fn func(ctx context.Context) error) error
 }
 
 // nowProvider is the minimal clock surface Service.Recompute

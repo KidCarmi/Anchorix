@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -958,4 +960,116 @@ func TestFindingsEvidenceContainsRuleSpecificFields(t *testing.T) {
 	if !strings.EqualFold(ev.PublicKeyAlgorithm, "RSA") {
 		t.Errorf("evidence.public_key_algorithm = %q, want RSA-like", ev.PublicKeyAlgorithm)
 	}
+}
+
+// --- concurrency --------------------------------------------------
+
+// TestFindingsRecomputeConcurrentSafety pins the per-organization
+// advisory lock added in response to the Codex P2 review on PR #30.
+// Two simultaneous POST /findings/recompute calls for the same org
+// MUST both return 200 — the lock serializes them so the second
+// caller sees the first caller's INSERTs and counts them as
+// `updated` rather than `opened` (instead of racing against the
+// UNIQUE (organization_id, certificate_id, rule_id) constraint
+// and surfacing as 500).
+//
+// Property checks on every iteration:
+//
+//   - Both HTTP responses are 200 OK.
+//   - Total findings rows for the org = expected_rule_match_count
+//     (no duplicates). Without the lock the second INSERT would
+//     unique-violate; with the lock it correctly UPDATEs the
+//     first caller's row.
+//
+// Iterates to make the test a reliable regression detector. The
+// race without the lock manifests probabilistically (Postgres
+// transactions interleave depending on scheduling); a single
+// iteration would false-pass too often.
+func TestFindingsRecomputeConcurrentSafety(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	// Three certs that each trigger one rule → 3 findings on
+	// the first recompute. The number is small so each
+	// iteration completes quickly; the variety reduces the
+	// odds that a race manifests as identical-looking races
+	// every time.
+	for i, fixture := range []certFixture{
+		mustWeakCertFixture("concurrency-weak-rsa"),
+		func() certFixture {
+			f := defaultCertFixture("concurrency-expired", "expired-conc.example")
+			f.NotBefore = time.Now().UTC().Add(-365 * 24 * time.Hour)
+			f.NotAfter = time.Now().UTC().Add(-1 * time.Hour)
+			return f
+		}(),
+		func() certFixture {
+			f := defaultCertFixture("concurrency-sha1", "sha1-conc.example")
+			f.SignatureAlgorithm = "SHA1-RSA"
+			return f
+		}(),
+	} {
+		_ = i
+		seedCert(t, db, fixture)
+	}
+
+	const concurrencyIterations = 5
+	for iter := 0; iter < concurrencyIterations; iter++ {
+		var wg sync.WaitGroup
+		var aOK, bOK int32
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if recomputeTolerant(srv.URL, adminClient) {
+				atomic.AddInt32(&aOK, 1)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if recomputeTolerant(srv.URL, adminClient) {
+				atomic.AddInt32(&bOK, 1)
+			}
+		}()
+		wg.Wait()
+
+		if aOK == 0 || bOK == 0 {
+			t.Fatalf("iteration %d: concurrent recomputes failed (a=%d, b=%d) — advisory lock broken",
+				iter, aOK, bOK)
+		}
+
+		// Post-condition: exactly 3 findings exist for the org
+		// (one per cert × matching rule). A duplicate INSERT
+		// race would have either failed (counts already
+		// asserted above) or, in a hypothetical broken state,
+		// produced extra rows.
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		var count int
+		err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx,
+				`SELECT COUNT(*) FROM findings WHERE organization_id = 'anchorix'`,
+			).Scan(&count)
+		})
+		cancel()
+		if err != nil {
+			t.Fatalf("iteration %d: count: %v", iter, err)
+		}
+		if count != 3 {
+			t.Fatalf("iteration %d: findings count = %d, want 3 (duplicate INSERT race?)", iter, count)
+		}
+	}
+}
+
+// recomputeTolerant performs a POST /findings/recompute that
+// returns success/failure as a boolean rather than failing the
+// test directly. Use from goroutines where t.Fatal would be
+// unsafe.
+func recomputeTolerant(srv string, client *http.Client) bool {
+	req, _ := http.NewRequest(http.MethodPost, srv+"/api/v1/findings/recompute", nil)
+	resp, err := client.Do(req)
+	if err != nil || resp == nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == http.StatusOK
 }

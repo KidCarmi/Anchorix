@@ -138,6 +138,38 @@ func (db *DB) WithTxLockedAgent(ctx context.Context, agentID string, fn func(ctx
 	})
 }
 
+// WithTxLockedFindings runs fn inside a single transaction with
+// an exclusive transaction-scope advisory lock keyed by
+// organizationID, namespaced to findings recompute. The lock
+// serializes concurrent recompute calls for the SAME org —
+// addresses the H-021 race where two simultaneous recomputes
+// load the same in-memory snapshot of existing findings, both
+// decide a `(cert_id, rule_id)` pair is "new", and both try to
+// INSERT the same triple. Without the lock the second INSERT
+// would violate the
+// `UNIQUE (organization_id, certificate_id, rule_id)`
+// constraint, surfacing as a 500 and rolling back the second
+// recompute — non-idempotent under concurrent operator
+// requests.
+//
+// Lock namespace + key: hashtext('findings-recompute') for the
+// namespace, hashtext(organization_id) for the key. Different
+// orgs recompute in parallel.
+//
+// Released automatically at tx commit/rollback. CLAUDE.md §8.10
+// concurrency discipline: documented owner, deterministic
+// release path, bounded lifetime.
+func (db *DB) WithTxLockedFindings(ctx context.Context, organizationID string, fn func(ctx context.Context) error) error {
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		if _, err := db.querierFor(ctx).Exec(ctx,
+			`SELECT pg_advisory_xact_lock(hashtext('findings-recompute'), hashtext($1))`,
+			organizationID); err != nil {
+			return fmt.Errorf("postgres: advisory lock findings org %s: %w", organizationID, err)
+		}
+		return fn(ctx)
+	})
+}
+
 // WithTxRaw exposes the underlying pgx.Tx for callers inside this
 // package (migrations.go) and for integration tests that need to
 // exercise raw SQL (audit-events-are-append-only). Production
