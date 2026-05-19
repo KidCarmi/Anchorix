@@ -16,6 +16,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 
+	"github.com/kidcarmi/anchorix/backend/internal/clock"
+	"github.com/kidcarmi/anchorix/backend/internal/findings"
 	"github.com/kidcarmi/anchorix/backend/internal/storage/postgres"
 )
 
@@ -1213,4 +1215,172 @@ func recomputeTolerant(srv string, client *http.Client) bool {
 	}
 	defer resp.Body.Close()
 	return resp.StatusCode == http.StatusOK
+}
+
+// --- H-022 scheduled-recompute audit envelope ---------------------
+
+// TestFindingsRecomputeScheduledWritesSchedulerActor pins the
+// H-022 contract that scheduled recomputes write an audit row
+// with actor="scheduler" and actor_type="system". Operators
+// filtering audit_events.actor = 'scheduler' can then see every
+// background recompute without inspecting metadata.
+//
+// The test invokes Service.RecomputeScheduled directly (bypassing
+// the HTTP layer) — there is no HTTP endpoint for the scheduler
+// path, and the scheduler's own loop is tested via unit tests
+// with fakes. This integration test exists to verify the
+// audit-row column values produced against real Postgres.
+func TestFindingsRecomputeScheduledWritesSchedulerActor(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	_ = signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	// Seed a cert that triggers the weak_rsa_key rule.
+	seedCert(t, db, mustWeakCertFixture("scheduled-actor"))
+
+	// Build a findings service that mirrors the testServer's
+	// wiring and call RecomputeScheduled directly.
+	findingsRepo := postgres.NewFindingsRepository(db)
+	certRepo := postgres.NewCertificateInventoryRepository(db)
+	auditRecorder := postgres.NewAuditRecorder(db, clock.System{})
+	findingsSvc, err := findings.NewService(
+		findingsRepo, certRepo, db, auditRecorder, clock.System{}, findings.DefaultRules(),
+	)
+	if err != nil {
+		t.Fatalf("findings.NewService: %v", err)
+	}
+	if _, err := findingsSvc.RecomputeScheduled(context.Background(), "anchorix"); err != nil {
+		t.Fatalf("RecomputeScheduled: %v", err)
+	}
+
+	// Verify the most recent findings.recomputed audit row has
+	// actor="scheduler" and actor_type="system".
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	var actor, actorType string
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT actor, actor_type
+			   FROM audit_events
+			  WHERE action = 'findings.recomputed'
+			    AND organization_id = 'anchorix'
+			  ORDER BY occurred_at DESC
+			  LIMIT 1`,
+		).Scan(&actor, &actorType)
+	}); err != nil {
+		t.Fatalf("read audit row: %v", err)
+	}
+	if actor != findings.SchedulerActorID {
+		t.Errorf("audit actor = %q, want %q", actor, findings.SchedulerActorID)
+	}
+	if actorType != "system" {
+		t.Errorf("audit actor_type = %q, want system", actorType)
+	}
+}
+
+// TestFindingsListOrganizationIDsReturnsSeededOrg pins the
+// minimal contract OrganizationsRepository.ListOrganizationIDs
+// must satisfy: it returns the home org (and any seeded
+// foreign orgs) in deterministic id-ascending order. The
+// scheduler iterates this slice on every tick.
+func TestFindingsListOrganizationIDsReturnsSeededOrg(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+
+	// Seed a second org so we can prove ordering.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		_, err := tx.Exec(ctx,
+			`INSERT INTO organizations (id, name) VALUES ('zzz-other-org', 'Other Org')`)
+		return err
+	}); err != nil {
+		t.Fatalf("seed second org: %v", err)
+	}
+
+	repo := postgres.NewOrganizationsRepository(db)
+	ids, err := repo.ListOrganizationIDs(ctx)
+	if err != nil {
+		t.Fatalf("ListOrganizationIDs: %v", err)
+	}
+	if len(ids) != 2 {
+		t.Fatalf("ids = %v, want 2", ids)
+	}
+	// Order: anchorix < zzz-other-org lexicographically.
+	if ids[0] != "anchorix" || ids[1] != "zzz-other-org" {
+		t.Errorf("ids = %v, want [anchorix, zzz-other-org]", ids)
+	}
+}
+
+// TestFindingsRecomputeScheduledSerializesWithManual pins the
+// H-022 promise that a scheduled recompute and a concurrent
+// manual recompute serialize at the per-org advisory lock
+// barrier — neither path returns 500 from the
+// UNIQUE (organization_id, certificate_id, rule_id) race.
+//
+// Two goroutines: one calls Service.RecomputeScheduled
+// directly, one calls Service.Recompute via the same code
+// path. Both must return without error and the org's findings
+// row count stays at exactly 1 (no duplicates).
+func TestFindingsRecomputeScheduledSerializesWithManual(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	_ = signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	seedCert(t, db, mustWeakCertFixture("scheduler-vs-manual"))
+
+	findingsRepo := postgres.NewFindingsRepository(db)
+	certRepo := postgres.NewCertificateInventoryRepository(db)
+	auditRecorder := postgres.NewAuditRecorder(db, clock.System{})
+	findingsSvc, err := findings.NewService(
+		findingsRepo, certRepo, db, auditRecorder, clock.System{}, findings.DefaultRules(),
+	)
+	if err != nil {
+		t.Fatalf("findings.NewService: %v", err)
+	}
+
+	const iterations = 5
+	for iter := 0; iter < iterations; iter++ {
+		var wg sync.WaitGroup
+		var manualOK, scheduledOK int32
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if _, err := findingsSvc.Recompute(context.Background(), findings.RecomputeInput{
+				OrganizationID: "anchorix",
+				ActorUserID:    "test-manual-user",
+			}); err == nil {
+				atomic.AddInt32(&manualOK, 1)
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			if _, err := findingsSvc.RecomputeScheduled(context.Background(), "anchorix"); err == nil {
+				atomic.AddInt32(&scheduledOK, 1)
+			}
+		}()
+		wg.Wait()
+
+		if manualOK == 0 || scheduledOK == 0 {
+			t.Fatalf("iteration %d: concurrent recomputes failed (manual=%d, scheduled=%d)",
+				iter, manualOK, scheduledOK)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		var count int
+		err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx,
+				`SELECT COUNT(*) FROM findings WHERE organization_id = 'anchorix'`,
+			).Scan(&count)
+		})
+		cancel()
+		if err != nil {
+			t.Fatalf("iteration %d: count: %v", iter, err)
+		}
+		if count != 1 {
+			t.Fatalf("iteration %d: findings count = %d, want 1 (duplicate INSERT race?)", iter, count)
+		}
+	}
 }

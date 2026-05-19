@@ -100,6 +100,25 @@ func cmdServe(ctx context.Context, cfg *config.Config, log *logger.Logger) error
 		return fmt.Errorf("findings service: %w", err)
 	}
 
+	// H-022: background recompute scheduler. Owns a single
+	// long-running goroutine started below; ctx cancellation
+	// stops the loop. The scheduler is constructed even when
+	// disabled (Run becomes a no-op) so the wiring is stable.
+	organizationsRepo := postgres.NewOrganizationsRepository(db)
+	findingsScheduler, err := findings.NewScheduler(
+		findingsService,
+		organizationsRepo,
+		log,
+		clock.System{},
+		findings.SchedulerConfig{
+			Enabled:  cfg.FindingsSchedulerEnabled,
+			Interval: cfg.FindingsSchedulerInterval,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("findings scheduler: %w", err)
+	}
+
 	// HTTP layer.
 	srv, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{
 		AuthService:           authService,
@@ -121,9 +140,27 @@ func cmdServe(ctx context.Context, cfg *config.Config, log *logger.Logger) error
 		"env", cfg.Env,
 		"tls_termination", cfg.TLSTermination,
 	)
+
+	// Start the H-022 findings scheduler. Runs in a goroutine
+	// owned by this composition root; ctx cancellation
+	// propagates to its loop and any in-flight recompute (the
+	// DB transaction sees ctx done and rolls back). The
+	// scheduler's Run returns nil on graceful shutdown.
+	schedDone := make(chan struct{})
+	go func() {
+		defer close(schedDone)
+		if err := findingsScheduler.Run(ctx); err != nil {
+			log.Error("findings scheduler exited with error", "err", err.Error())
+		}
+	}()
+
 	if err := srv.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		return fmt.Errorf("serve: %w", err)
 	}
+	// Wait for the scheduler goroutine to drain before
+	// returning so the deferred db.Close() doesn't race a
+	// recompute tx still mid-rollback.
+	<-schedDone
 	log.Info("shutdown complete")
 	return nil
 }
