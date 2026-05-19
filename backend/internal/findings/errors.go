@@ -29,3 +29,22 @@ var ErrInvalidRecomputeInput = errors.New("findings: invalid recompute input")
 // handler maps to 500 internal_error. Matches the
 // inventory.ErrInternalAudit pattern for consistency.
 var ErrInternalAudit = errors.New("findings: audit write failed")
+
+// ErrUnsupportedFindingStatus is returned by Service.Recompute
+// when an existing finding row carries a status the recompute
+// engine doesn't know how to transition. v0.1 only writes
+// `open` / `resolved`; the schema CHECK reserves
+// `acknowledged` and `suppressed` for the H-023 override
+// workflow.
+//
+// Failing loudly here is deliberate: an earlier draft used a
+// `default:` arm that silently treated any non-open status as
+// "resolved → reopen", which would have flipped a future
+// suppressed/acknowledged finding back to `open` on every
+// recompute, defeating the override workflow's purpose. When
+// H-023 introduces the override surface, it MUST extend the
+// switch in Service.runDiff (the comment on the default arm
+// points at this sentinel as the breadcrumb).
+//
+// HTTP handler maps to 500 internal_error.
+var ErrUnsupportedFindingStatus = errors.New("findings: unsupported finding status for recompute")

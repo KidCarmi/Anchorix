@@ -330,3 +330,138 @@ func TestServiceRecompute_InvalidInput(t *testing.T) {
 		t.Errorf("err = %v, want ErrInvalidRecomputeInput", err)
 	}
 }
+
+// TestServiceRecompute_UnsupportedStatusFailsLoudly_StillMatching
+// pins the defensive default branch in the matches loop: when a
+// pre-existing finding row carries a status outside `open` /
+// `resolved` (v0.1 never writes those; the migration 0001 CHECK
+// reserves `acknowledged` and `suppressed` for the H-023
+// override workflow), recompute MUST fail loudly with
+// ErrUnsupportedFindingStatus rather than silently flipping the
+// row to `open` (which an earlier `default: // reopen` arm
+// would have done).
+//
+// Property: when an `acknowledged` finding is pre-loaded and the
+// rule still matches, Recompute returns ErrUnsupportedFindingStatus
+// and rolls back any state changes from the same run.
+func TestServiceRecompute_UnsupportedStatusFailsLoudly_StillMatching(t *testing.T) {
+	clk := fixedClock{t: time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)}
+	repo := newFakeFindingsRepo()
+	tx := &fakeTransactor{}
+	rollbackRepo := &rollbackAwareRepo{inner: repo, tx: tx}
+
+	// Pre-seed a finding with status="acknowledged" — the H-023
+	// workflow value. v0.1 has no public path to create this,
+	// so we go around the public surface by inserting directly
+	// into the fake repo.
+	preExisting := &Finding{
+		ID:             "pre-acked-finding",
+		OrganizationID: "anchorix",
+		CertificateID:  "weak-cert",
+		RuleID:         RuleWeakRSAKey,
+		RuleVersion:    1,
+		Severity:       SeverityHigh,
+		Status:         Status("acknowledged"),
+		Title:          "RSA key below 2048 bits",
+		FirstSeenAt:    clk.t.Add(-1 * time.Hour),
+		LastSeenAt:     clk.t.Add(-1 * time.Hour),
+		UpdatedAt:      clk.t.Add(-1 * time.Hour),
+	}
+	if err := repo.InsertFinding(context.Background(), preExisting); err != nil {
+		t.Fatalf("pre-seed: %v", err)
+	}
+
+	// One cert that matches the same rule the pre-existing
+	// finding was about. Without the fix, the recompute would
+	// flip the acknowledged finding back to `open`.
+	certs := []inventory.CertificateSummary{
+		{
+			ID:            "weak-cert",
+			Subject:       "CN=weak.example",
+			SignatureAlg:  "SHA256-RSA",
+			PublicKeyAlg:  "RSA",
+			PublicKeyBits: 1024,
+			NotBefore:     clk.t.Add(-30 * 24 * time.Hour),
+			NotAfter:      clk.t.Add(180 * 24 * time.Hour),
+		},
+	}
+	svc, err := NewService(
+		rollbackRepo, fakeCertificateLister{certs: certs},
+		tx, &fakeAudit{}, clk, DefaultRules(),
+	)
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	_, err = svc.Recompute(context.Background(), RecomputeInput{
+		OrganizationID: "anchorix",
+		ActorUserID:    "test-user",
+	})
+	if !errors.Is(err, ErrUnsupportedFindingStatus) {
+		t.Fatalf("err = %v, want wrapping ErrUnsupportedFindingStatus", err)
+	}
+
+	// The pre-existing row must be UNCHANGED — no silent
+	// flip to `open`.
+	got, err := repo.GetFinding(context.Background(), "anchorix", "pre-acked-finding")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.Status != Status("acknowledged") {
+		t.Errorf("status = %q, want acknowledged (recompute silently mutated the row)", got.Status)
+	}
+}
+
+// TestServiceRecompute_UnsupportedStatusFailsLoudly_NoLongerMatching
+// is the negative-space counterpart. Same failure path, but the
+// rule no longer matches — the unmatched loop's default arm
+// must also fail loudly.
+func TestServiceRecompute_UnsupportedStatusFailsLoudly_NoLongerMatching(t *testing.T) {
+	clk := fixedClock{t: time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)}
+	repo := newFakeFindingsRepo()
+	tx := &fakeTransactor{}
+	rollbackRepo := &rollbackAwareRepo{inner: repo, tx: tx}
+
+	// Pre-seed a suppressed finding pointing at a cert that no
+	// longer triggers any rule.
+	if err := repo.InsertFinding(context.Background(), &Finding{
+		ID:             "pre-suppressed-finding",
+		OrganizationID: "anchorix",
+		CertificateID:  "fine-cert",
+		RuleID:         RuleWeakRSAKey,
+		RuleVersion:    1,
+		Severity:       SeverityHigh,
+		Status:         Status("suppressed"),
+		Title:          "Suppressed",
+		FirstSeenAt:    clk.t.Add(-24 * time.Hour),
+		LastSeenAt:     clk.t.Add(-12 * time.Hour),
+		UpdatedAt:      clk.t.Add(-12 * time.Hour),
+	}); err != nil {
+		t.Fatalf("pre-seed: %v", err)
+	}
+
+	// Cert is healthy — no rule matches.
+	certs := []inventory.CertificateSummary{
+		{
+			ID:            "fine-cert",
+			Subject:       "CN=fine.example",
+			SignatureAlg:  "SHA256-RSA",
+			PublicKeyAlg:  "RSA",
+			PublicKeyBits: 2048,
+			NotBefore:     clk.t.Add(-30 * 24 * time.Hour),
+			NotAfter:      clk.t.Add(180 * 24 * time.Hour),
+		},
+	}
+	svc, _ := NewService(
+		rollbackRepo, fakeCertificateLister{certs: certs},
+		tx, &fakeAudit{}, clk, DefaultRules(),
+	)
+
+	_, err := svc.Recompute(context.Background(), RecomputeInput{
+		OrganizationID: "anchorix",
+		ActorUserID:    "test-user",
+	})
+	if !errors.Is(err, ErrUnsupportedFindingStatus) {
+		t.Fatalf("err = %v, want wrapping ErrUnsupportedFindingStatus", err)
+	}
+}

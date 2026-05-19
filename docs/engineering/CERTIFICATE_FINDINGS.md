@@ -193,6 +193,28 @@ test (`TestFindingsReadEndpointsEmitNoAuditRows`) diffs the
 `audit_events` count before/after a read sweep to catch
 regressions.
 
+### Defensive: unsupported finding status fails loudly
+
+`Service.runDiff`'s state-transition switches handle exactly
+`StatusOpen` and `StatusResolved`. Any other value (the
+schema-reserved `acknowledged` / `suppressed`, or any future
+addition) hits an explicit `default:` arm that returns
+`ErrUnsupportedFindingStatus`. This is intentional: an earlier
+draft used `default: // resolved → reopen` which would have
+silently flipped a future `suppressed` finding back to `open`
+on every recompute, defeating the override workflow's purpose.
+
+The defensive arm is the H-023 breadcrumb: when the override
+workflow ships, it MUST extend both switches in `runDiff`
+(matches loop AND unmatched loop) to decide what to do for
+each reserved value. Until then, the path is unreachable
+because v0.1 has no public surface that writes those status
+values.
+
+Pinned by `service_test.go`
+`TestServiceRecompute_UnsupportedStatusFailsLoudly_StillMatching`
+and `_NoLongerMatching`.
+
 ## 6. API
 
 See [REST_API.md "Findings"](../api/REST_API.md#findings) for

@@ -66,6 +66,30 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
   expiry; acknowledgement does not. Recompute's diff logic
   needs a "do not reopen suppressed/acknowledged findings on
   re-match" rule.
+
+  **Must-extend code site:** `Service.runDiff` in
+  `internal/findings/service.go` currently has two switches
+  (matches loop + unmatched loop) whose `default:` arms
+  return `ErrUnsupportedFindingStatus`. H-023 MUST extend both
+  switches to add explicit cases for `acknowledged` and
+  `suppressed`. Failing to do so will surface as a 500 the
+  moment the first override is written — which is the right
+  failure mode (loud, not silent reopen), but H-023 must take
+  ownership of the design decisions:
+
+    * acknowledged + rule still matches → keep status as
+      acknowledged (bump last_seen_at? leave alone?).
+    * acknowledged + rule no longer matches → resolve?
+      Or keep acknowledged with resolved_at filled in?
+    * suppressed + rule still matches → keep suppressed,
+      do NOT surface. Bump last_seen_at to track recency.
+    * suppressed past expiry → fall back to standard
+      open/resolved transitions.
+
+  Unit tests `TestServiceRecompute_UnsupportedStatusFailsLoudly_*`
+  pin the failure mode today; they should be DELETED (not
+  weakened) when H-023 ships and replaces them with positive
+  tests for each acknowledged/suppressed transition.
 - **Recommended PR:** `feat(findings): operator acknowledge + suppress workflow`.
 - **Reason not fixed now:** H-021 explicitly scopes out the
   override workflow. The stubs in

@@ -244,7 +244,12 @@ func (s *Service) runDiff(
 				return 0, 0, 0, 0, 0, fmt.Errorf("findings: update: %w", err)
 			}
 			updated++
-		default: // resolved → reopen
+		case prior.Status == StatusResolved:
+			// resolved → reopen: rule matches again, lift the
+			// finding back into the operator-visible state.
+			// `opened_at` (= FirstSeenAt) is intentionally NOT
+			// touched here — it preserves the original detection
+			// moment across resolve/reopen cycles.
 			prior.Status = StatusOpen
 			prior.LastSeenAt = now
 			prior.UpdatedAt = now
@@ -257,16 +262,34 @@ func (s *Service) runDiff(
 				return 0, 0, 0, 0, 0, fmt.Errorf("findings: reopen: %w", err)
 			}
 			opened++
+		default:
+			// v0.1 only writes `open` / `resolved`. The
+			// migration 0001 CHECK reserves `acknowledged` and
+			// `suppressed` for the H-023 override workflow.
+			// When H-023 lands, this branch MUST be extended
+			// to decide what to do with each reserved value
+			// (suppressed-and-still-matches must NOT silently
+			// reopen, etc.). Failing loudly now prevents the
+			// silent-reopen regression that an earlier
+			// `default: // reopen` arm would have caused.
+			return 0, 0, 0, 0, 0, fmt.Errorf(
+				"%w: finding %s has status %q (rule still matches)",
+				ErrUnsupportedFindingStatus, prior.ID, prior.Status,
+			)
 		}
 	}
 
 	// Then walk existing rows that did NOT match. Open ones
 	// become resolved; resolved ones stay resolved (unchanged).
+	// `acknowledged` / `suppressed` reach here too once H-023
+	// ships — same H-023-must-decide breadcrumb as the matches
+	// loop above.
 	for k, f := range existingByKey {
 		if _, matched := matches[k]; matched {
 			continue
 		}
-		if f.Status == StatusOpen {
+		switch f.Status {
+		case StatusOpen:
 			resolvedAt := now
 			f.Status = StatusResolved
 			f.ResolvedAt = &resolvedAt
@@ -275,8 +298,13 @@ func (s *Service) runDiff(
 				return 0, 0, 0, 0, 0, fmt.Errorf("findings: resolve: %w", err)
 			}
 			resolved++
-		} else {
+		case StatusResolved:
 			unchanged++
+		default:
+			return 0, 0, 0, 0, 0, fmt.Errorf(
+				"%w: finding %s has status %q (rule no longer matches)",
+				ErrUnsupportedFindingStatus, f.ID, f.Status,
+			)
 		}
 	}
 	return evaluated, opened, updated, resolved, unchanged, nil
