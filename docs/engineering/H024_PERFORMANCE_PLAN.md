@@ -741,10 +741,94 @@ the v0.1 engineering principles (CLAUDE.md §14, §19).
 
 Nothing in the "yes" column requires a CLAUDE.md amendment.
 
-## 9. Recommended H-024 scope (one focused PR)
+## 9. Recommended H-024 scope (split into two PRs)
 
-The H-024 implementation PR ships exactly these items and
-nothing else:
+H-024 lands as **two sequential implementation PRs**. The
+split isolates the risky control-flow rewrite (the streaming
+two-cursor diff) from the lower-risk groundwork (fixtures,
+perf tests, indexes, the ingestion RETURNING optimization),
+so each PR can be reviewed against its own correctness bar
+without the reviewer juggling unrelated concerns.
+
+H-024A lands first; H-024B depends on A's fixture builder and
+on A's perf tests being green so any regression introduced by
+B is attributable.
+
+### 9.A H-024A — fixtures, perf tier, indexes, ingestion RETURNING
+
+Lower-risk, no changes to the findings state machine, no
+changes to the recompute control flow.
+
+**Migration**
+
+1. `backend/migrations/0008_perf_indexes.sql`:
+   - `CREATE INDEX certificate_observations_org_cert_active_idx
+      ON certificate_observations(organization_id, certificate_id)
+      WHERE removed_at IS NULL;` (partial index for §6.4).
+   - `CREATE INDEX certificates_org_last_seen_idx
+      ON certificates(organization_id, last_seen_at DESC, id ASC);`
+      (operator-list cursor walk, §6.4).
+   - Each `CREATE INDEX` carries an inline comment per
+     CLAUDE.md §16 documenting the query pattern it serves.
+
+**Storage / service**
+
+2. Fold the `GetCertificate` re-read into
+   `UpsertCertificate`'s `RETURNING` clause (§6.6). The
+   ingestion service consumes the canonical row directly from
+   the upsert; the standalone `GetCertificate` call on the
+   ingestion hot path goes away. `GetCertificate` itself
+   stays — operator reads still use it.
+
+**Tests**
+
+3. `backend/internal/inventory/fixtures/` deterministic
+   builder (§5). Two presets: `Smallv01` (tiny — used by
+   in-CI perf-regression tests) and `Pilot` (used by stress
+   tests, build-tagged `stress`). Documented in
+   `fixtures/doc.go` per CLAUDE.md §19.
+4. `backend/test/integration/perf_query_count_test.go`
+   (`//go:build perf`) — assert query counts on `runDiff`
+   (against the **current** load-all implementation; the
+   baseline H-024B will compare against), `ListCertificates`,
+   `ListFindings`, ingestion (including the new RETURNING
+   path).
+5. `backend/test/stress/` skeleton with one or two stub
+   tests (`//go:build stress`), `recompute_fleet_test.go`
+   and `ingestion_concurrent_test.go`, runnable on demand
+   with the Pilot fixture. The stress tests assert §3 pilot
+   budgets against the **current** code so H-024B has a
+   pre-change baseline.
+
+**Docs**
+
+6. Update [`CI_PLAN.md`](./CI_PLAN.md) with the perf tier
+   table (§4.1) and the build-tag conventions. The H-024A
+   PR DOES NOT change the blocking-CI gate; the `perf` tier
+   joins the blocking set in a follow-up once stable (see
+   §11 Q5).
+7. Update this file's §13 status table to mark H-024A
+   shipped.
+
+**Explicit non-shipping from H-024A:**
+
+- Paginated repository methods.
+- Any change to `runDiff`'s control flow.
+- Any change to the recompute audit metadata shape.
+- Removal of `ListAllCertificateSummariesForOrg` /
+  `ListAllForOrg` — they stay so H-024B's
+  byte-identical comparison test can call both paths.
+
+PR title: `perf(inventory): fixtures, perf/stress test tier, perf
+indexes, upsert RETURNING`. LOC budget: aim for < 1000 LOC
+including tests.
+
+### 9.B H-024B — paginated recompute scans + streaming diff
+
+Depends on H-024A. Carries the higher-risk control-flow
+rewrite around the findings state machine. Reviewed in
+isolation against the byte-identical comparison test introduced
+in this PR.
 
 **Storage layer**
 
@@ -757,70 +841,57 @@ nothing else:
    `ListAllFindingsForOrgPaged(ctx, orgID, cursor, pageSize)`
    — cursor by `(id ASC)`. Backs `runDiff`'s existing-finding
    load.
-3. Rewrite `ListAllCertificateSummariesForOrg`'s caller in
-   `runDiff` to consume the paginated method. Delete
-   `ListAllCertificateSummariesForOrg` once nothing references
-   it. (Operator-list query in
-   `certificate_inventory_list_repository.go` is **untouched**
-   — same code path, same SQL.)
-4. Fold the `GetCertificate` re-read into
-   `UpsertCertificate`'s `RETURNING` clause (§6.6).
+3. `ListAllCertificateSummariesForOrg` and `ListAllForOrg`
+   stay in the repository for the duration of this PR so the
+   byte-identical comparison test (item 6) can drive both
+   paths from the same fixture. Removal is **deferred to a
+   follow-up cleanup PR** that lands only after H-024B has
+   soaked in `main` for one minor release and no fallback
+   has been needed.
 
 **Service layer**
 
-5. `Service.runDiff` rewritten as a streaming two-cursor merge:
+4. `Service.runDiff` rewritten as a streaming two-cursor merge:
    pull a page of certs, evaluate rules over it, pull
    matching-key findings, apply diff, advance. Existing-finding
    rows that match no still-pending cert pages get walked at
    the end. The state-machine switch (service.go:268–393)
    stays byte-identical — only the surrounding control flow
-   changes.
-6. Recompute audit row writes the new `loaded_certificates` and
+   changes. H-023 override-preserving paths are NOT touched.
+5. Recompute audit row writes the new `loaded_certificates` and
    `loaded_findings` metadata fields. JSON is additive
    (CLAUDE.md §17); existing readers don't break.
 
-**Migration**
-
-7. `backend/migrations/0008_perf_indexes.sql`:
-   - `CREATE INDEX certificate_observations_org_cert_active_idx
-      ON certificate_observations(organization_id, certificate_id)
-      WHERE removed_at IS NULL;` (partial index for §6.4).
-   - `CREATE INDEX certificates_org_last_seen_idx
-      ON certificates(organization_id, last_seen_at DESC, id ASC);`
-      (operator-list cursor walk, §6.4).
-   - Each `CREATE INDEX` carries an inline comment per
-     CLAUDE.md §16 documenting the query pattern it serves.
-
 **Tests**
 
-8. `backend/internal/inventory/fixtures/` deterministic
-   builder (§5). Two presets: `Smallv01` (tiny — used by
-   in-CI perf-regression tests) and `Pilot` (used by stress
-   tests, build-tagged `stress`).
-9. `backend/test/integration/recompute_pagination_test.go` —
-   correctness: assert the streaming recompute produces a
-   `findings` table byte-identical to the previous load-all
-   path on the `Smallv01` fixture.
-10. `backend/test/integration/perf_query_count_test.go`
-    (`//go:build perf`) — assert query counts on `runDiff`,
-    `ListCertificates`, `ListFindings`, ingestion.
-11. `backend/test/stress/recompute_fleet_test.go`
-    (`//go:build stress`) — Pilot dataset, asserts the §3
-    pilot budgets. Not run on every PR; documented in
-    `CI_PLAN.md` as on-demand.
+6. `backend/test/integration/recompute_pagination_test.go` —
+   correctness: drive **both** the old load-all and the new
+   streaming implementations against the `Smallv01` fixture
+   from H-024A, snapshot each implementation's resulting
+   `findings` table state, and assert byte-identical
+   equivalence. This is the gating test for H-024B's merge.
+7. Extend the H-024A perf-regression test to assert the new
+   streaming `runDiff`'s query-count and per-page bounds.
+8. Stress: extend H-024A's stress skeleton to assert the
+   pilot/fleet recompute budgets from §3 against the
+   streaming implementation. Captures the post-change
+   baseline.
 
 **Docs**
 
-12. Update [`HARDENING_BACKLOG.md`](./HARDENING_BACKLOG.md):
+9. Update [`CERTIFICATE_FINDINGS.md`](./CERTIFICATE_FINDINGS.md)
+   §5 to reflect "streaming load" instead of "full snapshot",
+   and §10 to add an entry for H-024B's ship status. Note
+   that `ListAllCertificateSummariesForOrg` and
+   `ListAllForOrg` remain present-but-unused until the
+   follow-up cleanup PR.
+10. Update [`HARDENING_BACKLOG.md`](./HARDENING_BACKLOG.md):
     remove the H-024 entry, replace with a short pointer to
-    the PR / commits. H-025 stays.
-13. Update [`CERTIFICATE_FINDINGS.md`](./CERTIFICATE_FINDINGS.md)
-    §5 to reflect "streaming load" instead of "full snapshot",
-    and §10 to add an entry for the new H-024 ship status.
-14. Update [`CI_PLAN.md`](./CI_PLAN.md) with the perf tier
-    table (§4.1) and the build-tag conventions.
+    H-024A and H-024B / commits. H-025 stays.
+11. Update this file's §13 status table to mark H-024B
+    shipped.
 
-**Explicit non-shipping from this PR** (each is in §6 with a
+**Explicit non-shipping from H-024B** (each is in §6 with a
 "defer" recommendation):
 
 - materialized counters,
@@ -830,12 +901,36 @@ nothing else:
 - incremental recompute,
 - per-org timeout (H-025 owns it),
 - nightly workflow (revisit after measuring),
-- org watermarks.
+- org watermarks,
+- removal of the legacy load-all methods (separate cleanup PR
+  per item 3).
 
-The PR title is
-`perf(findings): paginate Recompute scans + ingestion + perf-tier tests`.
-LOC budget: aim for < 1500 LOC including tests; split if it
-grows past 2000.
+PR title: `perf(findings): paginate Recompute scans + streaming
+two-cursor diff`. LOC budget: aim for < 1000 LOC including the
+comparison test; split if it grows past 1500.
+
+### 9.C Why the split
+
+The streaming two-cursor diff is the **only** item in the
+H-024 envelope that changes control flow around the findings
+state machine. Every other item is additive (a new method, a
+new test, a new index, a tighter SQL).
+
+Reviewing the streaming rewrite alongside indexes, fixtures,
+and an ingestion-side optimization would dilute reviewer
+attention exactly where it matters most — the H-023 state
+machine took explicit hardening passes
+([`CERTIFICATE_FINDINGS.md`](./CERTIFICATE_FINDINGS.md) §5
+"Defensive: unsupported finding status fails loudly") and
+H-024B's rewrite must demonstrably preserve every transition
+in that switch.
+
+The split also lets H-024A's perf tests land first as a
+**baseline**, so H-024B's measurements are diff-able against
+the pre-change numbers from the same fixture on the same
+runner. Without that ordering, the streaming rewrite would
+land without a comparable baseline and any regression would
+be invisible to CI.
 
 ## 10. Constraint check
 
@@ -941,9 +1036,11 @@ resolve them:
 
 ## 13. Status
 
-| Item                                       | Status                                  |
-| ------------------------------------------ | --------------------------------------- |
-| H-024 plan (this doc)                      | **draft — awaiting review and merge**   |
-| H-024 implementation PR                    | not started                              |
-| H-024 nightly perf workflow                | optional (§4.5)                          |
-| H-025 per-recompute timeout                | tracked separately in HARDENING_BACKLOG  |
+| Item                                                | Status                                  |
+| --------------------------------------------------- | --------------------------------------- |
+| H-024 plan (this doc)                               | **draft — awaiting review and merge**   |
+| H-024A — fixtures, perf tier, indexes, RETURNING    | not started                              |
+| H-024B — paginated scans + streaming diff           | not started (depends on H-024A)          |
+| Legacy-method cleanup PR (post-H-024B soak)         | deferred                                 |
+| H-024 nightly perf workflow                         | optional (§4.5)                          |
+| H-025 per-recompute timeout                         | tracked separately in HARDENING_BACKLOG  |
