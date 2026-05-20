@@ -16,34 +16,6 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
 
 ## Open Items
 
-### H-022 — Findings: scheduled recompute
-
-- **Title:** `feat(findings): scheduled background recompute`
-- **Risk:** low-medium (operational). v0.1 `recompute` is
-  operator-triggered only — an operator who forgets to recompute
-  after the underlying inventory changes will see stale
-  findings until the next manual run. The H-021 implementation
-  is synchronous and idempotent, so a scheduler can just call
-  `Service.Recompute` on a tick.
-- **Scope:** a background goroutine owned by the composition
-  root (CLAUDE.md §8.10 — documented owner, context-cancelled,
-  bounded retry). Tick interval is configurable via
-  `internal/config` (no hot-reload — CLAUDE.md §8.9). One tick
-  per org. Failures emit a structured log line and bump a
-  metric counter; the next tick retries (recompute is
-  idempotent, so retries are safe). No audit row for tick
-  start; the existing `findings.recomputed` row IS the audit
-  trail.
-- **Recommended PR:** `feat(findings): scheduled background recompute`.
-- **Reason not fixed now:** H-021 explicitly scopes out
-  background workers. The synchronous endpoint is the v0.1
-  surface; scheduled recompute is an additive deployment-shape
-  change that benefits from being in its own PR with operational
-  knobs (tick interval, jitter, per-org enable/disable).
-- **References:** CLAUDE.md §8.10 (concurrency discipline);
-  `docs/engineering/CERTIFICATE_FINDINGS.md` §5 (recompute
-  lifecycle).
-
 ### H-023 — Findings: acknowledge / suppress workflow
 
 - **Title:** `feat(findings): operator acknowledge + suppress workflow`

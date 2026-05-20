@@ -74,6 +74,14 @@ type Config struct {
 	AgentHeartbeatInterval time.Duration
 	AgentInventoryInterval time.Duration
 
+	// FindingsScheduler — H-022 background recompute loop.
+	// Defaults: enabled=true, interval=6h. Operators can
+	// disable for CI / staged rollouts via the env var below.
+	// Validation requires interval >= 30s when enabled; see
+	// internal/findings.MinSchedulerInterval.
+	FindingsSchedulerEnabled  bool
+	FindingsSchedulerInterval time.Duration
+
 	TLSTermination TLSTermination
 	TLSCertFile    string
 	TLSKeyFile     string
@@ -108,6 +116,12 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if cfg.AgentInventoryInterval, err = parseDuration("ANCHORIX_AGENT_INVENTORY_INTERVAL", "15m"); err != nil {
+		return nil, err
+	}
+	if cfg.FindingsSchedulerEnabled, err = parseBool("ANCHORIX_FINDINGS_SCHEDULER_ENABLED", true); err != nil {
+		return nil, err
+	}
+	if cfg.FindingsSchedulerInterval, err = parseDuration("ANCHORIX_FINDINGS_SCHEDULER_INTERVAL", "6h"); err != nil {
 		return nil, err
 	}
 	if cfg.SessionIdleLifetime, err = parseDuration("ANCHORIX_SESSION_IDLE_LIFETIME", "8h"); err != nil {
@@ -159,6 +173,31 @@ func (c *Config) validate() error {
 	}
 	if c.IsProduction() && strings.Contains(c.DatabaseURL, "sslmode=disable") {
 		return errors.New("DATABASE_URL must not use sslmode=disable in production")
+	}
+	if err := c.validateFindingsScheduler(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateFindingsScheduler enforces H-022 interval bounds at
+// process startup so a misconfigured deployment fails closed
+// before the scheduler is constructed. Mirrors
+// findings.ValidateSchedulerConfig but lives in config to keep
+// the env-var error message close to the variable name.
+func (c *Config) validateFindingsScheduler() error {
+	if !c.FindingsSchedulerEnabled {
+		return nil
+	}
+	const minInterval = 30 * time.Second
+	if c.FindingsSchedulerInterval <= 0 {
+		return errors.New("ANCHORIX_FINDINGS_SCHEDULER_INTERVAL must be positive")
+	}
+	if c.FindingsSchedulerInterval < minInterval {
+		return fmt.Errorf(
+			"ANCHORIX_FINDINGS_SCHEDULER_INTERVAL=%s below minimum %s",
+			c.FindingsSchedulerInterval, minInterval,
+		)
 	}
 	return nil
 }
@@ -219,6 +258,22 @@ func parseInt(key string, fallback int) (int, error) {
 	v, err := strconv.Atoi(raw)
 	if err != nil {
 		return 0, fmt.Errorf("%s: invalid integer %q: %w", key, raw, err)
+	}
+	return v, nil
+}
+
+// parseBool accepts the canonical Go truthy/falsy strings
+// (`true`/`false`/`1`/`0`/`t`/`f`/`yes`/`no` per
+// strconv.ParseBool) and falls back to the supplied default
+// when the env var is unset.
+func parseBool(key string, fallback bool) (bool, error) {
+	raw := envDefault(key, "")
+	if raw == "" {
+		return fallback, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, fmt.Errorf("%s: invalid boolean %q: %w", key, raw, err)
 	}
 	return v, nil
 }

@@ -896,7 +896,23 @@ never `403`.
 
 ### `POST /findings/recompute`
 
-Synchronous. Returns the recompute counter set:
+Synchronous, on-demand recompute. The same recompute also
+runs automatically in the background on the H-022 scheduler
+(default every 6 hours; configurable via
+`ANCHORIX_FINDINGS_SCHEDULER_INTERVAL`) — the manual endpoint
+remains available for "I just changed the inventory, recompute
+now" cases. Both paths share the same per-org advisory lock,
+so a scheduled run and a simultaneous manual run serialize
+without duplicating findings.
+
+The audit row's `actor` distinguishes the two paths: manual
+runs carry the operator's user id (`actor_type="user"`),
+scheduled runs carry the sentinel `"scheduler"`
+(`actor_type="system"`). See
+[`CERTIFICATE_FINDINGS.md` §7](../engineering/CERTIFICATE_FINDINGS.md)
+for the scheduler architecture.
+
+Returns the recompute counter set:
 
 ```json
 {

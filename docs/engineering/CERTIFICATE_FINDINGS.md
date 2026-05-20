@@ -232,7 +232,81 @@ the wire contract.
 Cross-org / missing ids return `404 not_found`. Agent bearer
 credentials are NOT honored.
 
-## 7. Non-goals (out of scope for H-021)
+## 7. Background scheduler (H-022)
+
+A single in-process scheduler started from the composition
+root (`cmd/anchorix/serve.go`) recomputes findings on a tick,
+per organization, without operator-triggered HTTP calls. The
+manual `POST /findings/recompute` endpoint remains available
+for on-demand recomputes — the scheduler is additive, not a
+replacement.
+
+### Configuration
+
+| Env var                                  | Default | Meaning                                                          |
+| ---------------------------------------- | ------- | ---------------------------------------------------------------- |
+| `ANCHORIX_FINDINGS_SCHEDULER_ENABLED`    | `true`  | When `false`, the loop never ticks (NewScheduler still wires).   |
+| `ANCHORIX_FINDINGS_SCHEDULER_INTERVAL`   | `6h`    | Spacing between ticks. Must be ≥ 30s when enabled.               |
+
+Validation runs at startup in `internal/config.validate` so a
+misconfigured deployment fails closed before the scheduler is
+constructed.
+
+### Architecture
+
+- One long-running goroutine owned by the composition root.
+- Cancellation path: `context.Context` propagated from
+  `serve.go`. On signal, `ticker` is stopped and `Run` returns
+  nil; the deferred `db.Close()` waits for the goroutine to
+  drain via a `schedDone` channel.
+- No external scheduler system, no distributed coordination,
+  no cron dependency.
+
+### Audit envelope
+
+Scheduled recomputes write `findings.recomputed` audit rows
+with `actor="scheduler"` and `actor_type="system"` (the
+`findings.SchedulerActorID` constant). This is distinct from
+operator-triggered recomputes, which carry the real user ID
+with `actor_type="user"`. Operators filtering audit history
+can therefore separate scheduled vs manual runs without
+inspecting metadata.
+
+Pinned by `TestFindingsRecomputeScheduledWritesSchedulerActor`.
+
+### Error handling
+
+- **Failure in one org's recompute** — logged with structured
+  fields (organization_id, duration, err). The loop continues
+  to the next org. No global stop.
+- **Panic in one org's recompute** — recovered in
+  `Scheduler.recomputeOrg`'s deferred `recover()`. Logged with
+  the panic message. The loop continues.
+- **Organization-lister failure** — logged. The current sweep
+  is skipped; the next tick retries. No global stop.
+
+### Concurrency with manual recompute
+
+The scheduler does NOT add a second lock layer. The
+`WithTxLockedFindings` advisory lock already serializes
+concurrent recomputes per-organization (PR-021 / PR-026
+H-017 pattern). A scheduled run and a simultaneous manual run
+for the same org block at the lock barrier; whichever wins
+sees the other's state on its next read.
+
+Pinned by `TestFindingsRecomputeScheduledSerializesWithManual`
+(5 iterations of concurrent manual + scheduled recompute; both
+must return without error and findings count must stay at 1).
+
+### Observability
+
+Structured `info` log per successful org recompute, with
+fields: `organization_id`, `duration`, `evaluated_certificates`,
+`opened`, `updated`, `resolved`, `unchanged`, `rule_count`.
+Structured `error` log per failure (or panic) with `err` /
+`panic` fields. No metrics system in v0.1.
+
+## 8. Non-goals (out of scope for H-021)
 
 - **Remediation workflow** — no mutation surface beyond
   `recompute`. Acknowledge / suppress are reserved by the
@@ -249,17 +323,17 @@ credentials are NOT honored.
 - **Findings UI** — no React component, no dashboard widget;
   the API is the v0.1 surface.
 
-## 8. Status
+## 9. Status
 
 | Phase                             | Status                                  |
 | --------------------------------- | --------------------------------------- |
-| H-021 design (this doc)           | **shipped** (this PR)                   |
-| H-021 implementation              | **shipped** (this PR)                   |
-| Findings performance optimization | HARDENING_BACKLOG follow-up             |
-| Scheduled recompute               | HARDENING_BACKLOG follow-up             |
-| Acknowledge / suppress workflow   | HARDENING_BACKLOG follow-up             |
+| H-021 design (this doc)           | shipped (PR #30)                        |
+| H-021 implementation              | shipped (PR #30)                        |
+| H-022 scheduled recompute         | **shipped** (this PR)                   |
+| H-023 acknowledge / suppress workflow | HARDENING_BACKLOG follow-up         |
+| H-024 findings performance optimization | HARDENING_BACKLOG follow-up       |
 
-## 9. References
+## 10. References
 
 - [CLAUDE.md](../../CLAUDE.md) §6 (deterministic auth), §8.6
   (consumer-owned interfaces), §8.8 (constructor DI), §9 (audit

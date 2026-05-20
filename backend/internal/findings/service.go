@@ -76,12 +76,25 @@ func NewService(
 	}, nil
 }
 
+// SchedulerActorID is the value the scheduled-recompute path
+// records in the audit row's `actor` column. ActorType is then
+// "system" (the scheduler is not a user). Stable string so
+// operators can filter `audit_events.actor = 'scheduler'` to
+// see every background recompute.
+const SchedulerActorID = "scheduler"
+
 // RecomputeInput is the validated input to Service.Recompute.
 // OrganizationID is required; ActorUserID is the operator
 // whose session triggered the recompute (used as the audit
 // event's Actor so post-hoc filtering by user works). The HTTP
 // handler MUST populate ActorUserID from the authenticated
 // session — never from a request body or query parameter.
+//
+// For scheduled recomputes the scheduler MUST use
+// Service.RecomputeScheduled, NOT this method with
+// ActorUserID="" — that path is reserved for the explicit
+// scheduler entry point that emits the documented
+// `actor="scheduler"` audit row.
 type RecomputeInput struct {
 	OrganizationID string
 	ActorUserID    string
@@ -137,11 +150,53 @@ func (s *Service) Recompute(ctx context.Context, in RecomputeInput) (*RecomputeR
 	if strings.TrimSpace(in.OrganizationID) == "" {
 		return nil, fmt.Errorf("%w: organization id required", ErrInvalidRecomputeInput)
 	}
-	now := s.clock.Now()
+	// ActorUserID drives the audit row. An empty value falls back
+	// to ("system", "system") rather than the previous misleading
+	// "operator" placeholder; the H-021 review pinned this
+	// behavior with TestFindingsRecomputeAuditCarriesRealActorID.
+	// The scheduler path uses RecomputeScheduled to get the
+	// dedicated "scheduler" actor.
+	actor := strings.TrimSpace(in.ActorUserID)
+	actorType := "user"
+	if actor == "" {
+		actor = "system"
+		actorType = "system"
+	}
+	return s.recomputeWithActor(ctx, in.OrganizationID, actor, actorType)
+}
 
+// RecomputeScheduled is the entry point the H-022 background
+// scheduler uses. Behavior is identical to Recompute except the
+// audit row's Actor is hardcoded to SchedulerActorID and
+// ActorType is "system" — operators filtering audit history by
+// actor can therefore separate scheduled runs from
+// operator-triggered ones without inspecting the metadata.
+//
+// Kept as a separate method (rather than a Recompute flag) so
+// the audit envelope shape lives in one place. The HTTP handler
+// MUST NOT call this — it would mis-attribute an
+// operator-triggered recompute to the scheduler.
+func (s *Service) RecomputeScheduled(ctx context.Context, organizationID string) (*RecomputeResult, error) {
+	if strings.TrimSpace(organizationID) == "" {
+		return nil, fmt.Errorf("%w: organization id required", ErrInvalidRecomputeInput)
+	}
+	return s.recomputeWithActor(ctx, organizationID, SchedulerActorID, "system")
+}
+
+// recomputeWithActor is the shared implementation behind
+// Recompute and RecomputeScheduled. Both entry points validate
+// their inputs and then delegate here with the resolved
+// (actor, actorType) pair. The split keeps Recompute /
+// RecomputeScheduled as thin API surfaces and centralizes the
+// lock+diff+audit orchestration.
+func (s *Service) recomputeWithActor(
+	ctx context.Context,
+	organizationID, actor, actorType string,
+) (*RecomputeResult, error) {
+	now := s.clock.Now()
 	var result RecomputeResult
-	if err := s.tx.WithTxLockedFindings(ctx, in.OrganizationID, func(ctx context.Context) error {
-		evaluated, opened, updated, resolved, unchanged, err := s.runDiff(ctx, in.OrganizationID, now)
+	if err := s.tx.WithTxLockedFindings(ctx, organizationID, func(ctx context.Context) error {
+		evaluated, opened, updated, resolved, unchanged, err := s.runDiff(ctx, organizationID, now)
 		if err != nil {
 			return err
 		}
@@ -153,7 +208,7 @@ func (s *Service) Recompute(ctx context.Context, in RecomputeInput) (*RecomputeR
 			Unchanged:             unchanged,
 			RuleCount:             len(s.rules),
 		}
-		if err := s.recordRecomputeAudit(ctx, in, &result, now); err != nil {
+		if err := s.recordRecomputeAudit(ctx, organizationID, actor, actorType, &result, now); err != nil {
 			return err
 		}
 		return nil
@@ -325,14 +380,19 @@ type recomputeAuditMetadata struct {
 	RuleCount             int    `json:"rule_count"`
 }
 
+// recordRecomputeAudit takes the resolved (actor, actorType)
+// pair from its caller — Service.Recompute derives them from
+// RecomputeInput.ActorUserID; Service.RecomputeScheduled passes
+// (SchedulerActorID, "system"). The actor/actorType strings
+// reach the audit row verbatim.
 func (s *Service) recordRecomputeAudit(
 	ctx context.Context,
-	in RecomputeInput,
+	organizationID, actor, actorType string,
 	r *RecomputeResult,
 	now time.Time,
 ) error {
 	md, _ := json.Marshal(recomputeAuditMetadata{
-		OrganizationID:        in.OrganizationID,
+		OrganizationID:        organizationID,
 		EvaluatedCertificates: r.EvaluatedCertificates,
 		Opened:                r.Opened,
 		Updated:               r.Updated,
@@ -340,27 +400,14 @@ func (s *Service) recordRecomputeAudit(
 		Unchanged:             r.Unchanged,
 		RuleCount:             r.RuleCount,
 	})
-	// ActorUserID comes from the authenticated operator session
-	// via the HTTP handler. If a future caller (CLI, test) omits
-	// it, fall back to the "system" sentinel rather than logging
-	// a misleading "operator" placeholder — operators reading
-	// audit history can then distinguish "real user did this"
-	// from "internal pathway did this". The handler MUST set it
-	// for any real recompute; this fallback is purely defensive.
-	actor := strings.TrimSpace(in.ActorUserID)
-	actorType := "user"
-	if actor == "" {
-		actor = "system"
-		actorType = "system"
-	}
 	if err := s.audit.Record(ctx, audit.Event{
-		OrganizationID: in.OrganizationID,
+		OrganizationID: organizationID,
 		OccurredAt:     now,
 		Actor:          actor,
 		ActorType:      actorType,
 		Action:         "findings.recomputed",
 		TargetType:     "organization",
-		TargetID:       in.OrganizationID,
+		TargetID:       organizationID,
 		Metadata:       md,
 	}); err != nil {
 		return fmt.Errorf("%w: %v", ErrInternalAudit, err)
