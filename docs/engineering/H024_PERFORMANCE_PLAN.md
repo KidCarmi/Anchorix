@@ -491,13 +491,20 @@ or "**defer**" (revisit after pilot measurements).
 - **Migration risk:** none (schema unchanged).
 - **Correctness risk:** medium. The recompute must observe the
   org's certificates **consistently** during one tick.
-  PostgreSQL's REPEATABLE READ inside the existing `WithTxLockedFindings`
-  transaction already guarantees this for paginated scans — so
-  the snapshot stays coherent. The risk is implementer error
-  in the cursor-merge: a missed boundary becomes a wrong-diff
-  bug, which is far worse than a slow recompute. Mitigate with
-  a unit test that diff-compares the streaming and
-  load-all paths on the §5 fixture.
+  `WithTxLockedFindings` only serializes concurrent
+  *recomputes* — ingestion runs under a different advisory-lock
+  namespace (`WithTxLockedAgent`), so under PostgreSQL's
+  default `READ COMMITTED` each paginated `SELECT` would
+  observe a fresh snapshot and could disagree with the
+  previous page. The fix is binding on H-024B: open the
+  recompute tx at `REPEATABLE READ` so all pages read from
+  one snapshot. See §9.B item 4 for the wiring requirement
+  and item 7 for the coherence test that proves this property
+  under concurrent ingestion. Beyond isolation, the residual
+  risk is implementer error in the cursor-merge — a missed
+  boundary becomes a wrong-diff bug, which is far worse than
+  a slow recompute. Mitigate with the §9.B item 6
+  byte-identical diff-comparison test on the §5 fixture.
 - **Recommended:** **now** (this is the H-024 backlog entry's
   stated scope).
 
@@ -858,6 +865,28 @@ in this PR.
    the end. The state-machine switch (service.go:268–393)
    stays byte-identical — only the surrounding control flow
    changes. H-023 override-preserving paths are NOT touched.
+
+   **Snapshot isolation (binding):** the recompute transaction
+   MUST be opened at `REPEATABLE READ` isolation so every
+   paginated `SELECT` inside the tx reads from a single
+   consistent input snapshot. Under PostgreSQL's default
+   `READ COMMITTED`, each `SELECT` is a fresh snapshot — a
+   concurrent ingestion commit (which is NOT blocked by
+   `WithTxLockedFindings`, since cert ingestion holds the
+   different `WithTxLockedAgent` namespace) would let later
+   cert / observation pages see rows that earlier pages did
+   not, producing nondeterministic finding diffs and
+   violating
+   [`CERTIFICATE_FINDINGS.md`](./CERTIFICATE_FINDINGS.md)
+   §5's determinism guarantee. Wiring: extend
+   `Transactor.WithTxLockedFindings` (or add a sibling like
+   `WithTxLockedFindingsRepeatableRead`) so the
+   composition-root caller in
+   `internal/findings/service.go` opens the tx at the
+   correct isolation level. Override paths
+   (`Service.applyOverride`) keep their current isolation
+   level — they touch a single row and are already serialized
+   by the per-org lock.
 5. Recompute audit row writes the new `loaded_certificates` and
    `loaded_findings` metadata fields. JSON is additive
    (CLAUDE.md §17); existing readers don't break.
@@ -870,25 +899,36 @@ in this PR.
    from H-024A, snapshot each implementation's resulting
    `findings` table state, and assert byte-identical
    equivalence. This is the gating test for H-024B's merge.
-7. Extend the H-024A perf-regression test to assert the new
+7. `backend/test/integration/recompute_snapshot_isolation_test.go`
+   — coherence under concurrent ingestion. Start a recompute
+   on a mid-sized fixture; while the recompute is mid-scan,
+   commit an ingestion batch from a separate goroutine that
+   inserts a new cert whose fingerprint would match
+   `weak_rsa_key`. The recompute MUST NOT see the new cert
+   in its current pass (snapshot isolation); the next
+   recompute call MUST see it. Without `REPEATABLE READ`
+   this test fails — that is its purpose. Use a sync barrier
+   (channel, not sleep) to make the interleaving
+   deterministic per CLAUDE.md §8.10.
+8. Extend the H-024A perf-regression test to assert the new
    streaming `runDiff`'s query-count and per-page bounds.
-8. Stress: extend H-024A's stress skeleton to assert the
+9. Stress: extend H-024A's stress skeleton to assert the
    pilot/fleet recompute budgets from §3 against the
    streaming implementation. Captures the post-change
    baseline.
 
 **Docs**
 
-9. Update [`CERTIFICATE_FINDINGS.md`](./CERTIFICATE_FINDINGS.md)
-   §5 to reflect "streaming load" instead of "full snapshot",
-   and §10 to add an entry for H-024B's ship status. Note
-   that `ListAllCertificateSummariesForOrg` and
-   `ListAllForOrg` remain present-but-unused until the
-   follow-up cleanup PR.
-10. Update [`HARDENING_BACKLOG.md`](./HARDENING_BACKLOG.md):
+10. Update [`CERTIFICATE_FINDINGS.md`](./CERTIFICATE_FINDINGS.md)
+    §5 to reflect "streaming load under REPEATABLE READ"
+    instead of "full snapshot", and §10 to add an entry for
+    H-024B's ship status. Note that
+    `ListAllCertificateSummariesForOrg` and `ListAllForOrg`
+    remain present-but-unused until the follow-up cleanup PR.
+11. Update [`HARDENING_BACKLOG.md`](./HARDENING_BACKLOG.md):
     remove the H-024 entry, replace with a short pointer to
     H-024A and H-024B / commits. H-025 stays.
-11. Update this file's §13 status table to mark H-024B
+12. Update this file's §13 status table to mark H-024B
     shipped.
 
 **Explicit non-shipping from H-024B** (each is in §6 with a
@@ -977,14 +1017,29 @@ resolve them:
 1. **Page size for the streaming load.** 500? 1000? 5000?
    Goal: keep the matches map bounded; minimize round-trips.
    Suggestion: start at 1000 and measure on the Pilot fixture.
-2. **Snapshot consistency mechanism.** PostgreSQL's default
-   `READ COMMITTED` is sufficient for the locking model used,
-   but `REPEATABLE READ` would give a guaranteed coherent
-   snapshot across pages. Trade-off: REPEATABLE READ can
-   surface serialization conflicts; for a single advisory-lock-
-   protected writer this is essentially never hit, but worth
-   measuring. Suggestion: keep the default; rely on the
-   advisory lock for serialization.
+2. ~~**Snapshot consistency mechanism.**~~ **Resolved during
+   review.** An earlier draft suggested keeping `READ
+   COMMITTED` and relying on `WithTxLockedFindings` for
+   serialization; that recommendation was incorrect.
+   `WithTxLockedFindings` uses the `'findings-recompute'`
+   advisory-lock namespace; ingestion uses `'cert-inventory'`
+   on a per-agent key (`backend/internal/storage/postgres/postgres.go`).
+   The two namespaces don't block each other, so under
+   `READ COMMITTED` an ingestion commit during a paginated
+   recompute would let later pages observe newer
+   certificates / observations than earlier pages — breaking
+   the determinism guarantee
+   [`CERTIFICATE_FINDINGS.md`](./CERTIFICATE_FINDINGS.md)
+   §5 commits to.
+
+   **Binding decision:** the streaming recompute tx in H-024B
+   runs under `REPEATABLE READ`. This is now stated as a hard
+   requirement on §9.B item 4, with a dedicated coherence
+   test in §9.B item 7. Serialization conflicts are not a
+   concern: the recompute is read-only on inputs
+   (`certificates`, `certificate_observations`) and write-only
+   on `findings`, and the per-org `WithTxLockedFindings`
+   advisory lock keeps findings writes single-writer.
 3. **Streaming via cursor vs `LIMIT/OFFSET`.** The H-010
    cursor pattern is already in use; cursor wins on large
    page-N because it stays index-only. Suggestion: cursor.
