@@ -48,6 +48,11 @@ type findingRowDTO struct {
 	LastSeenAt        string          `json:"last_seen_at"`
 	ResolvedAt        *string         `json:"resolved_at"`
 	UpdatedAt         string          `json:"updated_at"`
+	// H-023 override metadata.
+	StatusReason      string  `json:"status_reason"`
+	StatusActor       string  `json:"status_actor"`
+	StatusChangedAt   *string `json:"status_changed_at"`
+	SuppressExpiresAt *string `json:"suppress_expires_at"`
 }
 
 type findingsListDTO struct {
@@ -1382,5 +1387,408 @@ func TestFindingsRecomputeScheduledSerializesWithManual(t *testing.T) {
 		if count != 1 {
 			t.Fatalf("iteration %d: findings count = %d, want 1 (duplicate INSERT race?)", iter, count)
 		}
+	}
+}
+
+// --- H-023 acknowledge / suppress workflow -------------------------
+
+// seedFindingForOverride seeds a weak-RSA cert + runs an initial
+// recompute so an open finding exists for the org. Returns the
+// finding id so override tests can hit it directly.
+func seedFindingForOverride(t *testing.T, db *postgres.DB, srv string, adminClient *http.Client, certID string) string {
+	t.Helper()
+	cert := defaultCertFixture(certID, certID+".example")
+	cert.PublicKeyBits = 1024 // weak_rsa_key
+	seedCert(t, db, cert)
+	recompute(t, srv, adminClient)
+
+	list := findingsList(t, srv, adminClient, "rule_id=weak_rsa_key&certificate_id="+certID)
+	if len(list.Items) != 1 {
+		t.Fatalf("seed list items = %d, want 1", len(list.Items))
+	}
+	return list.Items[0].ID
+}
+
+// postJSON is a small helper for POST /findings/{id}/{action}.
+func postJSON(t *testing.T, client *http.Client, url, body string, wantStatus int) []byte {
+	t.Helper()
+	req, _ := http.NewRequest(http.MethodPost, url, strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("POST %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != wantStatus {
+		t.Fatalf("POST %s: status = %d, want %d; body=%s",
+			url, resp.StatusCode, wantStatus, respBody)
+	}
+	return respBody
+}
+
+// TestFindingsAcknowledgeHappyPath: operator acknowledges an
+// open finding; response includes override metadata; the
+// finding row in the DB has status=acknowledged + reason + actor.
+func TestFindingsAcknowledgeHappyPath(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	findingID := seedFindingForOverride(t, db, srv.URL, adminClient, "ack-happy")
+
+	body := postJSON(t, adminClient,
+		srv.URL+"/api/v1/findings/"+findingID+"/acknowledge",
+		`{"reason":"ticket CSCM-001, blocked on vendor"}`, http.StatusOK)
+
+	var got findingRowDTO
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, body)
+	}
+	if got.Status != "acknowledged" {
+		t.Errorf("status = %q, want acknowledged", got.Status)
+	}
+	if got.StatusReason != "ticket CSCM-001, blocked on vendor" {
+		t.Errorf("status_reason = %q", got.StatusReason)
+	}
+	if got.StatusActor == "" {
+		t.Errorf("status_actor empty; want admin user id")
+	}
+	if got.StatusChangedAt == nil {
+		t.Errorf("status_changed_at = nil")
+	}
+}
+
+// TestFindingsSuppressHappyPath: operator suppresses a finding
+// with a future expiry; response carries suppress_expires_at.
+func TestFindingsSuppressHappyPath(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	findingID := seedFindingForOverride(t, db, srv.URL, adminClient, "supp-happy")
+
+	expiresAt := time.Now().UTC().Add(7 * 24 * time.Hour).Format(time.RFC3339)
+	body := postJSON(t, adminClient,
+		srv.URL+"/api/v1/findings/"+findingID+"/suppress",
+		`{"reason":"known false positive","expires_at":"`+expiresAt+`"}`,
+		http.StatusOK)
+
+	var got findingRowDTO
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, body)
+	}
+	if got.Status != "suppressed" {
+		t.Errorf("status = %q, want suppressed", got.Status)
+	}
+	if got.SuppressExpiresAt == nil {
+		t.Errorf("suppress_expires_at = nil")
+	}
+}
+
+// TestFindingsOverride_EmptyReason400: both endpoints reject
+// empty reason as 400 bad_request.
+func TestFindingsOverride_EmptyReason400(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	findingID := seedFindingForOverride(t, db, srv.URL, adminClient, "empty-reason")
+
+	for _, ep := range []string{"acknowledge", "suppress"} {
+		body := postJSON(t, adminClient,
+			srv.URL+"/api/v1/findings/"+findingID+"/"+ep,
+			`{"reason":"   "}`, http.StatusBadRequest)
+		if !strings.Contains(string(body), "bad_request") {
+			t.Errorf("%s: missing bad_request code; body=%s", ep, body)
+		}
+	}
+}
+
+// TestFindingsSuppress_PastExpiry400: suppress with expires_at
+// in the past returns 400.
+func TestFindingsSuppress_PastExpiry400(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	findingID := seedFindingForOverride(t, db, srv.URL, adminClient, "past-expiry")
+
+	past := time.Now().UTC().Add(-1 * time.Hour).Format(time.RFC3339)
+	body := postJSON(t, adminClient,
+		srv.URL+"/api/v1/findings/"+findingID+"/suppress",
+		`{"reason":"ok","expires_at":"`+past+`"}`,
+		http.StatusBadRequest)
+	if !strings.Contains(string(body), "bad_request") {
+		t.Errorf("missing bad_request code; body=%s", body)
+	}
+}
+
+// TestFindingsOverride_CrossOrg404: a foreign-org finding's id
+// passed to the home org's POST returns 404.
+func TestFindingsOverride_CrossOrg404(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	// Seed a foreign org + cert + finding directly via SQL —
+	// no public path produces a cross-org finding.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO organizations (id, name) VALUES ('other-org', 'Other Org')`); err != nil {
+			return err
+		}
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO certificates
+				(id, organization_id, fingerprint_sha256, subject, issuer,
+				 serial_number_hex, signature_algorithm, public_key_algorithm,
+				 public_key_bits, not_before, not_after,
+				 sans, key_usages, ext_key_usages,
+				 is_self_signed, is_ca, pem, first_seen_at, last_seen_at)
+			 VALUES ('foreign-cert-h023', 'other-org', 'fp', 'CN=foreign', 'CN=ca',
+				 '01', 'SHA256-RSA', 'RSA', 1024,
+				 now()-interval '1 day', now()+interval '90 days',
+				 '[]'::jsonb, '[]'::jsonb, '[]'::jsonb,
+				 false, false, 'pem', now(), now())`); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx,
+			`INSERT INTO findings (
+				id, organization_id, certificate_id, rule_id, rule_version,
+				severity, status, title, evidence,
+				opened_at, last_seen_at, resolved_at, updated_at
+			) VALUES (
+				'foreign-finding-h023', 'other-org', 'foreign-cert-h023', 'weak_rsa_key', 1,
+				'high', 'open', 'foreign', '{}'::jsonb,
+				now(), now(), NULL, now()
+			)`)
+		return err
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	for _, ep := range []string{"acknowledge", "suppress"} {
+		postJSON(t, adminClient,
+			srv.URL+"/api/v1/findings/foreign-finding-h023/"+ep,
+			`{"reason":"x"}`, http.StatusNotFound)
+	}
+}
+
+// TestFindingsOverride_AgentBearerRejected: agent bearer
+// credentials must not work against operator-only override
+// endpoints.
+func TestFindingsOverride_AgentBearerRejected(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	_, credential := enrolledAgent(t, srv.URL, adminClient)
+
+	bearerOnly := &http.Client{Timeout: 5 * time.Second}
+	for _, ep := range []string{"acknowledge", "suppress"} {
+		req, _ := http.NewRequest(http.MethodPost,
+			srv.URL+"/api/v1/findings/anything/"+ep,
+			strings.NewReader(`{"reason":"x"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+credential)
+		resp, err := bearerOnly.Do(req)
+		if err != nil {
+			t.Fatalf("%s: %v", ep, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Errorf("%s status = %d, want 401", ep, resp.StatusCode)
+		}
+	}
+}
+
+// TestFindingsOverride_AuditRowsWritten: an acknowledge + a
+// suppress each produce one audit row with the correct action,
+// severity:"security", and actor matching the operator's user
+// id.
+func TestFindingsOverride_AuditRowsWritten(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	findingID := seedFindingForOverride(t, db, srv.URL, adminClient, "audit-check")
+
+	postJSON(t, adminClient,
+		srv.URL+"/api/v1/findings/"+findingID+"/acknowledge",
+		`{"reason":"ack reason"}`, http.StatusOK)
+
+	expiresAt := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+	postJSON(t, adminClient,
+		srv.URL+"/api/v1/findings/"+findingID+"/suppress",
+		`{"reason":"suppress reason","expires_at":"`+expiresAt+`"}`, http.StatusOK)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Look up admin id from the users table.
+	var adminUserID string
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT id FROM users WHERE email = $1`, testEmail).Scan(&adminUserID)
+	}); err != nil {
+		t.Fatalf("lookup admin: %v", err)
+	}
+
+	for _, action := range []string{"finding.acknowledged", "finding.suppressed"} {
+		var actor, actorType string
+		var metadata []byte
+		if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx,
+				`SELECT actor, actor_type, metadata
+				   FROM audit_events
+				  WHERE action = $1
+				    AND organization_id = 'anchorix'
+				  ORDER BY occurred_at DESC
+				  LIMIT 1`, action,
+			).Scan(&actor, &actorType, &metadata)
+		}); err != nil {
+			t.Fatalf("%s lookup: %v", action, err)
+		}
+		if actor != adminUserID {
+			t.Errorf("%s actor = %q, want admin user id %q", action, actor, adminUserID)
+		}
+		if actorType != "user" {
+			t.Errorf("%s actor_type = %q, want user", action, actorType)
+		}
+		if !strings.Contains(string(metadata), `"severity":"security"`) {
+			t.Errorf("%s metadata missing severity:security; got %s", action, metadata)
+		}
+	}
+}
+
+// TestFindingsGet_ShowsOverrideMetadata: after acknowledge,
+// GET /findings/{id} returns the override fields.
+func TestFindingsGet_ShowsOverrideMetadata(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	findingID := seedFindingForOverride(t, db, srv.URL, adminClient, "get-shows")
+
+	postJSON(t, adminClient,
+		srv.URL+"/api/v1/findings/"+findingID+"/acknowledge",
+		`{"reason":"context"}`, http.StatusOK)
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/findings/"+findingID, nil)
+	resp, err := adminClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200; body=%s", resp.StatusCode, body)
+	}
+	var got findingRowDTO
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, body)
+	}
+	if got.StatusReason != "context" {
+		t.Errorf("GET status_reason = %q", got.StatusReason)
+	}
+	if got.StatusActor == "" {
+		t.Errorf("GET status_actor empty")
+	}
+}
+
+// TestFindingsList_StatusFilters: status=acknowledged and
+// status=suppressed filters surface only the matching rows.
+func TestFindingsList_StatusFilters(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	ackID := seedFindingForOverride(t, db, srv.URL, adminClient, "list-ack")
+	supID := seedFindingForOverride(t, db, srv.URL, adminClient, "list-supp")
+
+	postJSON(t, adminClient,
+		srv.URL+"/api/v1/findings/"+ackID+"/acknowledge",
+		`{"reason":"r"}`, http.StatusOK)
+	expiresAt := time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+	postJSON(t, adminClient,
+		srv.URL+"/api/v1/findings/"+supID+"/suppress",
+		`{"reason":"r","expires_at":"`+expiresAt+`"}`, http.StatusOK)
+
+	ackList := findingsList(t, srv.URL, adminClient, "status=acknowledged")
+	if len(ackList.Items) != 1 || ackList.Items[0].ID != ackID {
+		t.Errorf("acknowledged filter = %+v, want only %s", ackList.Items, ackID)
+	}
+
+	supList := findingsList(t, srv.URL, adminClient, "status=suppressed")
+	if len(supList.Items) != 1 || supList.Items[0].ID != supID {
+		t.Errorf("suppressed filter = %+v, want only %s", supList.Items, supID)
+	}
+}
+
+// TestFindingsRecompute_AcknowledgedStaysAcknowledged:
+// end-to-end check via the HTTP path that an acknowledged
+// finding's status survives a recompute when the rule still
+// matches.
+func TestFindingsRecompute_AcknowledgedStaysAcknowledged(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	findingID := seedFindingForOverride(t, db, srv.URL, adminClient, "ack-survives")
+
+	postJSON(t, adminClient,
+		srv.URL+"/api/v1/findings/"+findingID+"/acknowledge",
+		`{"reason":"r"}`, http.StatusOK)
+
+	recompute(t, srv.URL, adminClient)
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/findings/"+findingID, nil)
+	resp, _ := adminClient.Do(req)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var got findingRowDTO
+	json.Unmarshal(body, &got)
+	if got.Status != "acknowledged" {
+		t.Errorf("status = %q, want acknowledged after recompute", got.Status)
+	}
+	if got.StatusReason != "r" {
+		t.Errorf("status_reason = %q, want preserved", got.StatusReason)
+	}
+}
+
+// TestFindingsRecompute_ExpiredSuppressionReopens:
+// end-to-end check that a suppressed finding past its expiry
+// reopens to `open` on the next recompute.
+func TestFindingsRecompute_ExpiredSuppressionReopens(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	findingID := seedFindingForOverride(t, db, srv.URL, adminClient, "supp-reopens")
+
+	// Suppress for 1 second; sleep past the expiry; recompute;
+	// observe `open`.
+	expiresAt := time.Now().UTC().Add(1 * time.Second).Format(time.RFC3339)
+	postJSON(t, adminClient,
+		srv.URL+"/api/v1/findings/"+findingID+"/suppress",
+		`{"reason":"brief","expires_at":"`+expiresAt+`"}`, http.StatusOK)
+
+	time.Sleep(2 * time.Second)
+	recompute(t, srv.URL, adminClient)
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/findings/"+findingID, nil)
+	resp, _ := adminClient.Do(req)
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var got findingRowDTO
+	json.Unmarshal(body, &got)
+	if got.Status != "open" {
+		t.Errorf("status = %q, want open after expired suppression", got.Status)
+	}
+	if got.SuppressExpiresAt != nil {
+		t.Errorf("suppress_expires_at = %v, want nil after reopen", *got.SuppressExpiresAt)
 	}
 }

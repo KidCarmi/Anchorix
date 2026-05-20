@@ -30,6 +30,17 @@ var ErrInvalidRecomputeInput = errors.New("findings: invalid recompute input")
 // inventory.ErrInternalAudit pattern for consistency.
 var ErrInternalAudit = errors.New("findings: audit write failed")
 
+// ErrInvalidOverrideInput is returned by
+// Service.AcknowledgeFinding / SuppressFinding when the input
+// is structurally invalid:
+//
+//   - missing organization id / finding id / actor / reason
+//   - reason longer than MaxOverrideReasonLength
+//   - suppress ExpiresAt not strictly in the future
+//
+// HTTP handler maps to 400 bad_request.
+var ErrInvalidOverrideInput = errors.New("findings: invalid override input")
+
 // ErrUnsupportedFindingStatus is returned by Service.Recompute
 // when an existing finding row carries a status the recompute
 // engine doesn't know how to transition. v0.1 only writes

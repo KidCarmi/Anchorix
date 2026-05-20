@@ -23,15 +23,16 @@ const (
 
 // Status is the lifecycle of a finding.
 //
-// v0.1 emits only `open` and `resolved`. The schema CHECK reserves
-// `acknowledged` and `suppressed` for the future override surface
-// — Service.Recompute never writes those values, and the GET
-// endpoints filter the closed set (open/resolved) by default.
+// H-021 wrote only `open` / `resolved`. H-023 brings the two
+// override values into active use via
+// Service.AcknowledgeFinding and Service.SuppressFinding.
 type Status string
 
 const (
-	StatusOpen     Status = "open"
-	StatusResolved Status = "resolved"
+	StatusOpen         Status = "open"
+	StatusResolved     Status = "resolved"
+	StatusAcknowledged Status = "acknowledged"
+	StatusSuppressed   Status = "suppressed"
 )
 
 // Finding is the canonical in-memory representation of a row in
@@ -77,6 +78,24 @@ const (
 // The UpdateFinding / InsertFinding paths ignore them; only the
 // scan paths that need to surface them to operators populate
 // them.
+//
+// Override metadata (H-023):
+//
+//   - StatusReason / StatusActor / StatusChangedAt —
+//     populated when an operator transitions the finding to
+//     acknowledged or suppressed; cleared when recompute
+//     auto-transitions OUT of an override (rule no longer
+//     matches, suppression expired). NULL on findings that
+//     have never been overridden.
+//   - SuppressExpiresAt — set only when status=suppressed AND
+//     the operator provided an expires_at. Recompute reopens
+//     the finding to `open` when wall-clock time crosses this
+//     and the rule still matches.
+//
+// The immutable history of override actions lives in
+// audit_events (`finding.acknowledged` / `finding.suppressed`
+// rows). These fields are denormalized current-state for the
+// operator GET endpoints.
 type Finding struct {
 	ID                string
 	OrganizationID    string
@@ -93,6 +112,10 @@ type Finding struct {
 	UpdatedAt         time.Time
 	FingerprintSHA256 string
 	Subject           string
+	StatusReason      string
+	StatusActor       string
+	StatusChangedAt   *time.Time
+	SuppressExpiresAt *time.Time
 }
 
 // RecomputeResult is the counter set returned by Service.Recompute.
@@ -132,15 +155,17 @@ type ListQuery struct {
 }
 
 // StatusFilter is the shape of the operator's `status` query
-// parameter. The three accepted wire values are mapped to the
-// constants below; an empty filter is treated as `open` (the
-// documented default).
+// parameter. Accepted wire values are mapped to the constants
+// below; an empty filter is treated as `open` (the documented
+// default).
 type StatusFilter string
 
 const (
-	StatusFilterOpen     StatusFilter = "open"
-	StatusFilterResolved StatusFilter = "resolved"
-	StatusFilterAll      StatusFilter = "all"
+	StatusFilterOpen         StatusFilter = "open"
+	StatusFilterResolved     StatusFilter = "resolved"
+	StatusFilterAcknowledged StatusFilter = "acknowledged"
+	StatusFilterSuppressed   StatusFilter = "suppressed"
+	StatusFilterAll          StatusFilter = "all"
 )
 
 // ListResult is the page returned by Service.ListFindings.
@@ -148,4 +173,39 @@ const (
 type ListResult struct {
 	Items      []Finding
 	NextCursor string
+}
+
+// MaxOverrideReasonLength caps the operator-supplied `reason`
+// field on acknowledge / suppress requests. Long enough for a
+// "we filed CSCM-1234, expected fix Q2" sentence; short enough
+// that a malicious operator can't blow out the audit_events
+// JSONB column.
+const MaxOverrideReasonLength = 1000
+
+// AcknowledgeInput is the validated input to
+// Service.AcknowledgeFinding. All four fields are required:
+// OrganizationID and FindingID identify the target;
+// ActorUserID identifies the operator (passed through to the
+// audit row); Reason is the operator's note (also stored on
+// the finding row as `status_reason`).
+type AcknowledgeInput struct {
+	OrganizationID string
+	FindingID      string
+	ActorUserID    string
+	Reason         string
+}
+
+// SuppressInput is the validated input to
+// Service.SuppressFinding. ExpiresAt is optional — when nil,
+// the suppression has no expiry and the recompute logic
+// treats it as "permanent until manually changed". When set,
+// MUST be strictly in the future relative to the service's
+// clock (the HTTP handler trims and validates before reaching
+// the service, but the service re-checks defensively).
+type SuppressInput struct {
+	OrganizationID string
+	FindingID      string
+	ActorUserID    string
+	Reason         string
+	ExpiresAt      *time.Time
 }

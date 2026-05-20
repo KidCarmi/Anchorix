@@ -156,11 +156,13 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 		resolver(mw.RequireAuth(handlers.FindingsList(findingsDeps))))
 	mux.Handle("GET /findings/{id}",
 		resolver(mw.RequireAuth(handlers.FindingsGet(findingsDeps))))
-	// Acknowledge / suppress workflow is out of scope for H-021
-	// (see CERTIFICATE_FINDINGS.md "Non-goals"); the stubs stay
-	// so the route surface remains documented as future work.
-	mux.HandleFunc("POST /findings/{id}/acknowledge", handlers.FindingsAcknowledge)
-	mux.HandleFunc("POST /findings/{id}/suppress", handlers.FindingsSuppress)
+	// H-023 acknowledge / suppress workflow. Both are
+	// operator-only POSTs that mutate finding status with a
+	// required reason; the audit row is severity:"security".
+	mux.Handle("POST /findings/{id}/acknowledge",
+		resolver(mw.RequireAuth(handlers.FindingsAcknowledge(findingsDeps))))
+	mux.Handle("POST /findings/{id}/suppress",
+		resolver(mw.RequireAuth(handlers.FindingsSuppress(findingsDeps))))
 
 	// --- audit ---
 	mux.HandleFunc("GET /audit/events", handlers.AuditList)
