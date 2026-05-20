@@ -535,7 +535,12 @@ func normalizeListQuery(in ListQuery) (ListQuery, error) {
 		return ListQuery{}, fmt.Errorf("%w: organization id required", ErrInvalidListInput)
 	}
 	switch in.Status {
-	case "", StatusFilterOpen, StatusFilterResolved, StatusFilterAll:
+	case "",
+		StatusFilterOpen,
+		StatusFilterResolved,
+		StatusFilterAcknowledged,
+		StatusFilterSuppressed,
+		StatusFilterAll:
 		// ok
 	default:
 		return ListQuery{}, fmt.Errorf("%w: invalid status filter %q", ErrInvalidListInput, in.Status)
