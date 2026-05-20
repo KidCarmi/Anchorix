@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -405,8 +406,22 @@ func planObservations(
 		}
 
 		// For each picked cert, the agent observes it in a
-		// deterministic subset of the configured stores.
+		// deterministic subset of the configured stores. Sort
+		// the picked cert indices before iterating — Go map
+		// iteration order is intentionally randomized, and the
+		// loop body below consumes from `idSrc` (observation
+		// ID minting) and `shapeSrc` (removed-vs-active
+		// assignment). Without sorting, two `Build()` calls
+		// with the same `(seed, cfg, now)` allocate the same
+		// IDs and removed flags but to DIFFERENT picked certs,
+		// silently breaking the structural-determinism
+		// contract this fixture's doc.go advertises.
+		pickedIdx := make([]int, 0, len(picks))
 		for certIdx := range picks {
+			pickedIdx = append(pickedIdx, certIdx)
+		}
+		sort.Ints(pickedIdx)
+		for _, certIdx := range pickedIdx {
 			cert := certs[certIdx]
 			storesForCert := stores
 			if len(stores) > 1 {

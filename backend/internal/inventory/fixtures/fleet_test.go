@@ -74,6 +74,31 @@ func TestSmallv01BuildIsStructurallyDeterministic(t *testing.T) {
 			t.Errorf("certs[%d].IsSelfSigned differs across runs", i)
 		}
 	}
+	// Observation IDs, agent+cert+store wiring, and
+	// removed-vs-active flagging must match across builds.
+	// Pins the fix for the Codex P1 review on PR #37
+	// (range-over-map of `picks` was order-randomized, so
+	// IDs and removed flags drifted across runs even though
+	// the SET of picks was deterministic).
+	for i := range a.Observations {
+		oa, ob := a.Observations[i], b.Observations[i]
+		if oa.ID != ob.ID {
+			t.Errorf("observations[%d].ID differs: A=%q B=%q",
+				i, oa.ID, ob.ID)
+		}
+		if oa.AgentID != ob.AgentID || oa.CertID != ob.CertID ||
+			oa.StoreLocation != ob.StoreLocation {
+			t.Errorf("observations[%d] wiring differs: A=(%s,%s,%s) B=(%s,%s,%s)",
+				i, oa.AgentID, oa.CertID, oa.StoreLocation,
+				ob.AgentID, ob.CertID, ob.StoreLocation)
+		}
+		aRemoved := oa.RemovedAt != nil
+		bRemoved := ob.RemovedAt != nil
+		if aRemoved != bRemoved {
+			t.Errorf("observations[%d] removed flag differs: A=%v B=%v",
+				i, aRemoved, bRemoved)
+		}
+	}
 }
 
 // TestSmallv01CardinalitiesMatchPreset is the regression

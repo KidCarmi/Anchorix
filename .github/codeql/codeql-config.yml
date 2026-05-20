@@ -47,4 +47,4 @@ queries:
 # This is the only exclusion. Every other path in the
 # repository continues to run at security-extended breadth.
 paths-ignore:
-  - backend/internal/inventory/fixtures
+  - 'backend/internal/inventory/fixtures/**'
