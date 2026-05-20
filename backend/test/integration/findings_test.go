@@ -1486,6 +1486,71 @@ func TestFindingsSuppressHappyPath(t *testing.T) {
 	}
 }
 
+// TestFindingsSuppressPermanentNoExpiry pins the wire-shape
+// contract that `{"expires_at": null}` (or omitted) maps to a
+// permanent suppression: the response's suppress_expires_at is
+// null, and a subsequent recompute leaves the finding
+// suppressed even though wall-clock time has advanced. Without
+// this test, a regression that treated nil ExpiresAt as
+// "0 / past" (e.g. dropping the `!= nil` guard in the matches
+// loop) would silently reopen every permanent suppression on
+// the next recompute — defeating the workflow's whole purpose.
+func TestFindingsSuppressPermanentNoExpiry(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+	findingID := seedFindingForOverride(t, db, srv.URL, adminClient, "supp-permanent")
+
+	// Explicit null on the wire — equivalent to omitting the
+	// field. Either form should produce a permanent
+	// suppression with NULL suppress_expires_at in the DB.
+	body := postJSON(t, adminClient,
+		srv.URL+"/api/v1/findings/"+findingID+"/suppress",
+		`{"reason":"permanent","expires_at":null}`,
+		http.StatusOK)
+
+	var got findingRowDTO
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatalf("decode: %v; body=%s", err, body)
+	}
+	if got.Status != "suppressed" {
+		t.Errorf("status = %q, want suppressed", got.Status)
+	}
+	if got.SuppressExpiresAt != nil {
+		t.Errorf("suppress_expires_at = %v, want null for permanent suppression", *got.SuppressExpiresAt)
+	}
+
+	// Run a recompute — the permanent suppression must survive.
+	// (Wall-clock advanced naturally between the suppress and
+	// recompute calls; that delta should be irrelevant for nil
+	// expiries.)
+	recompute(t, srv.URL, adminClient)
+
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/findings/"+findingID, nil)
+	resp, err := adminClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET: %v", err)
+	}
+	defer resp.Body.Close()
+	rawBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET status = %d, want 200; body=%s", resp.StatusCode, rawBody)
+	}
+	var afterRecompute findingRowDTO
+	if err := json.Unmarshal(rawBody, &afterRecompute); err != nil {
+		t.Fatalf("decode GET: %v", err)
+	}
+	if afterRecompute.Status != "suppressed" {
+		t.Errorf("status after recompute = %q, want suppressed (permanent must NOT auto-reopen)",
+			afterRecompute.Status)
+	}
+	if afterRecompute.SuppressExpiresAt != nil {
+		t.Errorf("suppress_expires_at after recompute = %v, want null",
+			*afterRecompute.SuppressExpiresAt)
+	}
+}
+
 // TestFindingsOverride_EmptyReason400: both endpoints reject
 // empty reason as 400 bad_request.
 func TestFindingsOverride_EmptyReason400(t *testing.T) {

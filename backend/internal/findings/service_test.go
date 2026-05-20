@@ -489,6 +489,74 @@ func TestServiceRecompute_SuppressedNotExpiredStays(t *testing.T) {
 	}
 }
 
+// TestServiceRecompute_SuppressedNoExpiryStaysIndefinitely pins
+// the nil-expiry permanent-suppression path: the matches loop's
+// expiry-check is `SuppressExpiresAt != nil && ...`, so a nil
+// pointer must skip the reopen branch entirely no matter how
+// far in the future `now` is. Without this test, a regression
+// to e.g. `SuppressExpiresAt == nil || ...` would silently
+// reopen every nil-expiry suppression.
+//
+// The clock is advanced by 60 days (NOT 100 years) so the
+// seeded cert stays valid — a 100-year jump would cross the
+// cert's not_after and trigger the `certificate_expired` rule
+// against the SAME cert, adding a second finding and muddying
+// the counter assertion. 60 days is well past any plausible
+// suppression-expiry window operators set in practice but
+// safely within the seeded cert's 180-day validity.
+func TestServiceRecompute_SuppressedNoExpiryStaysIndefinitely(t *testing.T) {
+	clk := fixedClock{t: time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)}
+	svc, repo := newServiceForOverride(t, clk, matchingWeakRSACerts(clk))
+	// nil expiry — no SuppressExpiresAt argument.
+	id := seedFindingWithStatus(t, repo, clk, StatusSuppressed, nil)
+
+	// First recompute at clk.t — should stay suppressed.
+	out, err := svc.Recompute(context.Background(), RecomputeInput{
+		OrganizationID: "anchorix", ActorUserID: "test-user",
+	})
+	if err != nil {
+		t.Fatalf("Recompute at clk.t: %v", err)
+	}
+	if out.Opened != 0 || out.Updated != 1 {
+		t.Errorf("counters at clk.t = (opened=%d updated=%d), want (0,1)", out.Opened, out.Updated)
+	}
+
+	got, _ := repo.GetFinding(context.Background(), "anchorix", id)
+	if got.Status != StatusSuppressed {
+		t.Fatalf("status at clk.t = %q, want suppressed", got.Status)
+	}
+	if got.SuppressExpiresAt != nil {
+		t.Errorf("expected nil expiry preserved, got %v", got.SuppressExpiresAt)
+	}
+
+	// Advance the clock 60 days. The seeded cert's not_after is
+	// clk.t + 180 days so it stays valid; the only matching
+	// rule remains weak_rsa_key, and the suppression of the
+	// pre-existing finding must NOT reopen. Without the `!= nil`
+	// guard, this would fire the expired branch.
+	svc.clock = fixedClock{t: clk.t.AddDate(0, 0, 60)}
+
+	out, err = svc.Recompute(context.Background(), RecomputeInput{
+		OrganizationID: "anchorix", ActorUserID: "test-user",
+	})
+	if err != nil {
+		t.Fatalf("Recompute at +60d: %v", err)
+	}
+	if out.Opened != 0 || out.Updated != 1 {
+		t.Errorf("counters at +60d = (opened=%d updated=%d), want (0,1) — nil expiry must NEVER reopen",
+			out.Opened, out.Updated)
+	}
+
+	got, _ = repo.GetFinding(context.Background(), "anchorix", id)
+	if got.Status != StatusSuppressed {
+		t.Errorf("status at +60d = %q, want suppressed (nil expiry must not auto-reopen)", got.Status)
+	}
+	if got.SuppressExpiresAt != nil {
+		t.Errorf("suppress_expires_at = %v, want nil (permanent suppression must stay permanent)",
+			got.SuppressExpiresAt)
+	}
+}
+
 // TestServiceRecompute_SuppressedExpiredReopens pins: suppressed
 // + expiry passed + rule still matches → reopens to `open`
 // AND clears override metadata.
