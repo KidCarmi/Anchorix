@@ -90,9 +90,9 @@ type certRow struct {
 // `NewFleetBuilder(seed, cfg, now).Build()` produce
 // structurally equal Fleets for the same `(seed, cfg, now)`:
 // same row counts, same rule-bucket assignment per cert,
-// same observation IDs and removed flags. Exact PEM bytes
-// may differ — see the package doc for the reason
-// (crypto/internal/randutil.MaybeReadByte).
+// same observation IDs and removed flags. PEM bytes differ
+// because key material reads from crypto/rand by design —
+// see the package doc.
 type Fleet struct {
 	Config       FleetConfig
 	BuilderNow   time.Time
@@ -131,15 +131,21 @@ func (b *FleetBuilder) Build() (*Fleet, error) {
 		return nil, err
 	}
 
-	// Distinct seeded sources for two kinds of work, so a
-	// future change to one (e.g. swap key generation) does not
-	// silently re-shuffle the other (e.g. shared-cert
-	// assignment).
-	cryptoSrc := deterministicReader(b.seed)
+	// Two seeded math/rand sources drive the parts of the
+	// fixture that are required to be reproducible:
+	// `shapeSrc` decides which agent observes which cert and
+	// which observations are flagged removed; `idSrc` mints
+	// row ids. The third axis — key material and X.509
+	// signing — deliberately reads from crypto/rand
+	// (see `keyPool`), so the fixture's PEM bytes vary across
+	// runs but its structural shape does not. The seed
+	// offsets (+1, +2) are preserved from the pre-refactor
+	// shape so a caller running the same seed before and
+	// after the swap sees the same IDs.
 	shapeSrc := rand.New(rand.NewSource(b.seed + 1))
 	idSrc := rand.New(rand.NewSource(b.seed + 2))
 
-	pool := newKeyPool(cryptoSrc)
+	pool := newKeyPool()
 
 	// Phase 1: agents.
 	agents := make([]agentRow, b.cfg.AgentCount)
@@ -159,7 +165,7 @@ func (b *FleetBuilder) Build() (*Fleet, error) {
 	// Phase 3: generate the X.509 bytes for each shape.
 	certs := make([]certRow, len(shapes))
 	for i, s := range shapes {
-		pemOut, err := generateCertificate(pool, cryptoSrc, s)
+		pemOut, err := generateCertificate(pool, s)
 		if err != nil {
 			return nil, fmt.Errorf("fixtures: generate cert %d: %w", i, err)
 		}

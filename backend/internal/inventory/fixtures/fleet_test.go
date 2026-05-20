@@ -10,14 +10,11 @@ import (
 // TestSmallv01BuildIsStructurallyDeterministic pins the
 // package-level determinism contract: two `(seed, cfg, now)`
 // triples that match produce STRUCTURALLY equal fleets. Row
-// counts, IDs, and rule-bucket assignments must match. Exact
-// PEM bytes (and therefore SHA-256 fingerprints) may differ
-// across runs because crypto/rsa.GenerateKey and
-// crypto/x509.CreateCertificate consume a process-locally
-// non-deterministic number of bytes from the supplied reader
-// (see crypto/internal/randutil.MaybeReadByte). The fixture
-// docs spell this out; the test enforces what the fixture
-// actually guarantees.
+// counts, IDs, and rule-bucket assignments must match. PEM
+// bytes (and SHA-256 fingerprints) differ across runs because
+// key material reads from crypto/rand by design — the fixture
+// docs spell out the rationale; this test enforces what the
+// fixture actually guarantees.
 func TestSmallv01BuildIsStructurallyDeterministic(t *testing.T) {
 	now := time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC)
 	cfg := Smallv01()

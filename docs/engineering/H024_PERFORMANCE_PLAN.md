@@ -386,15 +386,12 @@ A deterministic fixture builder under
 see its `doc.go`) so both perf-regression and stress tests
 share the same data distribution. Determinism is STRUCTURAL,
 not byte-identical: row counts, IDs, rule-bucket assignments,
-and observation removed-vs-active flags are reproducible from
-`(seed, FleetConfig, now)`; cert PEM bytes (and therefore
-SHA-256 fingerprints) may vary across runs because
-`crypto/rsa.GenerateKey` and `crypto/x509.CreateCertificate`
-deliberately consume a process-locally non-deterministic
-number of bytes from the supplied reader
-(`crypto/internal/randutil.MaybeReadByte` — Go's defense
-against attacker-controlled deterministic seeds in crypto
-code). The fixture's `doc.go` documents the contract; the
+and observation removed-vs-active flags are reproducible
+from `(seed, FleetConfig, now)`. Cert PEM bytes (and SHA-256
+fingerprints) vary across runs because key material and X.509
+signing read from `crypto/rand.Reader` by design — keeping
+`go/insecure-randomness` clean on the binding CodeQL gate.
+The fixture's `doc.go` documents the contract; the
 perf-regression assertions key off cardinalities and rule
 hits, not PEM bytes.
 
@@ -481,15 +478,25 @@ and the override-preserving paths from H-023.
   `now` anchor is supplied explicitly so fixture-driven tests
   do not depend on CI clock drift.
 - **Structural determinism, not byte-identical PEMs.** Cert
-  PEM bytes (and therefore SHA-256 fingerprints) may differ
-  across runs because `crypto/rsa.GenerateKey` and
-  `crypto/x509.CreateCertificate` call
-  `crypto/internal/randutil.MaybeReadByte` to defeat
-  attacker-controlled deterministic seeds — a stdlib design
-  decision the fixture inherits. The reproducible properties
-  (row counts, rule-bucket assignment per cert, IDs,
-  observation removed-vs-active flags) are sufficient for
-  every assertion the perf-regression and stress tests need.
+  PEM bytes (and therefore SHA-256 fingerprints) differ across
+  runs because key material and X.509 signing read from
+  `crypto/rand.Reader` by design — a deterministic crypto
+  source would trip the `go/insecure-randomness` CodeQL query
+  (CLAUDE.md §11 keeps that gate binding) and the fixture's
+  reproducibility contract does not require byte-identical
+  PEMs to begin with. The reproducible properties (row counts,
+  rule-bucket assignment per cert, IDs, observation
+  removed-vs-active flags) are sufficient for every assertion
+  the perf-regression and stress tests need.
+- The fixture's intentional 1024-bit RSA keys for the
+  `weak_rsa_key` bucket would trip the
+  `go/weak-cryptographic-key` query. The
+  `.github/codeql/codeql-config.yml` path-ignore for this
+  directory (one path, never on a production code path) is
+  the narrowest practical exclusion — CodeQL cannot express
+  per-(path, query) suppressions, and a global query
+  exclusion would weaken coverage on real production code.
+  Documented inline in both the config and `fixtures/doc.go`.
 - Documented in `fixtures/doc.go` with the §5.1 table and the
   CLAUDE.md §8.4 naming-rule conformance.
 - No env-driven knobs (CLAUDE.md §8.9). The cfg is passed

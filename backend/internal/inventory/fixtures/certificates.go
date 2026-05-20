@@ -1,6 +1,7 @@
 package fixtures
 
 import (
+	cryptorand "crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/x509"
@@ -8,9 +9,7 @@ import (
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
-	"io"
 	"math/big"
-	"math/rand"
 	"time"
 )
 
@@ -58,16 +57,28 @@ type certPEM struct {
 }
 
 // keyPool caches RSA keys by bit-size so generating thousands
-// of certs does not pay thousands of key-gen costs. Keys are
-// generated with the seeded reader, so the same `(seed, bits,
-// index)` always yields the same key.
+// of certs does not pay thousands of key-gen costs.
+//
+// Key material is sourced from `crypto/rand.Reader`, NOT from
+// the seeded `math/rand` sources the rest of the fixture uses
+// for structural determinism. The fixture's reproducibility
+// contract is about row counts, IDs, rule-bucket assignment,
+// and observation removed/active flags — not about
+// byte-identical PEM bytes. Using crypto/rand here keeps
+// CodeQL's `go/insecure-randomness` clean while costing
+// nothing the perf/stress tier's assertions actually need.
+//
+// 1024-bit RSA is intentional for the `weak_rsa_key` rule
+// fixture bucket and is suppressed for this single file via
+// `.github/codeql/codeql-config.yml`. The rule under test is
+// "flag certs with key bits below 2048"; the fixture has to
+// produce inputs that fire it.
 type keyPool struct {
-	src  io.Reader
 	keys map[int][]*rsa.PrivateKey
 }
 
-func newKeyPool(src io.Reader) *keyPool {
-	return &keyPool{src: src, keys: make(map[int][]*rsa.PrivateKey)}
+func newKeyPool() *keyPool {
+	return &keyPool{keys: make(map[int][]*rsa.PrivateKey)}
 }
 
 // at returns the i-th key for the given bit-size, generating
@@ -84,7 +95,7 @@ func (p *keyPool) at(bits, i int) (*rsa.PrivateKey, error) {
 	}
 	idx := i % keyPoolSize
 	for len(p.keys[bits]) <= idx {
-		k, err := rsa.GenerateKey(p.src, bits)
+		k, err := rsa.GenerateKey(cryptorand.Reader, bits)
 		if err != nil {
 			return nil, fmt.Errorf("fixtures: rsa.GenerateKey(%d): %w", bits, err)
 		}
@@ -97,8 +108,9 @@ func (p *keyPool) at(bits, i int) (*rsa.PrivateKey, error) {
 // certificate as PEM bytes. The signing key comes from the
 // pool; the resulting fingerprint is unique because the
 // (subject, serial, validity, key) combination is unique per
-// shape.
-func generateCertificate(pool *keyPool, src io.Reader, shape certShape) (*certPEM, error) {
+// shape. Both the key generation and the cert signing read
+// from `crypto/rand.Reader` — see `keyPool` for the rationale.
+func generateCertificate(pool *keyPool, shape certShape) (*certPEM, error) {
 	sigAlg := shape.SignatureAlg
 	if sigAlg == x509.UnknownSignatureAlgorithm {
 		sigAlg = x509.SHA256WithRSA
@@ -161,7 +173,7 @@ func generateCertificate(pool *keyPool, src io.Reader, shape certShape) (*certPE
 		}
 	}
 
-	der, err := x509.CreateCertificate(src, &tmpl, parent, &signingKey.PublicKey, signerKey)
+	der, err := x509.CreateCertificate(cryptorand.Reader, &tmpl, parent, &signingKey.PublicKey, signerKey)
 	if err != nil {
 		return nil, fmt.Errorf("fixtures: x509.CreateCertificate(%q): %w", shape.Subject, err)
 	}
@@ -185,15 +197,6 @@ func generateCertificate(pool *keyPool, src io.Reader, shape certShape) (*certPE
 		NotBefore:   parsed.NotBefore,
 		NotAfter:    parsed.NotAfter,
 	}, nil
-}
-
-// deterministicReader adapts a seeded math/rand source into an
-// io.Reader so crypto/x509 and crypto/rsa can consume it.
-// *rand.Rand already implements Read(p) (n, error), so the
-// type itself is the adapter; we just give it a named
-// constructor for readability.
-func deterministicReader(seed int64) *rand.Rand {
-	return rand.New(rand.NewSource(seed))
 }
 
 // sha256Hex returns the hex-encoded SHA-256 of the input.

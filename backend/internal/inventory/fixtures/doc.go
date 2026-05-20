@@ -24,10 +24,11 @@
 // # Determinism (structural, not byte-identical)
 //
 // The fixture guarantees STRUCTURAL determinism, not byte
-// equality. The seed feeds three math/rand sources that drive
-// IDs, the cert-shape buckets, observation assignment, and
-// which findings get pre-promoted to acknowledged /
-// suppressed. Two runs with the same `(seed, cfg)` produce:
+// equality. Two seeded math/rand sources drive everything
+// callers actually depend on: IDs, the cert-shape buckets,
+// observation assignment, and which findings get pre-promoted
+// to acknowledged / suppressed. Two runs with the same
+// `(seed, cfg)` produce:
 //
 //   - identical row counts for agents, certificates, and
 //     observations,
@@ -37,17 +38,25 @@
 //   - identical observation row IDs and removed-vs-active
 //     flagging.
 //
-// Cert PEM bytes (and therefore SHA-256 fingerprints) MAY
-// differ across runs even with the same seed. `crypto/rsa`
-// and `crypto/x509` deliberately call
-// `crypto/internal/randutil.MaybeReadByte` on the supplied
-// reader, which non-deterministically consumes 0 or 1 byte to
-// prevent crypto code from being byte-reproducible against an
-// attacker-controlled seed. The fixture inherits that
-// behavior. Tests that need to assert against byte-identical
-// PEMs must capture the fingerprint from one run and compare
-// against that captured value within the same process — never
-// hard-code the fingerprint across processes.
+// Cert PEM bytes (and therefore SHA-256 fingerprints) WILL
+// differ across runs. Key material and X.509 signing read
+// from `crypto/rand.Reader` by design: a deterministic crypto
+// source would trip the `go/insecure-randomness` CodeQL query
+// (CLAUDE.md §11 keeps that gate binding) and the fixture's
+// reproducibility contract does not require byte-identical
+// PEMs to begin with. Tests that need to assert against
+// fingerprints must capture them from one run and compare
+// within the same process — never hard-code a fingerprint
+// across processes.
+//
+// 1024-bit RSA keys are intentional in the `weak_rsa_key`
+// fixture bucket and would otherwise trip the
+// `go/weak-cryptographic-key` query. That single query is
+// excluded for this directory in
+// `.github/codeql/codeql-config.yml` with a rationale comment.
+// The exclusion is narrow (one query, one path); every other
+// CodeQL query continues to run with `security-extended`
+// breadth here.
 //
 // # Real X.509 bytes, not synthetic strings
 //
