@@ -1657,8 +1657,16 @@ func TestFindingsOverride_AuditRowsWritten(t *testing.T) {
 		if actorType != "user" {
 			t.Errorf("%s actor_type = %q, want user", action, actorType)
 		}
-		if !strings.Contains(string(metadata), `"severity":"security"`) {
-			t.Errorf("%s metadata missing severity:security; got %s", action, metadata)
+		// Parse the JSONB column instead of substring-matching:
+		// PostgreSQL's canonical JSONB text form may reorder
+		// keys and tweak spacing, so a `"severity":"security"`
+		// substring search would be fragile across PG versions.
+		var meta map[string]any
+		if err := json.Unmarshal(metadata, &meta); err != nil {
+			t.Fatalf("%s metadata unmarshal: %v; raw=%s", action, err, metadata)
+		}
+		if got := meta["severity"]; got != "security" {
+			t.Errorf("%s metadata.severity = %v, want security; raw=%s", action, got, metadata)
 		}
 	}
 }
