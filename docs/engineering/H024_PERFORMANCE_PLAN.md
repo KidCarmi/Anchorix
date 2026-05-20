@@ -382,11 +382,18 @@ before/after numbers on the H-024 implementation PR.
 ## 5. Synthetic data generation strategy
 
 A deterministic fixture builder under
-`backend/internal/inventory/fixtures` (test-only build tag) so
-both perf-regression and stress tests share the same data
-distribution. Determinism is non-negotiable — random seeds are
-fixed and documented per fixture; CI runs must produce
-byte-identical inputs.
+`backend/internal/inventory/fixtures` (test-flavored package;
+see its `doc.go`) so both perf-regression and stress tests
+share the same data distribution. Determinism is STRUCTURAL,
+not byte-identical: row counts, IDs, rule-bucket assignments,
+and observation removed-vs-active flags are reproducible
+from `(seed, FleetConfig, now)`. Cert PEM bytes (and SHA-256
+fingerprints) vary across runs because key material and X.509
+signing read from `crypto/rand.Reader` by design — keeping
+`go/insecure-randomness` clean on the binding CodeQL gate.
+The fixture's `doc.go` documents the contract; the
+perf-regression assertions key off cardinalities and rule
+hits, not PEM bytes.
 
 ### 5.1 Population shape
 
@@ -463,10 +470,34 @@ and the override-preserving paths from H-023.
 
 ### 5.5 Reproducibility
 
-- Single entry point: `fixtures.NewFleetBuilder(seed int64,
-  cfg FleetConfig)` returns a `*Fleet` with deterministic IDs
-  (hex of `sha256(seed || index)`), deterministic
-  `collected_at`, deterministic PEMs.
+- Single entry point:
+  `fixtures.NewFleetBuilder(seed int64, cfg FleetConfig, now time.Time)`
+  returns a `*FleetBuilder`; `Build()` materializes the `*Fleet`.
+  IDs are hex strings produced by a math/rand source seeded
+  off `seed`, so they are byte-stable across runs. The
+  `now` anchor is supplied explicitly so fixture-driven tests
+  do not depend on CI clock drift.
+- **Structural determinism, not byte-identical PEMs.** Cert
+  PEM bytes (and therefore SHA-256 fingerprints) differ across
+  runs because key material and X.509 signing read from
+  `crypto/rand.Reader` by design — a deterministic crypto
+  source would trip the `go/insecure-randomness` CodeQL query
+  (CLAUDE.md §11 keeps that gate binding) and the fixture's
+  reproducibility contract does not require byte-identical
+  PEMs to begin with. The reproducible properties (row counts,
+  rule-bucket assignment per cert, IDs, observation
+  removed-vs-active flags) are sufficient for every assertion
+  the perf-regression and stress tests need.
+- The fixture's `weak_rsa_key` bucket uses a precomputed
+  1024-bit RSA private key embedded as a base64 PKCS#1 DER
+  constant in `certificates.go`, NOT a runtime
+  `rsa.GenerateKey(_, 1024)` call. CodeQL's
+  `go/weak-cryptographic-key` query inspects the literal bits
+  argument to `rsa.GenerateKey`; without that call site the
+  query has nothing to flag, and we avoid taking a CodeQL
+  config exclusion. The `weak_rsa_key` finding rule still
+  fires correctly because it reads `cert.PublicKeyBits` from
+  the certificate row, not the key-generation call site.
 - Documented in `fixtures/doc.go` with the §5.1 table and the
   CLAUDE.md §8.4 naming-rule conformance.
 - No env-driven knobs (CLAUDE.md §8.9). The cfg is passed
@@ -1093,8 +1124,8 @@ resolve them:
 
 | Item                                                | Status                                  |
 | --------------------------------------------------- | --------------------------------------- |
-| H-024 plan (this doc)                               | **draft — awaiting review and merge**   |
-| H-024A — fixtures, perf tier, indexes, RETURNING    | not started                              |
+| H-024 plan (this doc)                               | shipped (PR #36)                        |
+| H-024A — fixtures, perf tier, indexes, RETURNING    | **shipped (this PR)**                   |
 | H-024B — paginated scans + streaming diff           | not started (depends on H-024A)          |
 | Legacy-method cleanup PR (post-H-024B soak)         | deferred                                 |
 | H-024 nightly perf workflow                         | optional (§4.5)                          |

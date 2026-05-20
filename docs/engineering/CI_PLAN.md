@@ -129,6 +129,57 @@ Promoting any of the "tracked" items to blocking requires: a green
 streak ≥ 10 PRs, an explicit CLAUDE.md §11 amendment, and an update
 to both this doc and `.github/workflows/README.md`.
 
+## Perf and Stress Tiers (H-024A)
+
+The H-024A PR introduces two new on-demand test tiers under
+`backend/test/`. **Neither tier joins the blocking-CI set.** They
+are explicitly off the §11 required-check list and only run when
+asked. The blocking set stays at 14 jobs (per `Today`).
+
+| Tier   | Build tag | Location               | What it does                                                                                                                                       |
+| ------ | --------- | ---------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Perf   | `perf`    | `backend/test/perf/`   | Smallv01 fixture (10 agents, 60 certs) against the live PostgreSQL service container. Skeleton for query-count assertions; H-024B fleshes those out. |
+| Stress | `stress`  | `backend/test/stress/` | Pilot fixture (1K agents, 5K certs) against the live PostgreSQL service container. Heavy — minutes, not seconds. Wall-clock budget assertions land with H-024B. |
+
+### Running locally
+
+```bash
+# Perf (fast, requires DATABASE_URL):
+DATABASE_URL='postgres://anchorix:ci-password@127.0.0.1:5432/anchorix?sslmode=disable' \
+    ANCHORIX_SESSION_KEY='ci-session-key-32-bytes-padding-aaaaaaaa' \
+    ANCHORIX_ENV=development \
+    go test -tags=perf -count=1 ./backend/test/perf/...
+
+# Stress (heavy, allow generous timeout):
+DATABASE_URL='postgres://anchorix:ci-password@127.0.0.1:5432/anchorix?sslmode=disable' \
+    ANCHORIX_SESSION_KEY='ci-session-key-32-bytes-padding-aaaaaaaa' \
+    ANCHORIX_ENV=development \
+    go test -tags=stress -count=1 -timeout 30m ./backend/test/stress/...
+```
+
+Both tiers SKIP cleanly when `DATABASE_URL` is unset, matching the
+`integration` tier's behavior so developer machines without
+postgres compile the suite without surprises.
+
+### Build-tag conventions
+
+- `//go:build integration` — requires PostgreSQL; runs in the
+  existing `backend (go)` job (blocking).
+- `//go:build perf` — requires PostgreSQL; on-demand only; the
+  default `go test ./...` pass excludes the directory entirely.
+  NOT blocking.
+- `//go:build stress` — requires PostgreSQL; on-demand only;
+  generates pilot-scale fixtures and takes minutes. NOT
+  blocking, NOT run nightly in H-024A.
+
+Promoting either tier to a nightly workflow or to the blocking
+set is a future PR with its own CLAUDE.md §11 conversation —
+nothing in H-024A wires that. The skeleton landing now is the
+substrate; the assertions that motivate gating land alongside
+H-024B's streaming-recompute rewrite (see
+[`H024_PERFORMANCE_PLAN.md`](./H024_PERFORMANCE_PLAN.md) §4.5,
+§9.B).
+
 ## Anti-patterns Forbidden in CI (from CLAUDE.md §11 and §18)
 
 - `continue-on-error: true` on any required gate.

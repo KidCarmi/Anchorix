@@ -47,12 +47,23 @@ func NewCertificateInventoryRepository(db *DB) *CertificateInventoryRepository {
 //     last_seen_at; a newer batch advances it.
 //
 // On conflict the EXISTING row's id is returned, not the
-// caller's freshly minted one. The repo re-reads the canonical
-// row after the upsert so the returned *Certificate carries the
-// stored subject/issuer/PEM/etc., not the caller's potentially
-// stale input — important for out-of-order arrival where the
-// caller's metadata may differ from the canonical bytes already
-// in the DB.
+// caller's freshly minted one — and the EXISTING row's
+// subject/issuer/PEM/etc. are returned too, because the DO
+// UPDATE clause only touches first_seen_at / last_seen_at and
+// PostgreSQL's RETURNING emits the post-update row (unchanged
+// columns keep their stored canonical values). This is what
+// pins TestUpsertCertificateOutOfOrderMergesTimestamps's
+// "canonical subject wins over caller's stale input"
+// invariant.
+//
+// H-024A optimization: the canonical row is now produced by
+// the upsert's own RETURNING clause, replacing the separate
+// `GetCertificate` re-read that the previous implementation
+// did per upsert. Ingestion's per-cert round-trip count drops
+// from two to one. The contract is unchanged — callers still
+// receive the canonical stored *Certificate, not their input.
+// See docs/engineering/H024_PERFORMANCE_PLAN.md §6.6 / §9.A
+// item 2.
 func (r *CertificateInventoryRepository) UpsertCertificate(
 	ctx context.Context,
 	c *inventory.Certificate,
@@ -77,6 +88,13 @@ func (r *CertificateInventoryRepository) UpsertCertificate(
 	// the order of *arrival* instead of the order of
 	// *observation* (the H-018 fix). RETURNING always emits a row
 	// — there is no longer an out-of-order fallback path.
+	//
+	// RETURNING projects the full canonical column set (matching
+	// scanCertificate's column order) so the caller receives the
+	// post-update row directly. Columns not touched by DO UPDATE
+	// (subject, issuer, PEM, etc.) keep their existing stored
+	// values on conflict, which IS the canonical certificate for
+	// this fingerprint.
 	const q = `
 		INSERT INTO certificates (
 			id, organization_id, fingerprint_sha256, subject, issuer,
@@ -94,31 +112,29 @@ func (r *CertificateInventoryRepository) UpsertCertificate(
 		ON CONFLICT (organization_id, fingerprint_sha256) DO UPDATE
 		   SET first_seen_at = LEAST(certificates.first_seen_at, EXCLUDED.first_seen_at),
 		       last_seen_at  = GREATEST(certificates.last_seen_at, EXCLUDED.last_seen_at)
-		RETURNING id`
+		RETURNING id, organization_id, fingerprint_sha256, subject, issuer,
+		          serial_number_hex, signature_algorithm, public_key_algorithm,
+		          public_key_bits, not_before, not_after, sans, key_usages,
+		          ext_key_usages, is_self_signed, is_ca, pem,
+		          first_seen_at, last_seen_at`
 
 	candidateID := strings.TrimSpace(c.ID)
 	if candidateID == "" {
 		candidateID = ids.New()
 	}
 
-	var gotID string
-	if err := r.db.querierFor(ctx).QueryRow(ctx, q,
+	row := r.db.querierFor(ctx).QueryRow(ctx, q,
 		candidateID, c.OrganizationID, c.FingerprintSHA256, c.Subject, c.Issuer,
 		c.SerialNumberHex, c.SignatureAlg, c.PublicKeyAlg,
 		c.PublicKeyBits, c.NotBefore, c.NotAfter, sans, keyUsages,
 		extKeyUsages, c.IsSelfSigned, c.IsCA, c.PEM,
 		observedAt,
-	).Scan(&gotID); err != nil {
+	)
+	stored, err := scanCertificate(row)
+	if err != nil {
 		return nil, fmt.Errorf("postgres: upsert certificate: %w", err)
 	}
-
-	// Re-read the canonical row by id. The DO UPDATE only touched
-	// first_seen_at and last_seen_at, so on conflict the stored
-	// subject/issuer/PEM/etc. may differ from the caller's input
-	// (the stored row carries the bytes from the FIRST insert,
-	// which IS the canonical certificate for this fingerprint).
-	// Returning the canonical row keeps the contract honest.
-	return r.GetCertificate(ctx, c.OrganizationID, gotID)
+	return stored, nil
 }
 
 // UpsertObservation creates or merges the observation row for
