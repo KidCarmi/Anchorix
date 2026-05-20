@@ -217,12 +217,22 @@ func FindingsGet(deps FindingsDeps) http.HandlerFunc {
 func parseFindingsListQuery(r *http.Request, organizationID string) (findings.ListQuery, error) {
 	qs := r.URL.Query()
 
-	// status: empty / "open" / "resolved" / "all". Anything else
-	// is bad_request. Service applies the "default=open" when
-	// the value is empty.
+	// status: empty / "open" / "resolved" / "acknowledged" /
+	// "suppressed" / "all". Anything else is bad_request. The
+	// service applies the "default=open" when the value is
+	// empty. The H-023 additions (acknowledged, suppressed)
+	// MUST stay in lockstep with findings.StatusFilter — a new
+	// enum value added without updating this switch surfaces
+	// as 400 here, exactly as TestFindingsList_StatusFilters
+	// caught when this list was incomplete.
 	rawStatus := qs.Get("status")
 	switch findings.StatusFilter(rawStatus) {
-	case "", findings.StatusFilterOpen, findings.StatusFilterResolved, findings.StatusFilterAll:
+	case "",
+		findings.StatusFilterOpen,
+		findings.StatusFilterResolved,
+		findings.StatusFilterAcknowledged,
+		findings.StatusFilterSuppressed,
+		findings.StatusFilterAll:
 		// ok
 	default:
 		return findings.ListQuery{}, errors.New("invalid status filter")
