@@ -16,6 +16,36 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
 
 ## Open Items
 
+### H-025 — Findings scheduler: per-recompute timeout
+
+- **Title:** `feat(findings): per-org recompute timeout in scheduler`
+- **Risk:** low (operational). `Scheduler.recomputeOrg` invokes
+  `Service.RecomputeScheduled(ctx, orgID)` and blocks until it
+  returns. The v0.1 rules are pure functions of `(cert, now)`
+  with no I/O — they cannot hang. But a future rule that does
+  something exotic (a database call, a regex with catastrophic
+  backtracking, a chain validation against an OCSP responder)
+  could block indefinitely; the scheduler would block until
+  process-level `ctx` cancellation, missing all subsequent
+  ticks for every org in the sweep.
+- **Scope:** wrap each `recomputeOrg` call in a
+  `context.WithTimeout(ctx, perOrgBudget)` where `perOrgBudget`
+  is a new config knob defaulting to (say) 5 × the recompute
+  duration p99 once we have one. The wrapper would log a
+  `recompute timed out` line at error level and the loop
+  continues to the next org. Pairs naturally with adding the
+  first non-pure rule.
+- **Recommended PR:** `feat(findings): per-org recompute timeout`.
+- **Reason not fixed now:** v0.1 has only deterministic pure
+  rules; the hang scenario is unreachable. Adding a timeout
+  before there's a real recompute-duration baseline would pick
+  an arbitrary number; better to wait until the first non-pure
+  rule arrives (Phase 4) and size the timeout against measured
+  data.
+- **References:** `internal/findings/scheduler.go`
+  `recomputeOrg`; `docs/engineering/CERTIFICATE_FINDINGS.md`
+  §7 (Background scheduler).
+
 ### H-023 — Findings: acknowledge / suppress workflow
 
 - **Title:** `feat(findings): operator acknowledge + suppress workflow`

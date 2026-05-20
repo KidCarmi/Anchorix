@@ -148,7 +148,14 @@ func NewScheduler(
 // return errors — it logs them.
 func (s *Scheduler) Run(ctx context.Context) error {
 	if !s.cfg.Enabled {
-		s.log.Info("findings scheduler disabled (ANCHORIX_FINDINGS_SCHEDULER_ENABLED=false)")
+		// The disabled-state log message intentionally avoids
+		// naming a specific env var — composition roots, tests,
+		// and future kill-switches all reach this branch when
+		// they pass cfg.Enabled=false, and naming an env var
+		// would mislead the other two cases. The operator's
+		// `internal/config` layer is the one that logs which
+		// env var produced the false value at startup.
+		s.log.Info("findings scheduler disabled")
 		return nil
 	}
 	s.log.Info("findings scheduler started", "interval", s.cfg.Interval.String())
@@ -165,14 +172,24 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	}
 }
 
-// runOnce executes one sweep across all organizations. Exported
-// only via the package-internal pkg (no `_test.go` build tag),
-// so unit tests that want to step the loop without waiting for
-// the ticker can call it directly via the test file in the same
-// package. External callers should NOT depend on this method.
+// runOnce executes one sweep across all organizations. Package-
+// private so unit tests in the same package can call it
+// directly without waiting for the ticker; external packages
+// MUST NOT depend on this method.
 func (s *Scheduler) runOnce(ctx context.Context) {
 	orgIDs, err := s.orgs.ListOrganizationIDs(ctx)
 	if err != nil {
+		// If ctx was cancelled while ListOrganizationIDs was in
+		// flight, the error is just the cancellation propagating
+		// through pgx — not a real DB failure. Log it as an
+		// info line rather than error so operator alerting
+		// doesn't trip on graceful shutdown noise. The next
+		// runOnce will retry on the following tick (or the
+		// outer Run loop will exit via ctx.Done first).
+		if ctx.Err() != nil {
+			s.log.Info("findings scheduler: shutdown during list organizations")
+			return
+		}
 		s.log.Error("findings scheduler: list organizations failed",
 			"err", err.Error(),
 		)
@@ -181,10 +198,13 @@ func (s *Scheduler) runOnce(ctx context.Context) {
 	for _, orgID := range orgIDs {
 		// ctx.Done() check between orgs so a shutdown during a
 		// long sweep exits promptly without starting work on
-		// the next org.
+		// the next org. We do not preempt an in-flight
+		// recompute; the cancellation propagates through pgx
+		// and rolls back the tx, then recomputeOrg returns and
+		// this loop notices.
 		if err := ctx.Err(); err != nil {
-			s.log.Info("findings scheduler: shutdown during sweep, skipping remaining orgs",
-				"completed_before_shutdown", true,
+			s.log.Info("findings scheduler: shutdown during sweep",
+				"reason", "context cancelled",
 			)
 			return
 		}
@@ -210,10 +230,19 @@ func (s *Scheduler) recomputeOrg(ctx context.Context, organizationID string) {
 	out, err := s.service.RecomputeScheduled(ctx, organizationID)
 	duration := s.clock.Now().Sub(start)
 	if err != nil {
-		// One org's failure must not stop others — log and
-		// return. ctx.Err() being non-nil indicates shutdown
-		// in progress; we still log because the failure was
-		// real (the tx rolled back).
+		// Same signal-quality treatment as ListOrganizationIDs:
+		// a ctx-cancelled error during graceful shutdown is
+		// noise, not an alertable failure. Log it as info and
+		// move on; the next tick's recomputeOrg call (in the
+		// next process lifetime, since shutdown is in progress)
+		// will re-try.
+		if ctx.Err() != nil {
+			s.log.Info("findings scheduler: shutdown during recompute",
+				"organization_id", organizationID,
+				"duration", duration.String(),
+			)
+			return
+		}
 		s.log.Error("findings scheduler: recompute failed",
 			"organization_id", organizationID,
 			"duration", duration.String(),
