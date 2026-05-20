@@ -317,16 +317,74 @@ func (s *Service) runDiff(
 				return 0, 0, 0, 0, 0, fmt.Errorf("findings: reopen: %w", err)
 			}
 			opened++
+		case prior.Status == StatusAcknowledged:
+			// acknowledged + rule still matches: stay
+			// acknowledged. Bump the rule-derived fields so
+			// last_seen_at + evidence + rule_version reflect
+			// the current evaluation, but PRESERVE the
+			// operator's override metadata (status_reason,
+			// status_actor, status_changed_at).
+			prior.LastSeenAt = now
+			prior.UpdatedAt = now
+			prior.Severity = m.rule.Severity()
+			prior.Title = m.rule.Title()
+			prior.RuleVersion = m.rule.Version()
+			prior.Evidence = m.match.Evidence
+			if err := s.repo.UpdateFinding(ctx, prior); err != nil {
+				return 0, 0, 0, 0, 0, fmt.Errorf("findings: update acknowledged: %w", err)
+			}
+			updated++
+		case prior.Status == StatusSuppressed:
+			// suppressed + rule still matches: either stay
+			// suppressed (not expired) or reopen (expired).
+			// `now` is the recompute's anchor — we compare
+			// against the operator-set SuppressExpiresAt
+			// strictly (>=) so a suppression that expires
+			// EXACTLY at `now` is considered expired and the
+			// finding reopens.
+			if prior.SuppressExpiresAt != nil && !now.Before(*prior.SuppressExpiresAt) {
+				// Suppression expired: reopen to `open` and
+				// clear the override metadata so the row no
+				// longer claims operator intent. The audit
+				// history of the original suppression remains
+				// in audit_events.
+				prior.Status = StatusOpen
+				prior.LastSeenAt = now
+				prior.UpdatedAt = now
+				prior.ResolvedAt = nil
+				prior.Severity = m.rule.Severity()
+				prior.Title = m.rule.Title()
+				prior.RuleVersion = m.rule.Version()
+				prior.Evidence = m.match.Evidence
+				prior.StatusReason = ""
+				prior.StatusActor = ""
+				prior.StatusChangedAt = nil
+				prior.SuppressExpiresAt = nil
+				if err := s.repo.UpdateFinding(ctx, prior); err != nil {
+					return 0, 0, 0, 0, 0, fmt.Errorf("findings: reopen expired suppression: %w", err)
+				}
+				opened++
+				break
+			}
+			// Not expired (or no expiry): stay suppressed,
+			// PRESERVE the override metadata.
+			prior.LastSeenAt = now
+			prior.UpdatedAt = now
+			prior.Severity = m.rule.Severity()
+			prior.Title = m.rule.Title()
+			prior.RuleVersion = m.rule.Version()
+			prior.Evidence = m.match.Evidence
+			if err := s.repo.UpdateFinding(ctx, prior); err != nil {
+				return 0, 0, 0, 0, 0, fmt.Errorf("findings: update suppressed: %w", err)
+			}
+			updated++
 		default:
-			// v0.1 only writes `open` / `resolved`. The
-			// migration 0001 CHECK reserves `acknowledged` and
-			// `suppressed` for the H-023 override workflow.
-			// When H-023 lands, this branch MUST be extended
-			// to decide what to do with each reserved value
-			// (suppressed-and-still-matches must NOT silently
-			// reopen, etc.). Failing loudly now prevents the
-			// silent-reopen regression that an earlier
-			// `default: // reopen` arm would have caused.
+			// Any status outside open / resolved /
+			// acknowledged / suppressed is unexpected. Fail
+			// loudly so a future status addition (the
+			// schema's CHECK constraint is permissive enough
+			// to accept new strings via an upcoming migration)
+			// is forced to extend this switch explicitly.
 			return 0, 0, 0, 0, 0, fmt.Errorf(
 				"%w: finding %s has status %q (rule still matches)",
 				ErrUnsupportedFindingStatus, prior.ID, prior.Status,
@@ -334,11 +392,9 @@ func (s *Service) runDiff(
 		}
 	}
 
-	// Then walk existing rows that did NOT match. Open ones
-	// become resolved; resolved ones stay resolved (unchanged).
-	// `acknowledged` / `suppressed` reach here too once H-023
-	// ships — same H-023-must-decide breadcrumb as the matches
-	// loop above.
+	// Then walk existing rows that did NOT match. open / ack /
+	// suppressed all become resolved (rule no longer fires —
+	// nothing to override). resolved stays resolved (unchanged).
 	for k, f := range existingByKey {
 		if _, matched := matches[k]; matched {
 			continue
@@ -351,6 +407,26 @@ func (s *Service) runDiff(
 			f.UpdatedAt = now
 			if err := s.repo.UpdateFinding(ctx, f); err != nil {
 				return 0, 0, 0, 0, 0, fmt.Errorf("findings: resolve: %w", err)
+			}
+			resolved++
+		case StatusAcknowledged, StatusSuppressed:
+			// acknowledged / suppressed + rule no longer
+			// matches: the underlying problem is gone, so the
+			// operator override is moot. Resolve the finding
+			// AND clear the override metadata so the row's
+			// current state reflects "nothing here, nothing to
+			// override". Audit history of the original
+			// override remains in audit_events.
+			resolvedAt := now
+			f.Status = StatusResolved
+			f.ResolvedAt = &resolvedAt
+			f.UpdatedAt = now
+			f.StatusReason = ""
+			f.StatusActor = ""
+			f.StatusChangedAt = nil
+			f.SuppressExpiresAt = nil
+			if err := s.repo.UpdateFinding(ctx, f); err != nil {
+				return 0, 0, 0, 0, 0, fmt.Errorf("findings: resolve overridden: %w", err)
 			}
 			resolved++
 		case StatusResolved:
@@ -459,7 +535,12 @@ func normalizeListQuery(in ListQuery) (ListQuery, error) {
 		return ListQuery{}, fmt.Errorf("%w: organization id required", ErrInvalidListInput)
 	}
 	switch in.Status {
-	case "", StatusFilterOpen, StatusFilterResolved, StatusFilterAll:
+	case "",
+		StatusFilterOpen,
+		StatusFilterResolved,
+		StatusFilterAcknowledged,
+		StatusFilterSuppressed,
+		StatusFilterAll:
 		// ok
 	default:
 		return ListQuery{}, fmt.Errorf("%w: invalid status filter %q", ErrInvalidListInput, in.Status)
@@ -546,3 +627,220 @@ func normalizeLimit(raw int) (int, error) {
 // interface needs to be in the same package even though it is
 // not re-exported.
 var _ nowProvider = clock.System{}
+
+// --- H-023 override workflow -------------------------------------
+
+// AcknowledgeFinding transitions the (org, finding) row to
+// status=acknowledged. The operator's reason is stored on the
+// row (denormalized current state) and in the audit row
+// (immutable history). Audit is written in the same transaction
+// as the status update: a Record failure rolls back the status
+// change.
+//
+// State transitions accepted: from any current status. v0.1
+// deliberately keeps the API permissive — an operator can
+// re-acknowledge an already-acknowledged finding (refresh the
+// reason / actor) or acknowledge a resolved finding (a no-op
+// from a rule-engine POV, but the operator's intent is
+// recorded). The previous status is captured in the audit row's
+// metadata so the history is reconstructable.
+//
+// Cross-org / missing finding id → ErrFindingNotFound (HTTP
+// 404). Invalid input (empty reason, etc.) →
+// ErrInvalidOverrideInput (HTTP 400).
+func (s *Service) AcknowledgeFinding(ctx context.Context, in AcknowledgeInput) (*Finding, error) {
+	if err := validateAcknowledgeInput(in); err != nil {
+		return nil, err
+	}
+	return s.applyOverride(ctx, overrideRequest{
+		OrganizationID: in.OrganizationID,
+		FindingID:      in.FindingID,
+		ActorUserID:    in.ActorUserID,
+		Reason:         strings.TrimSpace(in.Reason),
+		NewStatus:      StatusAcknowledged,
+		AuditAction:    "finding.acknowledged",
+	})
+}
+
+// SuppressFinding transitions the (org, finding) row to
+// status=suppressed. Same semantics as AcknowledgeFinding plus
+// an optional expiry — when set, recompute reopens the finding
+// to `open` once wall-clock time crosses it (and the rule
+// still matches).
+//
+// in.ExpiresAt may be nil (permanent suppression) or strictly
+// in the future relative to the service clock; equal-to-now or
+// past values are rejected.
+func (s *Service) SuppressFinding(ctx context.Context, in SuppressInput) (*Finding, error) {
+	if err := validateSuppressInput(in, s.clock.Now()); err != nil {
+		return nil, err
+	}
+	return s.applyOverride(ctx, overrideRequest{
+		OrganizationID:    in.OrganizationID,
+		FindingID:         in.FindingID,
+		ActorUserID:       in.ActorUserID,
+		Reason:            strings.TrimSpace(in.Reason),
+		NewStatus:         StatusSuppressed,
+		SuppressExpiresAt: in.ExpiresAt,
+		AuditAction:       "finding.suppressed",
+	})
+}
+
+// overrideRequest is the internal envelope passed to
+// applyOverride. Centralizes the load+mutate+audit logic so
+// AcknowledgeFinding and SuppressFinding stay as thin
+// validators.
+type overrideRequest struct {
+	OrganizationID    string
+	FindingID         string
+	ActorUserID       string
+	Reason            string
+	NewStatus         Status
+	SuppressExpiresAt *time.Time
+	AuditAction       string
+}
+
+// applyOverride loads the finding, applies the operator
+// intent, and writes the audit row inside one transaction
+// guarded by the per-org WithTxLockedFindings advisory lock —
+// same lock the recompute path uses, so a manual override
+// during a recompute sweep serializes correctly.
+//
+// Audit metadata carries severity:"security" per CLAUDE.md §9
+// (finding overrides are listed in the security-event class).
+func (s *Service) applyOverride(ctx context.Context, req overrideRequest) (*Finding, error) {
+	now := s.clock.Now()
+	var updated *Finding
+	if err := s.tx.WithTxLockedFindings(ctx, req.OrganizationID, func(ctx context.Context) error {
+		prior, err := s.repo.GetFinding(ctx, req.OrganizationID, req.FindingID)
+		if err != nil {
+			// Includes ErrFindingNotFound — propagated as-is
+			// so the HTTP layer maps it to 404.
+			return err
+		}
+		previousStatus := prior.Status
+		prior.Status = req.NewStatus
+		prior.StatusReason = req.Reason
+		prior.StatusActor = req.ActorUserID
+		prior.StatusChangedAt = &now
+		prior.SuppressExpiresAt = req.SuppressExpiresAt
+		prior.UpdatedAt = now
+		// Clear ResolvedAt so the documented invariant
+		// "resolved_at is non-null iff status == 'resolved'"
+		// holds for the post-override row. An earlier draft
+		// left ResolvedAt populated when an operator
+		// overrode a resolved finding; the API would then
+		// return rows with status="acknowledged" /
+		// "suppressed" AND a non-null resolved_at, which
+		// breaks both the wire contract and the
+		// `?status=resolved` filter (which queries on
+		// status, not resolved_at, but operators reading
+		// the JSON would be confused). Recompute re-stamps
+		// resolved_at when transitioning an override BACK
+		// to resolved (rule no longer matches).
+		prior.ResolvedAt = nil
+		if err := s.repo.UpdateFinding(ctx, prior); err != nil {
+			return fmt.Errorf("findings: apply override: %w", err)
+		}
+		if err := s.recordOverrideAudit(ctx, req, previousStatus, now); err != nil {
+			return err
+		}
+		updated = prior
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return updated, nil
+}
+
+// findingOverrideAuditMetadata is the JSONB shape stored on the
+// `finding.acknowledged` / `finding.suppressed` audit rows.
+// Severity is "security" per CLAUDE.md §9 — finding overrides
+// are explicitly on the list of events that downstream alerting
+// must be able to filter on.
+type findingOverrideAuditMetadata struct {
+	Severity          string     `json:"severity"`
+	OrganizationID    string     `json:"organization_id"`
+	FindingID         string     `json:"finding_id"`
+	PreviousStatus    string     `json:"previous_status"`
+	NewStatus         string     `json:"new_status"`
+	Reason            string     `json:"reason"`
+	SuppressExpiresAt *time.Time `json:"suppress_expires_at,omitempty"`
+}
+
+func (s *Service) recordOverrideAudit(
+	ctx context.Context,
+	req overrideRequest,
+	previousStatus Status,
+	now time.Time,
+) error {
+	md, _ := json.Marshal(findingOverrideAuditMetadata{
+		Severity:          "security",
+		OrganizationID:    req.OrganizationID,
+		FindingID:         req.FindingID,
+		PreviousStatus:    string(previousStatus),
+		NewStatus:         string(req.NewStatus),
+		Reason:            req.Reason,
+		SuppressExpiresAt: req.SuppressExpiresAt,
+	})
+	if err := s.audit.Record(ctx, audit.Event{
+		OrganizationID: req.OrganizationID,
+		OccurredAt:     now,
+		Actor:          req.ActorUserID,
+		ActorType:      "user",
+		Action:         req.AuditAction,
+		TargetType:     "finding",
+		TargetID:       req.FindingID,
+		Metadata:       md,
+	}); err != nil {
+		return fmt.Errorf("%w: %v", ErrInternalAudit, err)
+	}
+	return nil
+}
+
+func validateAcknowledgeInput(in AcknowledgeInput) error {
+	if strings.TrimSpace(in.OrganizationID) == "" {
+		return fmt.Errorf("%w: organization id required", ErrInvalidOverrideInput)
+	}
+	if strings.TrimSpace(in.FindingID) == "" {
+		return fmt.Errorf("%w: finding id required", ErrInvalidOverrideInput)
+	}
+	if strings.TrimSpace(in.ActorUserID) == "" {
+		return fmt.Errorf("%w: actor user id required", ErrInvalidOverrideInput)
+	}
+	if err := validateReason(in.Reason); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateSuppressInput(in SuppressInput, now time.Time) error {
+	if strings.TrimSpace(in.OrganizationID) == "" {
+		return fmt.Errorf("%w: organization id required", ErrInvalidOverrideInput)
+	}
+	if strings.TrimSpace(in.FindingID) == "" {
+		return fmt.Errorf("%w: finding id required", ErrInvalidOverrideInput)
+	}
+	if strings.TrimSpace(in.ActorUserID) == "" {
+		return fmt.Errorf("%w: actor user id required", ErrInvalidOverrideInput)
+	}
+	if err := validateReason(in.Reason); err != nil {
+		return err
+	}
+	if in.ExpiresAt != nil && !in.ExpiresAt.After(now) {
+		return fmt.Errorf("%w: expires_at must be strictly in the future (got %s, now %s)",
+			ErrInvalidOverrideInput, in.ExpiresAt.UTC().Format(time.RFC3339), now.UTC().Format(time.RFC3339))
+	}
+	return nil
+}
+
+func validateReason(reason string) error {
+	trimmed := strings.TrimSpace(reason)
+	if trimmed == "" {
+		return fmt.Errorf("%w: reason required (non-empty after trim)", ErrInvalidOverrideInput)
+	}
+	if len(trimmed) > MaxOverrideReasonLength {
+		return fmt.Errorf("%w: reason exceeds %d bytes", ErrInvalidOverrideInput, MaxOverrideReasonLength)
+	}
+	return nil
+}

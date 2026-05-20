@@ -46,6 +46,15 @@ type findingRow struct {
 	LastSeenAt        string          `json:"last_seen_at"`
 	ResolvedAt        *string         `json:"resolved_at"`
 	UpdatedAt         string          `json:"updated_at"`
+	// H-023 override metadata. Always present in the JSON
+	// object; populated only when an operator has overridden
+	// the finding. StatusReason / StatusActor degrade to ""
+	// when null; StatusChangedAt / SuppressExpiresAt to
+	// JSON null.
+	StatusReason      string  `json:"status_reason"`
+	StatusActor       string  `json:"status_actor"`
+	StatusChangedAt   *string `json:"status_changed_at"`
+	SuppressExpiresAt *string `json:"suppress_expires_at"`
 }
 
 type findingsListResponse struct {
@@ -208,12 +217,22 @@ func FindingsGet(deps FindingsDeps) http.HandlerFunc {
 func parseFindingsListQuery(r *http.Request, organizationID string) (findings.ListQuery, error) {
 	qs := r.URL.Query()
 
-	// status: empty / "open" / "resolved" / "all". Anything else
-	// is bad_request. Service applies the "default=open" when
-	// the value is empty.
+	// status: empty / "open" / "resolved" / "acknowledged" /
+	// "suppressed" / "all". Anything else is bad_request. The
+	// service applies the "default=open" when the value is
+	// empty. The H-023 additions (acknowledged, suppressed)
+	// MUST stay in lockstep with findings.StatusFilter — a new
+	// enum value added without updating this switch surfaces
+	// as 400 here, exactly as TestFindingsList_StatusFilters
+	// caught when this list was incomplete.
 	rawStatus := qs.Get("status")
 	switch findings.StatusFilter(rawStatus) {
-	case "", findings.StatusFilterOpen, findings.StatusFilterResolved, findings.StatusFilterAll:
+	case "",
+		findings.StatusFilterOpen,
+		findings.StatusFilterResolved,
+		findings.StatusFilterAcknowledged,
+		findings.StatusFilterSuppressed,
+		findings.StatusFilterAll:
 		// ok
 	default:
 		return findings.ListQuery{}, errors.New("invalid status filter")
@@ -235,29 +254,143 @@ func parseFindingsListQuery(r *http.Request, organizationID string) (findings.Li
 	}, nil
 }
 
-// FindingsAcknowledge is the placeholder for the acknowledge
-// workflow (operator marks a finding as acknowledged with a
-// reason; the audit row records the override). Reserved by the
-// 0001-era schema's status CHECK; not in scope for H-021.
-func FindingsAcknowledge(w http.ResponseWriter, _ *http.Request) { notImplemented(w) }
+// --- H-023 acknowledge / suppress -----------------------------------
 
-// FindingsSuppress is the placeholder for the suppression
-// workflow (operator hides a finding with an expiry + reason).
-// Same reservation as FindingsAcknowledge.
-func FindingsSuppress(w http.ResponseWriter, _ *http.Request) { notImplemented(w) }
+// acknowledgeRequest is the JSON body shape for
+// POST /api/v1/findings/{id}/acknowledge.
+type acknowledgeRequest struct {
+	Reason string `json:"reason"`
+}
+
+// suppressRequest is the JSON body shape for
+// POST /api/v1/findings/{id}/suppress. ExpiresAt is a pointer so
+// the wire can distinguish "no expiry" (null/missing) from "an
+// explicit timestamp". The service's validator then enforces
+// strictly-future when present.
+type suppressRequest struct {
+	Reason    string     `json:"reason"`
+	ExpiresAt *time.Time `json:"expires_at"`
+}
+
+// FindingsAcknowledge handles POST /api/v1/findings/{id}/acknowledge.
+//
+// Operator-only. Org-scoped: cross-org / missing finding id →
+// 404 not_found (CLAUDE.md §6 — same envelope a truly-missing
+// id returns, so cross-org existence is not enumerable).
+//
+// Audit: one `finding.acknowledged` row, severity:"security"
+// (CLAUDE.md §9 lists finding overrides as security events).
+// Audit row is in the same transaction as the status update;
+// an audit failure rolls back the override.
+func FindingsAcknowledge(deps FindingsDeps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := middleware.UserFromContext(r.Context())
+		if user == nil {
+			envelope.WriteError(w, http.StatusUnauthorized,
+				"unauthorized", "authentication required")
+			return
+		}
+		findingID := r.PathValue("id")
+		if findingID == "" {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request",
+				"finding id required")
+			return
+		}
+
+		var body acknowledgeRequest
+		if err := envelope.DecodeStrictOptionalJSON(w, r, &body); err != nil {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+			return
+		}
+
+		updated, err := deps.Service.AcknowledgeFinding(r.Context(), findings.AcknowledgeInput{
+			OrganizationID: user.OrganizationID,
+			FindingID:      findingID,
+			ActorUserID:    user.ID,
+			Reason:         body.Reason,
+		})
+		if err != nil {
+			writeOverrideError(w, err)
+			return
+		}
+		envelope.WriteJSON(w, http.StatusOK, findingToRow(updated))
+	}
+}
+
+// FindingsSuppress handles POST /api/v1/findings/{id}/suppress.
+//
+// Same auth + org-scoping + audit posture as
+// FindingsAcknowledge, plus optional expires_at on the request
+// body. expires_at, if present, MUST be strictly in the future
+// (the service re-validates with the injected clock).
+func FindingsSuppress(deps FindingsDeps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := middleware.UserFromContext(r.Context())
+		if user == nil {
+			envelope.WriteError(w, http.StatusUnauthorized,
+				"unauthorized", "authentication required")
+			return
+		}
+		findingID := r.PathValue("id")
+		if findingID == "" {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request",
+				"finding id required")
+			return
+		}
+
+		var body suppressRequest
+		if err := envelope.DecodeStrictOptionalJSON(w, r, &body); err != nil {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid JSON body")
+			return
+		}
+
+		updated, err := deps.Service.SuppressFinding(r.Context(), findings.SuppressInput{
+			OrganizationID: user.OrganizationID,
+			FindingID:      findingID,
+			ActorUserID:    user.ID,
+			Reason:         body.Reason,
+			ExpiresAt:      body.ExpiresAt,
+		})
+		if err != nil {
+			writeOverrideError(w, err)
+			return
+		}
+		envelope.WriteJSON(w, http.StatusOK, findingToRow(updated))
+	}
+}
+
+// writeOverrideError maps the service-layer sentinels onto the
+// HTTP envelope. Shared between acknowledge and suppress.
+func writeOverrideError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, findings.ErrFindingNotFound):
+		envelope.WriteError(w, http.StatusNotFound, "not_found", "finding not found")
+	case errors.Is(err, findings.ErrInvalidOverrideInput):
+		envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid override input")
+	default:
+		envelope.WriteError(w, http.StatusInternalServerError, "internal_error", "could not apply finding override")
+	}
+}
 
 // findingToRow translates one domain Finding into its wire shape.
-// The certificate-side fields (fingerprint_sha256, subject) are
-// omitted in v0.1 — the operator UI can JOIN at presentation
-// time via the certificate id. A future iteration can populate
-// them server-side once the recompute path joins certificates;
-// keeping them omitted today keeps the wire contract additive
-// per CLAUDE.md §17.
+// H-023 added the four override-metadata fields; they are always
+// present in the JSON object (no `omitempty`) — empty strings or
+// JSON null when the finding has never been overridden.
 func findingToRow(f *findings.Finding) findingRow {
 	var resolvedAt *string
 	if f.ResolvedAt != nil {
 		s := f.ResolvedAt.UTC().Format(time.RFC3339)
 		resolvedAt = &s
+	}
+	var statusChangedAt *string
+	if f.StatusChangedAt != nil {
+		s := f.StatusChangedAt.UTC().Format(time.RFC3339)
+		statusChangedAt = &s
+	}
+	var suppressExpiresAt *string
+	if f.SuppressExpiresAt != nil {
+		s := f.SuppressExpiresAt.UTC().Format(time.RFC3339)
+		suppressExpiresAt = &s
 	}
 	evidence := f.Evidence
 	if evidence == nil {
@@ -278,5 +411,9 @@ func findingToRow(f *findings.Finding) findingRow {
 		LastSeenAt:        f.LastSeenAt.UTC().Format(time.RFC3339),
 		ResolvedAt:        resolvedAt,
 		UpdatedAt:         f.UpdatedAt.UTC().Format(time.RFC3339),
+		StatusReason:      f.StatusReason,
+		StatusActor:       f.StatusActor,
+		StatusChangedAt:   statusChangedAt,
+		SuppressExpiresAt: suppressExpiresAt,
 	}
 }

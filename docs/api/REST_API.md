@@ -891,8 +891,8 @@ never `403`.
 | POST   | `/findings/recompute`               | user | Synchronously recompute findings for the operator's organization         |
 | GET    | `/findings`                         | user | Paginated, filterable list                                               |
 | GET    | `/findings/{id}`                    | user | Single finding with evidence                                             |
-| POST   | `/findings/{id}/acknowledge`        | user | `501 not_implemented` — reserved by schema; out of scope for H-021       |
-| POST   | `/findings/{id}/suppress`           | user | `501 not_implemented` — reserved by schema; out of scope for H-021       |
+| POST   | `/findings/{id}/acknowledge`        | user | Operator acknowledges a finding (status → `acknowledged`)                |
+| POST   | `/findings/{id}/suppress`           | user | Operator suppresses a finding (status → `suppressed`)                    |
 
 ### `POST /findings/recompute`
 
@@ -940,14 +940,14 @@ neither does.
 
 Query parameters (all optional):
 
-| Name             | Default | Meaning                                                                      |
-| ---------------- | ------- | ---------------------------------------------------------------------------- |
-| `status`         | `open`  | One of `open` / `resolved` / `all`                                           |
-| `severity`       | —       | Exact match: `info` / `low` / `medium` / `high` / `critical`                 |
-| `rule_id`        | —       | Exact match against the rule id (e.g. `weak_rsa_key`)                        |
-| `certificate_id` | —       | Exact match — useful for "all findings for one cert"                         |
-| `limit`          | 50      | 1–200 inclusive. Out-of-bounds returns 400. Explicit `?limit=0` also rejected. |
-| `cursor`         | —       | Opaque cursor from a previous response's `next_cursor`.                      |
+| Name             | Default | Meaning                                                                                       |
+| ---------------- | ------- | --------------------------------------------------------------------------------------------- |
+| `status`         | `open`  | One of `open` / `resolved` / `acknowledged` / `suppressed` / `all`                            |
+| `severity`       | —       | Exact match: `info` / `low` / `medium` / `high` / `critical`                                  |
+| `rule_id`        | —       | Exact match against the rule id (e.g. `weak_rsa_key`)                                         |
+| `certificate_id` | —       | Exact match — useful for "all findings for one cert"                                          |
+| `limit`          | 50      | 1–200 inclusive. Out-of-bounds returns 400. Explicit `?limit=0` also rejected.                |
+| `cursor`         | —       | Opaque cursor from a previous response's `next_cursor`.                                       |
 
 Ordering: `last_seen_at DESC, id ASC` (matches H-010 cursor
 pattern).
@@ -965,6 +965,8 @@ Response:
       "severity": "high",
       "status": "open",
       "certificate_id": "01J4...",
+      "fingerprint_sha256": "...",
+      "subject": "CN=...",
       "evidence": {
         "public_key_algorithm": "RSA",
         "public_key_bits": 1024,
@@ -973,7 +975,11 @@ Response:
       "first_seen_at": "2026-05-17T14:00:00Z",
       "last_seen_at":  "2026-05-17T18:30:00Z",
       "resolved_at":   null,
-      "updated_at":    "2026-05-17T18:30:00Z"
+      "updated_at":    "2026-05-17T18:30:00Z",
+      "status_reason":        "",
+      "status_actor":         "",
+      "status_changed_at":    null,
+      "suppress_expires_at":  null
     }
   ],
   "next_cursor": null
@@ -984,10 +990,64 @@ Response:
 `last_seen_at` bumps on every recompute that re-confirms the
 match; `resolved_at` is non-null when `status == "resolved"`.
 
+The four `status_*` / `suppress_expires_at` fields carry the
+H-023 override metadata — populated when an operator
+acknowledges or suppresses the finding; cleared by the
+recompute when the row auto-transitions OUT of an override
+state. Always present in the JSON object.
+
 ### `GET /findings/{id}`
 
 Same row shape as one entry of the list response. Cross-org or
 missing id → `404 not_found`.
+
+### `POST /findings/{id}/acknowledge`
+
+Operator-only. Transitions the finding to `acknowledged`. The
+recompute keeps the row acknowledged while the rule still
+matches and resolves it (clearing the override metadata) once
+the rule no longer matches.
+
+```json
+{ "reason": "ticket CSCM-001, blocked on vendor" }
+```
+
+| Field    | Required | Notes                                |
+| -------- | -------- | ------------------------------------ |
+| `reason` | yes      | Trimmed-non-empty, ≤ 1000 bytes.     |
+
+Returns `200 OK` with the updated finding row (full shape
+including the populated `status_*` fields). Cross-org or
+missing id → `404 not_found`. Empty reason → `400 bad_request`.
+
+**Audit:** one `finding.acknowledged` row, metadata carries
+`severity:"security"` (CLAUDE.md §9). Audit failure rolls back
+the override.
+
+### `POST /findings/{id}/suppress`
+
+Operator-only. Transitions the finding to `suppressed`.
+Recompute keeps the row suppressed until either the rule
+stops matching (resolve) or `expires_at` is reached and the
+rule still matches (reopen to `open`).
+
+```json
+{
+  "reason": "known false positive",
+  "expires_at": "2026-06-17T12:00:00Z"
+}
+```
+
+| Field        | Required | Notes                                                       |
+| ------------ | -------- | ----------------------------------------------------------- |
+| `reason`     | yes      | Trimmed-non-empty, ≤ 1000 bytes.                            |
+| `expires_at` | no       | RFC3339. If present, MUST be strictly in the future.        |
+
+Returns `200 OK` with the updated finding row. Past or
+exactly-now `expires_at` → `400 bad_request`.
+
+**Audit:** one `finding.suppressed` row with the same security-
+severity envelope as acknowledge.
 
 ### Audit policy
 

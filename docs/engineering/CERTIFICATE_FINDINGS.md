@@ -306,16 +306,118 @@ fields: `organization_id`, `duration`, `evaluated_certificates`,
 Structured `error` log per failure (or panic) with `err` /
 `panic` fields. No metrics system in v0.1.
 
-## 8. Non-goals (out of scope for H-021)
+## 8. Operator override workflow (H-023)
 
-- **Remediation workflow** — no mutation surface beyond
-  `recompute`. Acknowledge / suppress are reserved by the
-  schema's `status` CHECK but the HTTP handlers stay as
-  `notImplemented` stubs.
+Operators can override the recompute's default open/resolved
+decisions via two POST endpoints. The current state goes onto
+the `findings` row (denormalized current intent); the immutable
+history goes into `audit_events`. The recompute pass honors
+overrides during subsequent ticks per the transition table
+below.
+
+### Status state machine
+
+```
+                  +-----------+   ack    +--------------+
+                  |   open    |--------->| acknowledged |
+                  +-----------+          +--------------+
+                       |                          |
+                       | resolve / no-match       | no-match
+                       v                          v
+                  +-----------+                +-----------+
+                  | resolved  |<---------------|           |
+                  +-----------+                +-----------+
+                       ^                          ^
+                       | rule no longer matches   | rule still
+                       |                          | matches
+                  +-----------+   suppress  +--------------+
+                  |   open    |------------>|  suppressed  |
+                  +-----------+             +--------------+
+                                              |        |
+                                expired+match |        | no-match
+                                              v        v
+                                         (back to open) / resolved
+```
+
+### Recompute transition table
+
+| Current status | Rule matches | Action                                      |
+| -------------- | ------------ | ------------------------------------------- |
+| open           | yes          | UPDATE (last_seen_at bumped)                |
+| open           | no           | resolve                                     |
+| resolved       | yes          | reopen → open (first_seen_at preserved)     |
+| resolved       | no           | unchanged                                   |
+| acknowledged   | yes          | UPDATE; override metadata PRESERVED         |
+| acknowledged   | no           | resolve; override metadata CLEARED          |
+| suppressed     | yes, expired | reopen → open; override metadata CLEARED    |
+| suppressed     | yes, live    | UPDATE; override metadata PRESERVED         |
+| suppressed     | no           | resolve; override metadata CLEARED          |
+
+### Override metadata columns (migration 0007)
+
+| Column                | Type        | Meaning                                                |
+| --------------------- | ----------- | ------------------------------------------------------ |
+| `status_reason`       | TEXT        | Operator's free-text reason (≤ 1000 bytes).            |
+| `status_actor`        | TEXT        | User id who set the override.                          |
+| `status_changed_at`   | TIMESTAMPTZ | Wall-clock at the time of the operator action.         |
+| `suppress_expires_at` | TIMESTAMPTZ | Only set when status=suppressed AND operator gave one. |
+
+All four are nullable. They are CLEARED back to NULL by the
+recompute when it transitions a finding OUT of an override
+(resolve from acknowledged/suppressed; reopen from expired
+suppression). The original override action remains in
+`audit_events` forever.
+
+### Endpoints
+
+```
+POST /api/v1/findings/{id}/acknowledge   body: {"reason": "..."}
+POST /api/v1/findings/{id}/suppress      body: {"reason": "...", "expires_at": "RFC3339"|null}
+```
+
+Both are operator-only (RequireAuth + session resolver), org-
+scoped, with cross-org / missing id → 404 not_found and agent
+bearer → 401 unauthorized.
+
+### Validation
+
+- `reason` is required, trimmed-non-empty, ≤ `MaxOverrideReasonLength` (1000 bytes).
+- `expires_at` is optional on suppress. If present, MUST be
+  strictly in the future (`> now`). The service re-checks
+  with the injected clock; the HTTP handler does no separate
+  time check.
+
+### Audit envelope
+
+```
+action:       finding.acknowledged | finding.suppressed
+actor:        <user.id>
+actor_type:   user
+target_type:  finding
+target_id:    <finding.id>
+metadata: {
+  "severity":         "security",
+  "organization_id":  "...",
+  "finding_id":       "...",
+  "previous_status":  "open" | "acknowledged" | ...,
+  "new_status":       "acknowledged" | "suppressed",
+  "reason":           "<operator's text>",
+  "suppress_expires_at": "RFC3339" | absent
+}
+```
+
+`severity: "security"` per CLAUDE.md §9 — finding overrides are
+explicitly listed as security events.
+
+The audit row is INSERTED in the same transaction as the
+status update (the per-org `WithTxLockedFindings` advisory
+lock serializes the override with concurrent recomputes for
+the same org). An audit failure ROLLS BACK the override.
+
+## 9. Non-goals (still out of scope)
+
 - **Alerting / notification** — no push, no email, no
   webhooks.
-- **Background scheduler** — `recompute` runs on operator
-  demand only. A scheduled recompute is a future follow-up.
 - **Trust-chain validation, OCSP, CRL** — out of scope; the
   inventory does not yet carry chain state.
 - **Dynamic severity** — the static per-rule mapping is the
@@ -323,17 +425,18 @@ Structured `error` log per failure (or panic) with `err` /
 - **Findings UI** — no React component, no dashboard widget;
   the API is the v0.1 surface.
 
-## 9. Status
+## 10. Status
 
-| Phase                             | Status                                  |
-| --------------------------------- | --------------------------------------- |
-| H-021 design (this doc)           | shipped (PR #30)                        |
-| H-021 implementation              | shipped (PR #30)                        |
-| H-022 scheduled recompute         | **shipped** (this PR)                   |
-| H-023 acknowledge / suppress workflow | HARDENING_BACKLOG follow-up         |
-| H-024 findings performance optimization | HARDENING_BACKLOG follow-up       |
+| Phase                                   | Status                |
+| --------------------------------------- | --------------------- |
+| H-021 design (this doc)                 | shipped (PR #30)      |
+| H-021 implementation                    | shipped (PR #30)      |
+| H-022 scheduled recompute               | shipped (PR #32)      |
+| H-023 acknowledge / suppress workflow   | **shipped** (this PR) |
+| H-024 findings performance optimization | HARDENING_BACKLOG     |
+| H-025 per-recompute timeout             | HARDENING_BACKLOG     |
 
-## 10. References
+## 11. References
 
 - [CLAUDE.md](../../CLAUDE.md) §6 (deterministic auth), §8.6
   (consumer-owned interfaces), §8.8 (constructor DI), §9 (audit

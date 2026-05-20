@@ -331,137 +331,397 @@ func TestServiceRecompute_InvalidInput(t *testing.T) {
 	}
 }
 
-// TestServiceRecompute_UnsupportedStatusFailsLoudly_StillMatching
-// pins the defensive default branch in the matches loop: when a
-// pre-existing finding row carries a status outside `open` /
-// `resolved` (v0.1 never writes those; the migration 0001 CHECK
-// reserves `acknowledged` and `suppressed` for the H-023
-// override workflow), recompute MUST fail loudly with
-// ErrUnsupportedFindingStatus rather than silently flipping the
-// row to `open` (which an earlier `default: // reopen` arm
-// would have done).
+// --- H-023 override + recompute transitions ---------------------
 //
-// Property: when an `acknowledged` finding is pre-loaded and the
-// rule still matches, Recompute returns ErrUnsupportedFindingStatus
-// and rolls back any state changes from the same run.
-func TestServiceRecompute_UnsupportedStatusFailsLoudly_StillMatching(t *testing.T) {
-	clk := fixedClock{t: time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)}
+// The five tests below replace the H-021 hardening pass's
+// TestServiceRecompute_UnsupportedStatusFailsLoudly_* pair —
+// those were placeholders pinning the defensive
+// `ErrUnsupportedFindingStatus` arm BEFORE H-023 shipped the
+// real handling. With H-023 in place, the override statuses
+// now have positive behavior contracts, and the tests below
+// pin them.
+
+func seedFindingWithStatus(t *testing.T, repo *fakeFindingsRepo, clk fixedClock, status Status, suppressExpiresAt *time.Time) string {
+	t.Helper()
+	id := "pre-" + string(status) + "-finding"
+	f := &Finding{
+		ID:                id,
+		OrganizationID:    "anchorix",
+		CertificateID:     "target-cert",
+		RuleID:            RuleWeakRSAKey,
+		RuleVersion:       1,
+		Severity:          SeverityHigh,
+		Status:            status,
+		Title:             "RSA key below 2048 bits",
+		FirstSeenAt:       clk.t.Add(-24 * time.Hour),
+		LastSeenAt:        clk.t.Add(-12 * time.Hour),
+		UpdatedAt:         clk.t.Add(-12 * time.Hour),
+		StatusReason:      "ticket CSCM-001",
+		StatusActor:       "alice@example.com",
+		SuppressExpiresAt: suppressExpiresAt,
+	}
+	changed := clk.t.Add(-12 * time.Hour)
+	f.StatusChangedAt = &changed
+	if err := repo.InsertFinding(context.Background(), f); err != nil {
+		t.Fatalf("pre-seed: %v", err)
+	}
+	return id
+}
+
+func matchingWeakRSACerts(clk fixedClock) []inventory.CertificateSummary {
+	return []inventory.CertificateSummary{{
+		ID:            "target-cert",
+		Subject:       "CN=target.example",
+		SignatureAlg:  "SHA256-RSA",
+		PublicKeyAlg:  "RSA",
+		PublicKeyBits: 1024,
+		NotBefore:     clk.t.Add(-30 * 24 * time.Hour),
+		NotAfter:      clk.t.Add(180 * 24 * time.Hour),
+	}}
+}
+
+func healthyCerts(clk fixedClock) []inventory.CertificateSummary {
+	c := matchingWeakRSACerts(clk)[0]
+	c.PublicKeyBits = 2048 // no longer weak
+	return []inventory.CertificateSummary{c}
+}
+
+func newServiceForOverride(t *testing.T, clk fixedClock, certs []inventory.CertificateSummary) (*Service, *fakeFindingsRepo) {
+	t.Helper()
 	repo := newFakeFindingsRepo()
 	tx := &fakeTransactor{}
 	rollbackRepo := &rollbackAwareRepo{inner: repo, tx: tx}
-
-	// Pre-seed a finding with status="acknowledged" — the H-023
-	// workflow value. v0.1 has no public path to create this,
-	// so we go around the public surface by inserting directly
-	// into the fake repo.
-	preExisting := &Finding{
-		ID:             "pre-acked-finding",
-		OrganizationID: "anchorix",
-		CertificateID:  "weak-cert",
-		RuleID:         RuleWeakRSAKey,
-		RuleVersion:    1,
-		Severity:       SeverityHigh,
-		Status:         Status("acknowledged"),
-		Title:          "RSA key below 2048 bits",
-		FirstSeenAt:    clk.t.Add(-1 * time.Hour),
-		LastSeenAt:     clk.t.Add(-1 * time.Hour),
-		UpdatedAt:      clk.t.Add(-1 * time.Hour),
-	}
-	if err := repo.InsertFinding(context.Background(), preExisting); err != nil {
-		t.Fatalf("pre-seed: %v", err)
-	}
-
-	// One cert that matches the same rule the pre-existing
-	// finding was about. Without the fix, the recompute would
-	// flip the acknowledged finding back to `open`.
-	certs := []inventory.CertificateSummary{
-		{
-			ID:            "weak-cert",
-			Subject:       "CN=weak.example",
-			SignatureAlg:  "SHA256-RSA",
-			PublicKeyAlg:  "RSA",
-			PublicKeyBits: 1024,
-			NotBefore:     clk.t.Add(-30 * 24 * time.Hour),
-			NotAfter:      clk.t.Add(180 * 24 * time.Hour),
-		},
-	}
-	svc, err := NewService(
-		rollbackRepo, fakeCertificateLister{certs: certs},
-		tx, &fakeAudit{}, clk, DefaultRules(),
-	)
+	svc, err := NewService(rollbackRepo, fakeCertificateLister{certs: certs},
+		tx, &fakeAudit{}, clk, DefaultRules())
 	if err != nil {
 		t.Fatalf("NewService: %v", err)
 	}
+	// Repo wrapper isn't visible to tests that want to inspect
+	// the raw rows; return the inner repo so assertions can
+	// read state directly.
+	return svc, repo
+}
 
-	_, err = svc.Recompute(context.Background(), RecomputeInput{
-		OrganizationID: "anchorix",
-		ActorUserID:    "test-user",
+// TestServiceRecompute_AcknowledgedStaysAcknowledged pins:
+// rule still matches on an acknowledged finding → stays
+// acknowledged, last_seen_at bumped, override metadata
+// PRESERVED.
+func TestServiceRecompute_AcknowledgedStaysAcknowledged(t *testing.T) {
+	clk := fixedClock{t: time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)}
+	svc, repo := newServiceForOverride(t, clk, matchingWeakRSACerts(clk))
+	id := seedFindingWithStatus(t, repo, clk, StatusAcknowledged, nil)
+
+	out, err := svc.Recompute(context.Background(), RecomputeInput{
+		OrganizationID: "anchorix", ActorUserID: "test-user",
 	})
-	if !errors.Is(err, ErrUnsupportedFindingStatus) {
-		t.Fatalf("err = %v, want wrapping ErrUnsupportedFindingStatus", err)
+	if err != nil {
+		t.Fatalf("Recompute: %v", err)
+	}
+	if out.Updated != 1 || out.Opened != 0 || out.Resolved != 0 {
+		t.Errorf("counters = (opened=%d updated=%d resolved=%d), want (0,1,0)",
+			out.Opened, out.Updated, out.Resolved)
 	}
 
-	// The pre-existing row must be UNCHANGED — no silent
-	// flip to `open`.
-	got, err := repo.GetFinding(context.Background(), "anchorix", "pre-acked-finding")
-	if err != nil {
-		t.Fatalf("get: %v", err)
+	got, _ := repo.GetFinding(context.Background(), "anchorix", id)
+	if got.Status != StatusAcknowledged {
+		t.Errorf("status = %q, want acknowledged", got.Status)
 	}
-	if got.Status != Status("acknowledged") {
-		t.Errorf("status = %q, want acknowledged (recompute silently mutated the row)", got.Status)
+	if got.StatusReason != "ticket CSCM-001" {
+		t.Errorf("status_reason = %q, want preserved value", got.StatusReason)
+	}
+	if !got.LastSeenAt.Equal(clk.t) {
+		t.Errorf("last_seen_at = %s, want bumped to clk.t", got.LastSeenAt)
 	}
 }
 
-// TestServiceRecompute_UnsupportedStatusFailsLoudly_NoLongerMatching
-// is the negative-space counterpart. Same failure path, but the
-// rule no longer matches — the unmatched loop's default arm
-// must also fail loudly.
-func TestServiceRecompute_UnsupportedStatusFailsLoudly_NoLongerMatching(t *testing.T) {
+// TestServiceRecompute_AcknowledgedNoLongerMatchingResolves
+// pins: rule stops matching on an acknowledged finding →
+// resolves and CLEARS the override metadata.
+func TestServiceRecompute_AcknowledgedNoLongerMatchingResolves(t *testing.T) {
+	clk := fixedClock{t: time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)}
+	svc, repo := newServiceForOverride(t, clk, healthyCerts(clk))
+	id := seedFindingWithStatus(t, repo, clk, StatusAcknowledged, nil)
+
+	out, err := svc.Recompute(context.Background(), RecomputeInput{
+		OrganizationID: "anchorix", ActorUserID: "test-user",
+	})
+	if err != nil {
+		t.Fatalf("Recompute: %v", err)
+	}
+	if out.Resolved != 1 {
+		t.Errorf("resolved counter = %d, want 1", out.Resolved)
+	}
+
+	got, _ := repo.GetFinding(context.Background(), "anchorix", id)
+	if got.Status != StatusResolved {
+		t.Errorf("status = %q, want resolved", got.Status)
+	}
+	if got.StatusReason != "" || got.StatusActor != "" || got.StatusChangedAt != nil {
+		t.Errorf("override metadata not cleared: reason=%q actor=%q changed=%v",
+			got.StatusReason, got.StatusActor, got.StatusChangedAt)
+	}
+}
+
+// TestServiceRecompute_SuppressedNotExpiredStays pins:
+// suppressed + not expired + rule matches → stays suppressed.
+func TestServiceRecompute_SuppressedNotExpiredStays(t *testing.T) {
+	clk := fixedClock{t: time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)}
+	future := clk.t.Add(7 * 24 * time.Hour)
+	svc, repo := newServiceForOverride(t, clk, matchingWeakRSACerts(clk))
+	id := seedFindingWithStatus(t, repo, clk, StatusSuppressed, &future)
+
+	out, err := svc.Recompute(context.Background(), RecomputeInput{
+		OrganizationID: "anchorix", ActorUserID: "test-user",
+	})
+	if err != nil {
+		t.Fatalf("Recompute: %v", err)
+	}
+	if out.Updated != 1 || out.Opened != 0 {
+		t.Errorf("counters = (opened=%d updated=%d), want (0,1)", out.Opened, out.Updated)
+	}
+
+	got, _ := repo.GetFinding(context.Background(), "anchorix", id)
+	if got.Status != StatusSuppressed {
+		t.Errorf("status = %q, want suppressed", got.Status)
+	}
+	if got.SuppressExpiresAt == nil || !got.SuppressExpiresAt.Equal(future) {
+		t.Errorf("suppress_expires_at not preserved: %v", got.SuppressExpiresAt)
+	}
+}
+
+// TestServiceRecompute_SuppressedExpiredReopens pins: suppressed
+// + expiry passed + rule still matches → reopens to `open`
+// AND clears override metadata.
+func TestServiceRecompute_SuppressedExpiredReopens(t *testing.T) {
+	clk := fixedClock{t: time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)}
+	past := clk.t.Add(-1 * time.Hour) // expired
+	svc, repo := newServiceForOverride(t, clk, matchingWeakRSACerts(clk))
+	id := seedFindingWithStatus(t, repo, clk, StatusSuppressed, &past)
+
+	out, err := svc.Recompute(context.Background(), RecomputeInput{
+		OrganizationID: "anchorix", ActorUserID: "test-user",
+	})
+	if err != nil {
+		t.Fatalf("Recompute: %v", err)
+	}
+	if out.Opened != 1 {
+		t.Errorf("opened counter = %d, want 1", out.Opened)
+	}
+
+	got, _ := repo.GetFinding(context.Background(), "anchorix", id)
+	if got.Status != StatusOpen {
+		t.Errorf("status = %q, want open (reopened from expired suppression)", got.Status)
+	}
+	if got.SuppressExpiresAt != nil {
+		t.Errorf("suppress_expires_at = %v, want nil after reopen", got.SuppressExpiresAt)
+	}
+	if got.StatusReason != "" {
+		t.Errorf("status_reason = %q, want cleared after reopen", got.StatusReason)
+	}
+}
+
+// TestServiceRecompute_SuppressedNoLongerMatchingResolves pins:
+// suppressed + rule no longer matches → resolves + clears.
+func TestServiceRecompute_SuppressedNoLongerMatchingResolves(t *testing.T) {
+	clk := fixedClock{t: time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)}
+	future := clk.t.Add(7 * 24 * time.Hour)
+	svc, repo := newServiceForOverride(t, clk, healthyCerts(clk))
+	id := seedFindingWithStatus(t, repo, clk, StatusSuppressed, &future)
+
+	if _, err := svc.Recompute(context.Background(), RecomputeInput{
+		OrganizationID: "anchorix", ActorUserID: "test-user",
+	}); err != nil {
+		t.Fatalf("Recompute: %v", err)
+	}
+
+	got, _ := repo.GetFinding(context.Background(), "anchorix", id)
+	if got.Status != StatusResolved {
+		t.Errorf("status = %q, want resolved", got.Status)
+	}
+	if got.SuppressExpiresAt != nil || got.StatusReason != "" {
+		t.Errorf("override metadata not cleared after resolve")
+	}
+}
+
+// --- H-023 override input validation ----------------------------
+
+func TestServiceAcknowledge_RequiresReason(t *testing.T) {
+	clk := fixedClock{t: time.Now()}
+	svc, _ := newServiceForOverride(t, clk, nil)
+	for _, reason := range []string{"", "   ", "\t\n"} {
+		_, err := svc.AcknowledgeFinding(context.Background(), AcknowledgeInput{
+			OrganizationID: "anchorix", FindingID: "x", ActorUserID: "u", Reason: reason,
+		})
+		if !errors.Is(err, ErrInvalidOverrideInput) {
+			t.Errorf("reason %q: err = %v, want ErrInvalidOverrideInput", reason, err)
+		}
+	}
+}
+
+func TestServiceSuppress_RequiresReason(t *testing.T) {
+	clk := fixedClock{t: time.Now()}
+	svc, _ := newServiceForOverride(t, clk, nil)
+	_, err := svc.SuppressFinding(context.Background(), SuppressInput{
+		OrganizationID: "anchorix", FindingID: "x", ActorUserID: "u", Reason: "",
+	})
+	if !errors.Is(err, ErrInvalidOverrideInput) {
+		t.Errorf("err = %v, want ErrInvalidOverrideInput", err)
+	}
+}
+
+func TestServiceSuppress_RejectsPastExpiry(t *testing.T) {
+	clk := fixedClock{t: time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)}
+	svc, _ := newServiceForOverride(t, clk, nil)
+	past := clk.t.Add(-1 * time.Second)
+	_, err := svc.SuppressFinding(context.Background(), SuppressInput{
+		OrganizationID: "anchorix", FindingID: "x", ActorUserID: "u",
+		Reason: "ok", ExpiresAt: &past,
+	})
+	if !errors.Is(err, ErrInvalidOverrideInput) {
+		t.Errorf("past expiry: err = %v, want ErrInvalidOverrideInput", err)
+	}
+	// Exactly-now is also rejected (strictly-future).
+	now := clk.t
+	_, err = svc.SuppressFinding(context.Background(), SuppressInput{
+		OrganizationID: "anchorix", FindingID: "x", ActorUserID: "u",
+		Reason: "ok", ExpiresAt: &now,
+	})
+	if !errors.Is(err, ErrInvalidOverrideInput) {
+		t.Errorf("exact-now expiry: err = %v, want ErrInvalidOverrideInput", err)
+	}
+}
+
+// TestServiceAcknowledge_AuditFailureRollsBack mirrors the H-021
+// audit-rollback test for the new override path.
+func TestServiceAcknowledge_AuditFailureRollsBack(t *testing.T) {
+	clk := fixedClock{t: time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)}
+	repo := newFakeFindingsRepo()
+	tx := &fakeTransactor{}
+	rollbackRepo := &rollbackAwareRepo{inner: repo, tx: tx}
+	aud := &fakeAudit{fail: errors.New("synthetic audit failure")}
+
+	// Pre-seed an open finding.
+	if err := repo.InsertFinding(context.Background(), &Finding{
+		ID: "open-finding", OrganizationID: "anchorix",
+		CertificateID: "c", RuleID: RuleWeakRSAKey,
+		Status: StatusOpen, Title: "T", Severity: SeverityHigh,
+		FirstSeenAt: clk.t, LastSeenAt: clk.t, UpdatedAt: clk.t,
+	}); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	svc, err := NewService(rollbackRepo, fakeCertificateLister{}, tx, aud, clk, DefaultRules())
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+	_, err = svc.AcknowledgeFinding(context.Background(), AcknowledgeInput{
+		OrganizationID: "anchorix", FindingID: "open-finding",
+		ActorUserID: "u", Reason: "test",
+	})
+	if !errors.Is(err, ErrInternalAudit) {
+		t.Fatalf("err = %v, want ErrInternalAudit", err)
+	}
+	// The finding's status MUST still be `open` — rollback worked.
+	got, _ := repo.GetFinding(context.Background(), "anchorix", "open-finding")
+	if got.Status != StatusOpen {
+		t.Errorf("status = %q, want open (rollback failed)", got.Status)
+	}
+}
+
+// TestServiceAcknowledge_ClearsResolvedAt pins the Codex P2 fix
+// on PR #34: overriding a resolved finding (acknowledge or
+// suppress) MUST clear `resolved_at` so the documented invariant
+// "resolved_at is non-null iff status == 'resolved'" holds.
+// An earlier draft left ResolvedAt populated on the override
+// path, which would have surfaced rows with
+// status="acknowledged" AND a non-null resolved_at — a wire-
+// contract bug.
+func TestServiceAcknowledge_ClearsResolvedAt(t *testing.T) {
 	clk := fixedClock{t: time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)}
 	repo := newFakeFindingsRepo()
 	tx := &fakeTransactor{}
 	rollbackRepo := &rollbackAwareRepo{inner: repo, tx: tx}
 
-	// Pre-seed a suppressed finding pointing at a cert that no
-	// longer triggers any rule.
+	// Pre-seed a resolved finding (an unusual but legitimate
+	// state — the rule used to match, recompute resolved it,
+	// then an operator wants to "I see this, don't reopen if
+	// the rule matches again" via acknowledge).
+	resolvedAt := clk.t.Add(-1 * time.Hour)
 	if err := repo.InsertFinding(context.Background(), &Finding{
-		ID:             "pre-suppressed-finding",
-		OrganizationID: "anchorix",
-		CertificateID:  "fine-cert",
-		RuleID:         RuleWeakRSAKey,
-		RuleVersion:    1,
-		Severity:       SeverityHigh,
-		Status:         Status("suppressed"),
-		Title:          "Suppressed",
-		FirstSeenAt:    clk.t.Add(-24 * time.Hour),
-		LastSeenAt:     clk.t.Add(-12 * time.Hour),
-		UpdatedAt:      clk.t.Add(-12 * time.Hour),
+		ID: "resolved-finding", OrganizationID: "anchorix",
+		CertificateID: "c", RuleID: RuleWeakRSAKey,
+		Status: StatusResolved, Title: "T", Severity: SeverityHigh,
+		FirstSeenAt: clk.t.Add(-2 * time.Hour),
+		LastSeenAt:  clk.t.Add(-1 * time.Hour),
+		ResolvedAt:  &resolvedAt,
+		UpdatedAt:   clk.t.Add(-1 * time.Hour),
 	}); err != nil {
 		t.Fatalf("pre-seed: %v", err)
 	}
 
-	// Cert is healthy — no rule matches.
-	certs := []inventory.CertificateSummary{
-		{
-			ID:            "fine-cert",
-			Subject:       "CN=fine.example",
-			SignatureAlg:  "SHA256-RSA",
-			PublicKeyAlg:  "RSA",
-			PublicKeyBits: 2048,
-			NotBefore:     clk.t.Add(-30 * 24 * time.Hour),
-			NotAfter:      clk.t.Add(180 * 24 * time.Hour),
-		},
+	svc, err := NewService(rollbackRepo, fakeCertificateLister{},
+		tx, &fakeAudit{}, clk, DefaultRules())
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
 	}
-	svc, _ := NewService(
-		rollbackRepo, fakeCertificateLister{certs: certs},
-		tx, &fakeAudit{}, clk, DefaultRules(),
-	)
 
-	_, err := svc.Recompute(context.Background(), RecomputeInput{
-		OrganizationID: "anchorix",
-		ActorUserID:    "test-user",
+	updated, err := svc.AcknowledgeFinding(context.Background(), AcknowledgeInput{
+		OrganizationID: "anchorix", FindingID: "resolved-finding",
+		ActorUserID: "u", Reason: "ack the resolved one",
 	})
-	if !errors.Is(err, ErrUnsupportedFindingStatus) {
-		t.Fatalf("err = %v, want wrapping ErrUnsupportedFindingStatus", err)
+	if err != nil {
+		t.Fatalf("AcknowledgeFinding: %v", err)
+	}
+	if updated.Status != StatusAcknowledged {
+		t.Errorf("status = %q, want acknowledged", updated.Status)
+	}
+	if updated.ResolvedAt != nil {
+		t.Errorf("resolved_at = %v, want nil (invariant: non-null iff status=resolved)",
+			updated.ResolvedAt)
+	}
+
+	// Double-check by re-reading via the repo.
+	got, _ := repo.GetFinding(context.Background(), "anchorix", "resolved-finding")
+	if got.ResolvedAt != nil {
+		t.Errorf("repo ResolvedAt = %v, want nil after override", got.ResolvedAt)
+	}
+}
+
+// TestServiceSuppress_ClearsResolvedAt is the suppress-path
+// counterpart for completeness — both override paths must
+// honor the invariant.
+func TestServiceSuppress_ClearsResolvedAt(t *testing.T) {
+	clk := fixedClock{t: time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)}
+	repo := newFakeFindingsRepo()
+	tx := &fakeTransactor{}
+	rollbackRepo := &rollbackAwareRepo{inner: repo, tx: tx}
+
+	resolvedAt := clk.t.Add(-1 * time.Hour)
+	if err := repo.InsertFinding(context.Background(), &Finding{
+		ID: "resolved-finding-2", OrganizationID: "anchorix",
+		CertificateID: "c", RuleID: RuleWeakRSAKey,
+		Status: StatusResolved, Title: "T", Severity: SeverityHigh,
+		FirstSeenAt: clk.t.Add(-2 * time.Hour),
+		LastSeenAt:  clk.t.Add(-1 * time.Hour),
+		ResolvedAt:  &resolvedAt,
+		UpdatedAt:   clk.t.Add(-1 * time.Hour),
+	}); err != nil {
+		t.Fatalf("pre-seed: %v", err)
+	}
+
+	svc, _ := NewService(rollbackRepo, fakeCertificateLister{},
+		tx, &fakeAudit{}, clk, DefaultRules())
+
+	future := clk.t.Add(7 * 24 * time.Hour)
+	updated, err := svc.SuppressFinding(context.Background(), SuppressInput{
+		OrganizationID: "anchorix", FindingID: "resolved-finding-2",
+		ActorUserID: "u", Reason: "suppress the resolved one",
+		ExpiresAt: &future,
+	})
+	if err != nil {
+		t.Fatalf("SuppressFinding: %v", err)
+	}
+	if updated.ResolvedAt != nil {
+		t.Errorf("suppress resolved_at = %v, want nil", updated.ResolvedAt)
 	}
 }

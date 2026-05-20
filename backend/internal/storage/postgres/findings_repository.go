@@ -53,23 +53,34 @@ func (r *FindingsRepository) InsertFinding(ctx context.Context, f *findings.Find
 		return errors.New("postgres: nil finding")
 	}
 	evidence := jsonValue(f.Evidence)
+	// New findings born from a recompute are always `open` with
+	// NULL override metadata — the H-023 override columns get
+	// populated later via UpdateFinding when an operator
+	// acknowledges or suppresses. We still pass them through
+	// from the supplied struct so a hypothetical caller that
+	// pre-populates them (tests, future bulk-import) round-trips
+	// correctly.
 	const q = `
 		INSERT INTO findings (
 			id, organization_id, certificate_id,
 			rule_id, rule_version,
 			severity, status, title, evidence,
-			opened_at, last_seen_at, resolved_at, updated_at
+			opened_at, last_seen_at, resolved_at, updated_at,
+			status_reason, status_actor, status_changed_at, suppress_expires_at
 		) VALUES (
 			$1, $2, $3,
 			$4, $5,
 			$6, $7, $8, $9,
-			$10, $11, $12, $13
+			$10, $11, $12, $13,
+			$14, $15, $16, $17
 		)`
 	if _, err := r.db.querierFor(ctx).Exec(ctx, q,
 		f.ID, f.OrganizationID, f.CertificateID,
 		f.RuleID, f.RuleVersion,
 		string(f.Severity), string(f.Status), f.Title, evidence,
 		f.FirstSeenAt, f.LastSeenAt, f.ResolvedAt, f.UpdatedAt,
+		nullableString(f.StatusReason), nullableString(f.StatusActor),
+		f.StatusChangedAt, f.SuppressExpiresAt,
 	); err != nil {
 		return fmt.Errorf("postgres: insert finding: %w", err)
 	}
@@ -79,6 +90,14 @@ func (r *FindingsRepository) InsertFinding(ctx context.Context, f *findings.Find
 // UpdateFinding writes the supplied state to an existing row
 // identified by (id, organization_id). The organization_id is in
 // the WHERE clause so a buggy caller cannot update across orgs.
+//
+// Writes ALL mutable columns, including the H-023 override
+// metadata. Recompute paths preserve the override fields by
+// loading the prior row, mutating only the rule-derived
+// columns, and writing the whole struct back. Operator paths
+// (AcknowledgeFinding / SuppressFinding) mutate the override
+// fields and write back; auto-transitions OUT of an override
+// CLEAR the fields before writing.
 func (r *FindingsRepository) UpdateFinding(ctx context.Context, f *findings.Finding) error {
 	if f == nil {
 		return errors.New("postgres: nil finding")
@@ -86,20 +105,26 @@ func (r *FindingsRepository) UpdateFinding(ctx context.Context, f *findings.Find
 	evidence := jsonValue(f.Evidence)
 	const q = `
 		UPDATE findings
-		   SET rule_version = $3,
-		       severity     = $4,
-		       status       = $5,
-		       title        = $6,
-		       evidence     = $7,
-		       last_seen_at = $8,
-		       resolved_at  = $9,
-		       updated_at   = $10
+		   SET rule_version        = $3,
+		       severity            = $4,
+		       status              = $5,
+		       title               = $6,
+		       evidence            = $7,
+		       last_seen_at        = $8,
+		       resolved_at         = $9,
+		       updated_at          = $10,
+		       status_reason       = $11,
+		       status_actor        = $12,
+		       status_changed_at   = $13,
+		       suppress_expires_at = $14
 		 WHERE id = $1 AND organization_id = $2`
 	tag, err := r.db.querierFor(ctx).Exec(ctx, q,
 		f.ID, f.OrganizationID,
 		f.RuleVersion,
 		string(f.Severity), string(f.Status), f.Title, evidence,
 		f.LastSeenAt, f.ResolvedAt, f.UpdatedAt,
+		nullableString(f.StatusReason), nullableString(f.StatusActor),
+		f.StatusChangedAt, f.SuppressExpiresAt,
 	)
 	if err != nil {
 		return fmt.Errorf("postgres: update finding: %w", err)
@@ -108,6 +133,17 @@ func (r *FindingsRepository) UpdateFinding(ctx context.Context, f *findings.Find
 		return findings.ErrFindingNotFound
 	}
 	return nil
+}
+
+// nullableString converts an empty Go string to SQL NULL so the
+// override-metadata columns stay NULL when no operator has
+// touched the row. pgx maps `nil` to SQL NULL; an empty string
+// would otherwise be stored as the literal "".
+func nullableString(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // GetFinding returns the (org, finding) row or ErrFindingNotFound.
@@ -125,6 +161,7 @@ func (r *FindingsRepository) GetFinding(
 		       f.rule_id, f.rule_version,
 		       f.severity, f.status, f.title, f.evidence,
 		       f.opened_at, f.last_seen_at, f.resolved_at, f.updated_at,
+		       f.status_reason, f.status_actor, f.status_changed_at, f.suppress_expires_at,
 		       COALESCE(c.fingerprint_sha256, ''),
 		       COALESCE(c.subject, '')
 		  FROM findings f
@@ -147,7 +184,9 @@ func (r *FindingsRepository) GetFinding(
 // regardless of status. Used by Service.Recompute to compute the
 // diff against the freshly-evaluated rule matches. The org
 // filter is the only WHERE clause; the result is ordered by id
-// for repeatability.
+// for repeatability. Selects the H-023 override columns so the
+// recompute logic can decide what to do with acknowledged /
+// suppressed rows.
 func (r *FindingsRepository) ListAllForOrg(
 	ctx context.Context,
 	organizationID string,
@@ -156,7 +195,8 @@ func (r *FindingsRepository) ListAllForOrg(
 		SELECT id, organization_id, certificate_id,
 		       rule_id, rule_version,
 		       severity, status, title, evidence,
-		       opened_at, last_seen_at, resolved_at, updated_at
+		       opened_at, last_seen_at, resolved_at, updated_at,
+		       status_reason, status_actor, status_changed_at, suppress_expires_at
 		  FROM findings
 		 WHERE organization_id = $1
 		 ORDER BY id ASC`
@@ -212,8 +252,12 @@ func (r *FindingsRepository) ListFindings(
 		conditions = append(conditions, "f.status = 'open'")
 	case findings.StatusFilterResolved:
 		conditions = append(conditions, "f.status = 'resolved'")
+	case findings.StatusFilterAcknowledged:
+		conditions = append(conditions, "f.status = 'acknowledged'")
+	case findings.StatusFilterSuppressed:
+		conditions = append(conditions, "f.status = 'suppressed'")
 	case findings.StatusFilterAll:
-		// no filter — both open and resolved.
+		// no filter — all status values.
 	}
 
 	if q.Severity != "" {
@@ -251,6 +295,7 @@ func (r *FindingsRepository) ListFindings(
 		       f.rule_id, f.rule_version,
 		       f.severity, f.status, f.title, f.evidence,
 		       f.opened_at, f.last_seen_at, f.resolved_at, f.updated_at,
+		       f.status_reason, f.status_actor, f.status_changed_at, f.suppress_expires_at,
 		       COALESCE(c.fingerprint_sha256, ''),
 		       COALESCE(c.subject, '')
 		  FROM findings f
@@ -283,20 +328,29 @@ func (r *FindingsRepository) ListFindings(
 	return out, nil
 }
 
-// scanFinding parses one row into a *findings.Finding.
+// scanFinding parses one row into a *findings.Finding. Includes
+// the H-023 override columns (NULL-friendly via *string /
+// *time.Time scan targets — NULL maps to nil, which the helpers
+// below normalize to the Finding struct's empty-string /
+// nil-pointer representation).
 func scanFinding(row pgx.Row) (*findings.Finding, error) {
 	var (
-		f           findings.Finding
-		severity    string
-		status      string
-		evidenceRaw []byte
-		resolvedAt  *time.Time
+		f                 findings.Finding
+		severity          string
+		status            string
+		evidenceRaw       []byte
+		resolvedAt        *time.Time
+		statusReason      *string
+		statusActor       *string
+		statusChangedAt   *time.Time
+		suppressExpiresAt *time.Time
 	)
 	if err := row.Scan(
 		&f.ID, &f.OrganizationID, &f.CertificateID,
 		&f.RuleID, &f.RuleVersion,
 		&severity, &status, &f.Title, &evidenceRaw,
 		&f.FirstSeenAt, &f.LastSeenAt, &resolvedAt, &f.UpdatedAt,
+		&statusReason, &statusActor, &statusChangedAt, &suppressExpiresAt,
 	); err != nil {
 		return nil, err
 	}
@@ -306,6 +360,14 @@ func scanFinding(row pgx.Row) (*findings.Finding, error) {
 		f.Evidence = json.RawMessage(evidenceRaw)
 	}
 	f.ResolvedAt = resolvedAt
+	if statusReason != nil {
+		f.StatusReason = *statusReason
+	}
+	if statusActor != nil {
+		f.StatusActor = *statusActor
+	}
+	f.StatusChangedAt = statusChangedAt
+	f.SuppressExpiresAt = suppressExpiresAt
 	return &f, nil
 }
 
@@ -318,19 +380,24 @@ func scanFinding(row pgx.Row) (*findings.Finding, error) {
 // total).
 func scanFindingWithCert(row pgx.Row) (*findings.Finding, error) {
 	var (
-		f           findings.Finding
-		severity    string
-		status      string
-		evidenceRaw []byte
-		resolvedAt  *time.Time
-		fingerprint string
-		subject     string
+		f                 findings.Finding
+		severity          string
+		status            string
+		evidenceRaw       []byte
+		resolvedAt        *time.Time
+		statusReason      *string
+		statusActor       *string
+		statusChangedAt   *time.Time
+		suppressExpiresAt *time.Time
+		fingerprint       string
+		subject           string
 	)
 	if err := row.Scan(
 		&f.ID, &f.OrganizationID, &f.CertificateID,
 		&f.RuleID, &f.RuleVersion,
 		&severity, &status, &f.Title, &evidenceRaw,
 		&f.FirstSeenAt, &f.LastSeenAt, &resolvedAt, &f.UpdatedAt,
+		&statusReason, &statusActor, &statusChangedAt, &suppressExpiresAt,
 		&fingerprint, &subject,
 	); err != nil {
 		return nil, err
@@ -341,6 +408,14 @@ func scanFindingWithCert(row pgx.Row) (*findings.Finding, error) {
 		f.Evidence = json.RawMessage(evidenceRaw)
 	}
 	f.ResolvedAt = resolvedAt
+	if statusReason != nil {
+		f.StatusReason = *statusReason
+	}
+	if statusActor != nil {
+		f.StatusActor = *statusActor
+	}
+	f.StatusChangedAt = statusChangedAt
+	f.SuppressExpiresAt = suppressExpiresAt
 	f.FingerprintSHA256 = fingerprint
 	f.Subject = subject
 	return &f, nil
