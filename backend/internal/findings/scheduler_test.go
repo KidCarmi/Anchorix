@@ -351,3 +351,173 @@ func TestScheduler_RunOnce_ContextCancelledMidSweepSkipsRest(t *testing.T) {
 		t.Errorf("expected 0 service calls under cancelled ctx, got %d", svc.totalCalls())
 	}
 }
+
+// --- log signal-quality during graceful shutdown ------------------
+//
+// The four tests below pin the post-H-022 hardening pass's
+// signal-quality fixes: ctx-cancelled errors during graceful
+// shutdown MUST log as `info` (not `error`) so operator alerting
+// doesn't trip on the noise that propagates through pgx when
+// the process is mid-shutdown.
+
+// capturingLogger returns a logger that writes to the supplied
+// buffer. Tests then assert on substrings of the captured
+// output to verify which fields and levels each log line
+// produced.
+func capturingLogger(buf *strings.Builder) *logger.Logger {
+	return logger.NewWithWriter("debug", "development", buf)
+}
+
+// containsLogLevel checks whether the captured slog text output
+// contains the given level token. logger.NewWithWriter with
+// env="development" uses the slog TextHandler whose format is
+// `level=INFO` / `level=ERROR`. Encapsulating the assertion in
+// one helper keeps a future format change to one site.
+func containsLogLevel(captured, level string) bool {
+	return strings.Contains(captured, "level="+strings.ToUpper(level))
+}
+
+// TestScheduler_RunOnce_OrgListerCtxCancelLogsInfoNotError pins
+// the property: when ctx is cancelled and ListOrganizationIDs
+// returns a (presumably) context.Canceled error, the scheduler
+// must log it as `info` (not `error`) so operator alerting
+// stays quiet during graceful shutdown.
+func TestScheduler_RunOnce_OrgListerCtxCancelLogsInfoNotError(t *testing.T) {
+	var captured strings.Builder
+	svc := newFakeScheduledService()
+	orgs := &fakeOrgLister{err: context.Canceled}
+	sched, err := NewScheduler(svc, orgs, capturingLogger(&captured), schedFixedClock{t: time.Now()},
+		SchedulerConfig{Enabled: true, Interval: MinSchedulerInterval})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	sched.runOnce(ctx)
+
+	out := captured.String()
+	if !strings.Contains(out, "shutdown during list organizations") {
+		t.Errorf("missing shutdown-info line; captured:\n%s", out)
+	}
+	if containsLogLevel(out, "ERROR") {
+		t.Errorf("ctx-cancelled list error logged as ERROR (should be INFO); captured:\n%s", out)
+	}
+}
+
+// TestScheduler_RunOnce_OrgListerRealErrorLogsError is the
+// negative-space counterpart: a real lister failure (no ctx
+// cancellation in play) must still produce an `error` log line
+// so alerting fires on actual DB outages.
+func TestScheduler_RunOnce_OrgListerRealErrorLogsError(t *testing.T) {
+	var captured strings.Builder
+	svc := newFakeScheduledService()
+	orgs := &fakeOrgLister{err: errors.New("synthetic real db failure")}
+	sched, err := NewScheduler(svc, orgs, capturingLogger(&captured), schedFixedClock{t: time.Now()},
+		SchedulerConfig{Enabled: true, Interval: MinSchedulerInterval})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+
+	// Non-cancelled context — the error is real.
+	sched.runOnce(context.Background())
+
+	out := captured.String()
+	if !strings.Contains(out, "list organizations failed") {
+		t.Errorf("missing error log; captured:\n%s", out)
+	}
+	if !containsLogLevel(out, "ERROR") {
+		t.Errorf("real list failure not logged at ERROR level; captured:\n%s", out)
+	}
+}
+
+// TestScheduler_RunOnce_RecomputeCtxCancelLogsInfoNotError mirrors
+// the lister case for the per-org Recompute call: a
+// ctx-cancelled-mid-recompute error is a graceful-shutdown
+// signal, not a real failure. Must log as info.
+//
+// To exercise the recompute-branch specifically (skipping
+// runOnce's between-org cancel-check), the test calls
+// recomputeOrg directly with a pre-cancelled context.
+func TestScheduler_RunOnce_RecomputeCtxCancelLogsInfoNotError(t *testing.T) {
+	var captured strings.Builder
+	svc := newFakeScheduledService()
+	svc.failOrgs["cancelled-during-recompute"] = context.Canceled
+	orgs := &fakeOrgLister{orgs: []string{"cancelled-during-recompute"}}
+	sched, err := NewScheduler(svc, orgs, capturingLogger(&captured), schedFixedClock{t: time.Now()},
+		SchedulerConfig{Enabled: true, Interval: MinSchedulerInterval})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	sched.recomputeOrg(ctx, "cancelled-during-recompute")
+
+	out := captured.String()
+	if !strings.Contains(out, "shutdown during recompute") {
+		t.Errorf("missing shutdown-info line; captured:\n%s", out)
+	}
+	if containsLogLevel(out, "ERROR") {
+		t.Errorf("ctx-cancelled recompute error logged as ERROR (should be INFO); captured:\n%s", out)
+	}
+	// slog text format uses `organization_id=value` (unquoted
+	// for simple strings); confirm the field appears so
+	// operators can grep by org during shutdown.
+	if !strings.Contains(out, "organization_id=cancelled-during-recompute") {
+		t.Errorf("missing organization_id field; captured:\n%s", out)
+	}
+}
+
+// TestScheduler_RunOnce_RecomputeRealErrorLogsError is the
+// negative-space counterpart for the recompute branch.
+func TestScheduler_RunOnce_RecomputeRealErrorLogsError(t *testing.T) {
+	var captured strings.Builder
+	svc := newFakeScheduledService()
+	svc.failOrgs["real-failure-org"] = errors.New("synthetic real recompute failure")
+	orgs := &fakeOrgLister{orgs: []string{"real-failure-org"}}
+	sched, err := NewScheduler(svc, orgs, capturingLogger(&captured), schedFixedClock{t: time.Now()},
+		SchedulerConfig{Enabled: true, Interval: MinSchedulerInterval})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+
+	// Non-cancelled context — the error is real.
+	sched.runOnce(context.Background())
+
+	out := captured.String()
+	if !strings.Contains(out, "recompute failed") {
+		t.Errorf("missing error log; captured:\n%s", out)
+	}
+	if !containsLogLevel(out, "ERROR") {
+		t.Errorf("real recompute failure not logged at ERROR level; captured:\n%s", out)
+	}
+}
+
+// TestScheduler_DisabledLogDoesNotLeakEnvVar pins the cleanup
+// to the disabled-state log message: it must NOT name a
+// specific env var, because callers other than the env-driven
+// composition root also reach this branch (tests, future
+// kill-switches).
+func TestScheduler_DisabledLogDoesNotLeakEnvVar(t *testing.T) {
+	var captured strings.Builder
+	svc := newFakeScheduledService()
+	orgs := &fakeOrgLister{}
+	sched, err := NewScheduler(svc, orgs, capturingLogger(&captured), schedFixedClock{t: time.Now()},
+		SchedulerConfig{Enabled: false})
+	if err != nil {
+		t.Fatalf("NewScheduler: %v", err)
+	}
+
+	if err := sched.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	out := captured.String()
+	if !strings.Contains(out, "findings scheduler disabled") {
+		t.Errorf("missing disabled log; captured:\n%s", out)
+	}
+	if strings.Contains(out, "ANCHORIX_FINDINGS_SCHEDULER_ENABLED") {
+		t.Errorf("disabled log leaks env var name; captured:\n%s", out)
+	}
+}
