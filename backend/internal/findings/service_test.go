@@ -627,3 +627,101 @@ func TestServiceAcknowledge_AuditFailureRollsBack(t *testing.T) {
 		t.Errorf("status = %q, want open (rollback failed)", got.Status)
 	}
 }
+
+// TestServiceAcknowledge_ClearsResolvedAt pins the Codex P2 fix
+// on PR #34: overriding a resolved finding (acknowledge or
+// suppress) MUST clear `resolved_at` so the documented invariant
+// "resolved_at is non-null iff status == 'resolved'" holds.
+// An earlier draft left ResolvedAt populated on the override
+// path, which would have surfaced rows with
+// status="acknowledged" AND a non-null resolved_at — a wire-
+// contract bug.
+func TestServiceAcknowledge_ClearsResolvedAt(t *testing.T) {
+	clk := fixedClock{t: time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)}
+	repo := newFakeFindingsRepo()
+	tx := &fakeTransactor{}
+	rollbackRepo := &rollbackAwareRepo{inner: repo, tx: tx}
+
+	// Pre-seed a resolved finding (an unusual but legitimate
+	// state — the rule used to match, recompute resolved it,
+	// then an operator wants to "I see this, don't reopen if
+	// the rule matches again" via acknowledge).
+	resolvedAt := clk.t.Add(-1 * time.Hour)
+	if err := repo.InsertFinding(context.Background(), &Finding{
+		ID: "resolved-finding", OrganizationID: "anchorix",
+		CertificateID: "c", RuleID: RuleWeakRSAKey,
+		Status: StatusResolved, Title: "T", Severity: SeverityHigh,
+		FirstSeenAt: clk.t.Add(-2 * time.Hour),
+		LastSeenAt:  clk.t.Add(-1 * time.Hour),
+		ResolvedAt:  &resolvedAt,
+		UpdatedAt:   clk.t.Add(-1 * time.Hour),
+	}); err != nil {
+		t.Fatalf("pre-seed: %v", err)
+	}
+
+	svc, err := NewService(rollbackRepo, fakeCertificateLister{},
+		tx, &fakeAudit{}, clk, DefaultRules())
+	if err != nil {
+		t.Fatalf("NewService: %v", err)
+	}
+
+	updated, err := svc.AcknowledgeFinding(context.Background(), AcknowledgeInput{
+		OrganizationID: "anchorix", FindingID: "resolved-finding",
+		ActorUserID: "u", Reason: "ack the resolved one",
+	})
+	if err != nil {
+		t.Fatalf("AcknowledgeFinding: %v", err)
+	}
+	if updated.Status != StatusAcknowledged {
+		t.Errorf("status = %q, want acknowledged", updated.Status)
+	}
+	if updated.ResolvedAt != nil {
+		t.Errorf("resolved_at = %v, want nil (invariant: non-null iff status=resolved)",
+			updated.ResolvedAt)
+	}
+
+	// Double-check by re-reading via the repo.
+	got, _ := repo.GetFinding(context.Background(), "anchorix", "resolved-finding")
+	if got.ResolvedAt != nil {
+		t.Errorf("repo ResolvedAt = %v, want nil after override", got.ResolvedAt)
+	}
+}
+
+// TestServiceSuppress_ClearsResolvedAt is the suppress-path
+// counterpart for completeness — both override paths must
+// honor the invariant.
+func TestServiceSuppress_ClearsResolvedAt(t *testing.T) {
+	clk := fixedClock{t: time.Date(2026, 5, 17, 12, 0, 0, 0, time.UTC)}
+	repo := newFakeFindingsRepo()
+	tx := &fakeTransactor{}
+	rollbackRepo := &rollbackAwareRepo{inner: repo, tx: tx}
+
+	resolvedAt := clk.t.Add(-1 * time.Hour)
+	if err := repo.InsertFinding(context.Background(), &Finding{
+		ID: "resolved-finding-2", OrganizationID: "anchorix",
+		CertificateID: "c", RuleID: RuleWeakRSAKey,
+		Status: StatusResolved, Title: "T", Severity: SeverityHigh,
+		FirstSeenAt: clk.t.Add(-2 * time.Hour),
+		LastSeenAt:  clk.t.Add(-1 * time.Hour),
+		ResolvedAt:  &resolvedAt,
+		UpdatedAt:   clk.t.Add(-1 * time.Hour),
+	}); err != nil {
+		t.Fatalf("pre-seed: %v", err)
+	}
+
+	svc, _ := NewService(rollbackRepo, fakeCertificateLister{},
+		tx, &fakeAudit{}, clk, DefaultRules())
+
+	future := clk.t.Add(7 * 24 * time.Hour)
+	updated, err := svc.SuppressFinding(context.Background(), SuppressInput{
+		OrganizationID: "anchorix", FindingID: "resolved-finding-2",
+		ActorUserID: "u", Reason: "suppress the resolved one",
+		ExpiresAt: &future,
+	})
+	if err != nil {
+		t.Fatalf("SuppressFinding: %v", err)
+	}
+	if updated.ResolvedAt != nil {
+		t.Errorf("suppress resolved_at = %v, want nil", updated.ResolvedAt)
+	}
+}

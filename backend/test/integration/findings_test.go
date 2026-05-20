@@ -1762,6 +1762,15 @@ func TestFindingsRecompute_AcknowledgedStaysAcknowledged(t *testing.T) {
 // TestFindingsRecompute_ExpiredSuppressionReopens:
 // end-to-end check that a suppressed finding past its expiry
 // reopens to `open` on the next recompute.
+//
+// Timing constants are deliberately conservative for slow CI:
+// the wire-format RFC3339Nano preserves sub-second precision
+// (RFC3339 alone would truncate, leaving a residual margin
+// smaller than HTTP roundtrip latency); the future-offset is
+// 3 seconds so a slow handler can't time-travel past the
+// suppress validator's "strictly in the future" check; the
+// sleep is 4 seconds so the recompute's clock is always past
+// the expiry by at least 1 second.
 func TestFindingsRecompute_ExpiredSuppressionReopens(t *testing.T) {
 	db := testDB(t)
 	freshDatabase(t, db)
@@ -1769,14 +1778,12 @@ func TestFindingsRecompute_ExpiredSuppressionReopens(t *testing.T) {
 	adminClient := signInAdmin(t, urlSrv{url: srv.URL}, svc)
 	findingID := seedFindingForOverride(t, db, srv.URL, adminClient, "supp-reopens")
 
-	// Suppress for 1 second; sleep past the expiry; recompute;
-	// observe `open`.
-	expiresAt := time.Now().UTC().Add(1 * time.Second).Format(time.RFC3339)
+	expiresAt := time.Now().UTC().Add(3 * time.Second).Format(time.RFC3339Nano)
 	postJSON(t, adminClient,
 		srv.URL+"/api/v1/findings/"+findingID+"/suppress",
 		`{"reason":"brief","expires_at":"`+expiresAt+`"}`, http.StatusOK)
 
-	time.Sleep(2 * time.Second)
+	time.Sleep(4 * time.Second)
 	recompute(t, srv.URL, adminClient)
 
 	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/api/v1/findings/"+findingID, nil)

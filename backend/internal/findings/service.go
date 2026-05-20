@@ -720,12 +720,20 @@ func (s *Service) applyOverride(ctx context.Context, req overrideRequest) (*Find
 		prior.StatusChangedAt = &now
 		prior.SuppressExpiresAt = req.SuppressExpiresAt
 		prior.UpdatedAt = now
-		// Override does NOT clear ResolvedAt — if the operator
-		// is acknowledging a resolved finding, the row stays
-		// resolved-flavored in its history but the current
-		// status is now "acknowledged". The recompute pass
-		// will move it back to resolved on the next tick if
-		// the rule still doesn't match.
+		// Clear ResolvedAt so the documented invariant
+		// "resolved_at is non-null iff status == 'resolved'"
+		// holds for the post-override row. An earlier draft
+		// left ResolvedAt populated when an operator
+		// overrode a resolved finding; the API would then
+		// return rows with status="acknowledged" /
+		// "suppressed" AND a non-null resolved_at, which
+		// breaks both the wire contract and the
+		// `?status=resolved` filter (which queries on
+		// status, not resolved_at, but operators reading
+		// the JSON would be confused). Recompute re-stamps
+		// resolved_at when transitioning an override BACK
+		// to resolved (rule no longer matches).
+		prior.ResolvedAt = nil
 		if err := s.repo.UpdateFinding(ctx, prior); err != nil {
 			return fmt.Errorf("findings: apply override: %w", err)
 		}
