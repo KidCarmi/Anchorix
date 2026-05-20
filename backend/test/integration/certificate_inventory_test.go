@@ -240,6 +240,58 @@ func TestCertificateInventoryMigrationApplies(t *testing.T) {
 			t.Errorf("index %s missing", idx)
 		}
 	}
+
+	// H-024A indexes from migration 0008. Listed separately so a
+	// future maintainer reading the test sees which group each
+	// index belongs to without cross-referencing migrations.
+	//
+	//   - certificate_observations_org_cert_active_idx is the
+	//     PARTIAL index serving the operator-list `current_only`
+	//     EXISTS subquery. The assertion below probes the indexdef
+	//     so a future migration that accidentally drops the
+	//     `WHERE removed_at IS NULL` predicate fails this test
+	//     (a plain (org, cert_id) btree without the predicate is
+	//     a regression — it would cease to serve the partial-
+	//     index optimization).
+	//   - certificates_org_last_seen_idx is the composite index
+	//     matching the operator-list ORDER BY tuple.
+	var hasObsActivePartial bool
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		return tx.QueryRow(ctx,
+			`SELECT EXISTS (
+				SELECT 1 FROM pg_indexes
+				 WHERE indexname = 'certificate_observations_org_cert_active_idx'
+				   AND indexdef ILIKE '%where (removed_at IS NULL)%')`,
+		).Scan(&hasObsActivePartial)
+	}); err != nil {
+		t.Fatalf("probe certificate_observations_org_cert_active_idx: %v", err)
+	}
+	if !hasObsActivePartial {
+		t.Error("certificate_observations_org_cert_active_idx missing or no longer partial on WHERE removed_at IS NULL")
+	}
+
+	for _, idx := range []string{
+		"certificates_org_last_seen_idx",
+	} {
+		var exists bool
+		if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx,
+				`SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = $1)`, idx,
+			).Scan(&exists)
+		}); err != nil {
+			t.Fatalf("probe index %s: %v", idx, err)
+		}
+		if !exists {
+			t.Errorf("H-024A index %s missing", idx)
+		}
+	}
+
+	// schema_migrations version must reflect the H-024A
+	// migration. Pinned so a future binary that ships without
+	// running 0008 surfaces here rather than mid-recompute.
+	if version < 8 {
+		t.Errorf("schema_migrations max version = %d; want >= 8 (H-024A)", version)
+	}
 }
 
 // TestCertificateDedupByFingerprint confirms two UpsertCertificate
