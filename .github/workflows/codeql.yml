@@ -55,12 +55,6 @@ jobs:
           # security-extended is tighter than default, less noisy than
           # security-and-quality. Start tight; expand if signal is good.
           queries: security-extended
-          # Path-ignore for the certificate-inventory fixture package
-          # lives in this config. CodeQL cannot express
-          # per-(path, query) exclusions, so the directory is the
-          # narrowest unit available. See
-          # .github/codeql/codeql-config.yml for the rationale.
-          config-file: ./.github/codeql/codeql-config.yml
 
       - name: Build Go modules (manual for CodeQL)
         if: matrix.language == 'go'

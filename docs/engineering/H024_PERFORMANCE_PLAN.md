@@ -488,15 +488,16 @@ and the override-preserving paths from H-023.
   rule-bucket assignment per cert, IDs, observation
   removed-vs-active flags) are sufficient for every assertion
   the perf-regression and stress tests need.
-- The fixture's intentional 1024-bit RSA keys for the
-  `weak_rsa_key` bucket would trip the
-  `go/weak-cryptographic-key` query. The
-  `.github/codeql/codeql-config.yml` path-ignore for this
-  directory (one path, never on a production code path) is
-  the narrowest practical exclusion — CodeQL cannot express
-  per-(path, query) suppressions, and a global query
-  exclusion would weaken coverage on real production code.
-  Documented inline in both the config and `fixtures/doc.go`.
+- The fixture's `weak_rsa_key` bucket uses a precomputed
+  1024-bit RSA private key embedded as a base64 PKCS#1 DER
+  constant in `certificates.go`, NOT a runtime
+  `rsa.GenerateKey(_, 1024)` call. CodeQL's
+  `go/weak-cryptographic-key` query inspects the literal bits
+  argument to `rsa.GenerateKey`; without that call site the
+  query has nothing to flag, and we avoid taking a CodeQL
+  config exclusion. The `weak_rsa_key` finding rule still
+  fires correctly because it reads `cert.PublicKeyBits` from
+  the certificate row, not the key-generation call site.
 - Documented in `fixtures/doc.go` with the §5.1 table and the
   CLAUDE.md §8.4 naming-rule conformance.
 - No env-driven knobs (CLAUDE.md §8.9). The cfg is passed

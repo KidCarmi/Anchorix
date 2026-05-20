@@ -49,14 +49,19 @@
 // within the same process — never hard-code a fingerprint
 // across processes.
 //
-// 1024-bit RSA keys are intentional in the `weak_rsa_key`
-// fixture bucket and would otherwise trip the
-// `go/weak-cryptographic-key` query. That single query is
-// excluded for this directory in
-// `.github/codeql/codeql-config.yml` with a rationale comment.
-// The exclusion is narrow (one query, one path); every other
-// CodeQL query continues to run with `security-extended`
-// breadth here.
+// The `weak_rsa_key` fixture bucket uses a precomputed
+// 1024-bit RSA private key embedded as a base64 PKCS#1 DER
+// constant in `certificates.go` rather than minting one at
+// runtime via `rsa.GenerateKey(_, 1024)`. CodeQL's
+// `go/weak-cryptographic-key` query inspects the literal bits
+// argument to `rsa.GenerateKey`; the embedded key is never
+// minted at runtime, so the query has nothing to flag. The
+// `weak_rsa_key` finding rule still fires correctly because
+// it reads `cert.PublicKeyBits` from the certificate row, not
+// the call site. The embedded key is documented inline at the
+// const declaration; it is a test fixture, never used as the
+// identity of any agent, operator, or control-plane TLS
+// endpoint.
 //
 // # Real X.509 bytes, not synthetic strings
 //

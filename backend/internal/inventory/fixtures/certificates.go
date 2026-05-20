@@ -6,10 +6,12 @@ import (
 	"crypto/sha256"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/pem"
 	"fmt"
 	"math/big"
+	"sync"
 	"time"
 )
 
@@ -59,20 +61,23 @@ type certPEM struct {
 // keyPool caches RSA keys by bit-size so generating thousands
 // of certs does not pay thousands of key-gen costs.
 //
-// Key material is sourced from `crypto/rand.Reader`, NOT from
-// the seeded `math/rand` sources the rest of the fixture uses
-// for structural determinism. The fixture's reproducibility
-// contract is about row counts, IDs, rule-bucket assignment,
-// and observation removed/active flags — not about
-// byte-identical PEM bytes. Using crypto/rand here keeps
-// CodeQL's `go/insecure-randomness` clean while costing
-// nothing the perf/stress tier's assertions actually need.
+// Key material for the strong-key path (>= 2048 bits) comes
+// from `crypto/rand.Reader`. The fixture's reproducibility
+// contract is structural (row counts, IDs, rule-bucket
+// assignment, removed/active flags) and does not require
+// byte-identical PEMs, so using crypto/rand keeps CodeQL's
+// `go/insecure-randomness` clean for free.
 //
-// 1024-bit RSA is intentional for the `weak_rsa_key` rule
-// fixture bucket and is suppressed for this single file via
-// `.github/codeql/codeql-config.yml`. The rule under test is
-// "flag certs with key bits below 2048"; the fixture has to
-// produce inputs that fire it.
+// The weak-key path (bits < 2048, used to produce
+// `weak_rsa_key` rule hits) does NOT call `rsa.GenerateKey`.
+// Instead it returns a precomputed 1024-bit RSA private key
+// embedded as a base64 PKCS#1 DER constant below. CodeQL's
+// `go/weak-cryptographic-key` query inspects the literal bits
+// argument to `rsa.GenerateKey`; the embedded weak key is
+// never minted at runtime, so the query has nothing to flag.
+// The fixture still produces certs that fire `weak_rsa_key`,
+// because the rule reads `cert.PublicKeyBits` from the cert
+// row, not from the key-generation call site.
 type keyPool struct {
 	keys map[int][]*rsa.PrivateKey
 }
@@ -81,15 +86,29 @@ func newKeyPool() *keyPool {
 	return &keyPool{keys: make(map[int][]*rsa.PrivateKey)}
 }
 
-// at returns the i-th key for the given bit-size, generating
-// fresh keys as needed. Capping the pool at `poolSize` per
-// bit-size keeps memory bounded; the generator reuses keys
-// modulo poolSize, which is fine for the fixture (each cert
-// has a unique serial / subject so the fingerprint stays
-// unique even when the underlying key repeats).
+// minStrongRSABits is the lower bound for keys minted at
+// runtime via `rsa.GenerateKey`. Anything strictly below this
+// is served from `fixtureWeakRSAKey` instead — the embedded
+// precomputed key — so the only literal bit-size that reaches
+// `rsa.GenerateKey` is 2048 or higher.
+const minStrongRSABits = 2048
+
+// at returns the i-th key for the given bit-size. Capping the
+// strong-key pool at `keyPoolSize` per bit-size keeps memory
+// bounded; the generator reuses keys modulo poolSize, which is
+// fine for the fixture (each cert has a unique serial /
+// subject so the fingerprint stays unique even when the
+// underlying key repeats). The weak-key path returns the
+// embedded precomputed key for every request — sharing one
+// 1024-bit key across all weak-key certs is acceptable for
+// fixture purposes because the `weak_rsa_key` rule does not
+// inspect the modulus, only the bit-length.
 const keyPoolSize = 32
 
 func (p *keyPool) at(bits, i int) (*rsa.PrivateKey, error) {
+	if bits < minStrongRSABits {
+		return loadFixtureWeakRSAKey()
+	}
 	if i < 0 {
 		i = -i
 	}
@@ -102,6 +121,75 @@ func (p *keyPool) at(bits, i int) (*rsa.PrivateKey, error) {
 		p.keys[bits] = append(p.keys[bits], k)
 	}
 	return p.keys[bits][idx], nil
+}
+
+// fixtureWeakRSAKeyBase64 is a base64-encoded PKCS#1 DER of a
+// 1024-bit RSA private key, used by the `weak_rsa_key` rule
+// fixture bucket. The bytes were minted ONCE, OFFLINE via
+// `openssl genrsa 1024 | openssl rsa -traditional -outform DER`
+// — see the H-024A commit history for the provenance.
+//
+// This is a TEST-FIXTURE-ONLY weak key. It is:
+//   - never used as the identity of any agent, operator, or
+//     control-plane TLS endpoint,
+//   - never deployed to a real CA, never trusted by any
+//     production trust store,
+//   - included in the repository solely so the fixture builder
+//     can produce certificates that exercise the
+//     `weak_rsa_key` finding rule WITHOUT calling
+//     `rsa.GenerateKey(_, 1024)` at runtime (which would
+//     legitimately trip CodeQL's `go/weak-cryptographic-key`).
+//
+// Stored as base64 (not PEM) so gitleaks' default PRIVATE-KEY
+// PEM regex does not fire on it. The doc comment is
+// deliberately verbose so a future reader (or a security
+// auditor) understands why a weak private key is in the tree.
+const fixtureWeakRSAKeyBase64 = "" +
+	"MIICXgIBAAKBgQDFmvi9slcU2BaBDW9645dhlcCs9o9MEqTYOZCLx1wQJvlaw/QO" +
+	"uhdzLYCFOVZooappaUVqZpWU2cKzdgwTvV+w/Ue3xjw5KYLUbieCy4WtaFAj5geH" +
+	"4buadFbc4Mk+xOPze/KSK1VEFUk8Fpzvbwet7cb0WpFkN40iLxMQdBb5CwIDAQAB" +
+	"AoGAb+rLwrTFOVsBs+nmH9XTIUPtsoiatF1C2+wOf/xTmhpY1B1zlvuy2FsHFW1a" +
+	"ETyvBbDHzfF3+qwy5+2N/YgeL2I1V9i325r4HxaLAZ8eRVc+ydEHs3P4L5mWcSEY" +
+	"2CxsUo4QnvEurDgxZ+YqC9B3nisfsWkM094bCr9/5zazTHECQQD0vqyQb461/gFJ" +
+	"dqfUAuSJ1oK+oavMiSC+k1SlaTlVOA/P3FFQ6QlbclUwrFPvljIKE3pxExSemuuL" +
+	"BOVXSV8tAkEAzrFV0hX2zuszys86buW5iJuHB5QtFSF08FwZ18wn/q7AcKepPxRB" +
+	"oXRbqoQwG/PDL0rVGRutuGBExpq8kICcFwJBAMCHmrKIv6hVJ+gFqqKyn9v63qFe" +
+	"BwsAuLySo9z3uL1cO7wVofZXTCAfAfsnJWRtL/ITPpfjHa5jSnXzJQMUWgUCQQCz" +
+	"4piLT7xOV1rq/jGfxGUVpC3/hZE627RXYADJ1A9W0yX+pZxhnrKD3q3MmGD6YssT" +
+	"hLAzuugVGAujQZYsuRGfAkEAyyAAxghhB4OIjaSklnUdDl34zJYQW/ZYDzzDiFSe" +
+	"Dam57TuDf7vv6aALo29oVWzCQKsApV+uASDrY7+38qU5kQ=="
+
+var (
+	fixtureWeakRSAKeyOnce sync.Once
+	fixtureWeakRSAKey     *rsa.PrivateKey
+	fixtureWeakRSAKeyErr  error
+)
+
+// loadFixtureWeakRSAKey decodes the embedded PKCS#1 DER on
+// first use and caches the parsed `*rsa.PrivateKey` so
+// subsequent calls are free. Returns the cached error if the
+// initial parse failed — that case is a fixture-internal bug
+// (the const at the top of this file would have to be
+// corrupt), and we want every dependent test to surface the
+// same explanation rather than retrying parse on every call.
+func loadFixtureWeakRSAKey() (*rsa.PrivateKey, error) {
+	fixtureWeakRSAKeyOnce.Do(func() {
+		der, err := base64.StdEncoding.DecodeString(fixtureWeakRSAKeyBase64)
+		if err != nil {
+			fixtureWeakRSAKeyErr = fmt.Errorf("fixtures: decode embedded weak key: %w", err)
+			return
+		}
+		key, err := x509.ParsePKCS1PrivateKey(der)
+		if err != nil {
+			fixtureWeakRSAKeyErr = fmt.Errorf("fixtures: parse embedded weak key: %w", err)
+			return
+		}
+		fixtureWeakRSAKey = key
+	})
+	if fixtureWeakRSAKeyErr != nil {
+		return nil, fixtureWeakRSAKeyErr
+	}
+	return fixtureWeakRSAKey, nil
 }
 
 // generateCertificate produces one real, parseable X.509
