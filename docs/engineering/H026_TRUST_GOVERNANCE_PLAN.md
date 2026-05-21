@@ -637,15 +637,22 @@ CREATE TABLE certificate_ownership_overrides (
     cleared_at          TIMESTAMPTZ,
     cleared_by          TEXT,
     cleared_reason      TEXT,
-    UNIQUE (organization_id, certificate_id, cleared_at)        -- only one active override per cert
-        WHERE cleared_at IS NULL,
     FOREIGN KEY (organization_id, certificate_id) REFERENCES certificates(organization_id, id) ON DELETE CASCADE,
     FOREIGN KEY (organization_id, service_id) REFERENCES services(organization_id, id) ON DELETE RESTRICT
 );
+
+-- Partial uniqueness must be a unique index, not a table constraint:
+-- PostgreSQL only supports the WHERE predicate on CREATE [UNIQUE] INDEX.
+CREATE UNIQUE INDEX certificate_ownership_overrides_active_idx
+    ON certificate_ownership_overrides(organization_id, certificate_id)
+    WHERE cleared_at IS NULL;
+-- Enforces "one active override per cert" while keeping history rows.
 ```
 
-- The unique constraint with `WHERE cleared_at IS NULL` enforces
-  "one active override per cert" while keeping history.
+- The partial unique index above enforces "one active override per
+  cert" while keeping cleared rows for history. A constraint-level
+  `UNIQUE (...) WHERE …` would not be accepted by PostgreSQL — the
+  predicate is index-level only.
 - An override always wins — engine precedence tier "explicit"
   (§4.2) is the override path.
 - Clearing an override produces a soft-delete row (set
@@ -744,14 +751,19 @@ CREATE TABLE policy_assignments (
     assigned_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
     cleared_at               TIMESTAMPTZ,
     cleared_by               TEXT,
-    UNIQUE (organization_id, policy_definition_id, scope_kind, scope_id, cleared_at)
-        WHERE cleared_at IS NULL,
     FOREIGN KEY (organization_id, policy_definition_id) REFERENCES policy_definitions(organization_id, id) ON DELETE RESTRICT
 );
+
+-- Partial uniqueness must be a unique index, not a table constraint.
+CREATE UNIQUE INDEX policy_assignments_active_idx
+    ON policy_assignments(organization_id, policy_definition_id, scope_kind, scope_id)
+    WHERE cleared_at IS NULL;
+-- Enforces "one active assignment per (definition, scope)" while keeping cleared history.
 
 CREATE INDEX policy_assignments_org_scope_idx
     ON policy_assignments(organization_id, scope_kind, scope_id)
     WHERE cleared_at IS NULL;
+-- Backs "which policies apply to this scope?" lookups during recompute.
 ```
 
 - An assignment binds one policy definition to one scope.
@@ -777,10 +789,14 @@ CREATE TABLE policy_waivers (
     expires_at               TIMESTAMPTZ NOT NULL,              -- non-NULL; waivers MUST expire
     cleared_at               TIMESTAMPTZ,
     cleared_by               TEXT,
-    UNIQUE (organization_id, policy_definition_id, policy_rule_local_id, scope_kind, scope_id, cleared_at)
-        WHERE cleared_at IS NULL,
     FOREIGN KEY (organization_id, policy_definition_id) REFERENCES policy_definitions(organization_id, id) ON DELETE RESTRICT
 );
+
+-- Partial uniqueness must be a unique index, not a table constraint.
+CREATE UNIQUE INDEX policy_waivers_active_idx
+    ON policy_waivers(organization_id, policy_definition_id, policy_rule_local_id, scope_kind, scope_id)
+    WHERE cleared_at IS NULL;
+-- Enforces "one active waiver per (rule, scope)" while keeping cleared history.
 ```
 
 - Waivers are **rule-scoped, time-bounded** exceptions. A waiver
@@ -853,11 +869,12 @@ All indexes are intentional and documented inline per CLAUDE.md
 | `certificate_ownership (organization_id, certificate_id)` PK                                | Single-cert lookup.                                              |
 | `certificate_ownership (organization_id, service_id)`                                       | "All certs this service owns."                                    |
 | `certificate_ownership (organization_id, decision)`                                         | "Show me unowned / ambiguous certs."                             |
-| `certificate_ownership_overrides (organization_id, certificate_id, cleared_at)` partial UNIQUE WHERE cleared_at IS NULL | One active override per cert.                |
+| `certificate_ownership_overrides_active_idx` — partial UNIQUE INDEX on `(organization_id, certificate_id) WHERE cleared_at IS NULL` | One active override per cert (history kept). |
 | `ownership_match_explanations (organization_id, certificate_id, decided_at DESC)`           | Explanation timeline per cert.                                    |
 | `policy_definitions (organization_id, slug, version)` UNIQUE                                | Versioned slug lookup.                                            |
+| `policy_assignments_active_idx` — partial UNIQUE INDEX on `(organization_id, policy_definition_id, scope_kind, scope_id) WHERE cleared_at IS NULL` | One active assignment per `(definition, scope)`. |
 | `policy_assignments (organization_id, scope_kind, scope_id)` partial idx WHERE cleared_at IS NULL | "Which policies apply to this scope?"                   |
-| `policy_waivers (organization_id, policy_definition_id, policy_rule_local_id, scope_kind, scope_id, cleared_at)` partial UNIQUE WHERE cleared_at IS NULL | One active waiver per `(rule, scope)`. |
+| `policy_waivers_active_idx` — partial UNIQUE INDEX on `(organization_id, policy_definition_id, policy_rule_local_id, scope_kind, scope_id) WHERE cleared_at IS NULL` | One active waiver per `(rule, scope)`. |
 | `governance_recompute_runs (organization_id, kind, started_at DESC)`                        | Recent runs per org per kind.                                     |
 
 ---
@@ -1561,7 +1578,6 @@ All within the existing canonical envelope. New codes:
 | `tag_in_use`                      | 409  | Cannot disable a tag still attached to targets.                       |
 | `service_in_use`                  | 409  | Cannot disable a service still referenced by ownership rules / overrides. |
 | `service_group_has_children`      | 409  | Cannot disable a group with active children.                          |
-| `ownership_rule_cycle`            | 400  | (Reserved — rule sets cannot self-reference; placeholder.)            |
 | `service_group_cycle`             | 400  | Proposed parent would create a cycle.                                 |
 | `policy_definition_in_use`        | 409  | Cannot disable a published policy with active assignments.            |
 | `policy_waiver_expired_required`  | 400  | Waiver `expires_at` is required and must be > now.                    |
