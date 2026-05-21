@@ -32,12 +32,12 @@ const (
 // CertificateLister / Transactor types directly (CLAUDE.md §8.6,
 // §8.8).
 type Service struct {
-	repo                 Repository
-	certs                CertificateLister
-	tx                   Transactor
-	audit                audit.Recorder
-	clock                clock.Clock
-	rules                []Rule
+	repo                  Repository
+	certs                 CertificateLister
+	tx                    Transactor
+	audit                 audit.Recorder
+	clock                 clock.Clock
+	rules                 []Rule
 	streamingPageOverride int
 }
 
@@ -110,6 +110,8 @@ func (s *Service) effectiveStreamingPageSize() int {
 	}
 	return recomputeStreamingPageSize
 }
+
+// SchedulerActorID is the value the scheduled-recompute path
 // records in the audit row's `actor` column. ActorType is then
 // "system" (the scheduler is not a user). Stable string so
 // operators can filter `audit_events.actor = 'scheduler'` to
