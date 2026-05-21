@@ -11,7 +11,7 @@ import (
 
 	"github.com/kidcarmi/anchorix/backend/internal/audit"
 	"github.com/kidcarmi/anchorix/backend/internal/clock"
-	"github.com/kidcarmi/anchorix/backend/internal/ids"
+	"github.com/kidcarmi/anchorix/backend/internal/inventory"
 )
 
 // Defaults / bounds for cursor-paginated GET /findings. Match
@@ -189,25 +189,24 @@ func (s *Service) RecomputeScheduled(ctx context.Context, organizationID string)
 // (actor, actorType) pair. The split keeps Recompute /
 // RecomputeScheduled as thin API surfaces and centralizes the
 // lock+diff+audit orchestration.
+//
+// H-024B: the production path is `runDiffStreaming` under
+// `WithTxLockedFindingsRepeatableRead`. The legacy load-all
+// path stays in-tree behind RecomputeLegacyLoadAll for the
+// byte-identical equivalence test; the cleanup PR after the
+// H-024B soak removes both.
 func (s *Service) recomputeWithActor(
 	ctx context.Context,
 	organizationID, actor, actorType string,
 ) (*RecomputeResult, error) {
 	now := s.clock.Now()
 	var result RecomputeResult
-	if err := s.tx.WithTxLockedFindings(ctx, organizationID, func(ctx context.Context) error {
-		evaluated, opened, updated, resolved, unchanged, err := s.runDiff(ctx, organizationID, now)
+	if err := s.tx.WithTxLockedFindingsRepeatableRead(ctx, organizationID, func(ctx context.Context) error {
+		summary, err := s.runDiffStreaming(ctx, organizationID, now)
 		if err != nil {
 			return err
 		}
-		result = RecomputeResult{
-			EvaluatedCertificates: evaluated,
-			Opened:                opened,
-			Updated:               updated,
-			Resolved:              resolved,
-			Unchanged:             unchanged,
-			RuleCount:             len(s.rules),
-		}
+		result = summary.toRecomputeResult(len(s.rules))
 		if err := s.recordRecomputeAudit(ctx, organizationID, actor, actorType, &result, now); err != nil {
 			return err
 		}
@@ -218,28 +217,101 @@ func (s *Service) recomputeWithActor(
 	return &result, nil
 }
 
-// runDiff executes the rule pass and applies the diff. Pulled
-// out of Recompute so the orchestration sits in one tx callback
-// and Recompute itself stays focused on the audit + result
-// shaping.
-func (s *Service) runDiff(
+// RecomputeLegacyLoadAll runs the pre-H-024B load-all
+// recompute path under `WithTxLockedFindings` (READ COMMITTED).
+// Kept exported so the H-024B byte-identical equivalence test
+// in `backend/test/integration/` can drive it side-by-side
+// with the streaming path against the same Smallv01 fixture.
+//
+// NOT used by production traffic — `Recompute` and
+// `RecomputeScheduled` always invoke the streaming variant
+// under REPEATABLE READ. Will be removed by the cleanup PR
+// after H-024B soaks (per H024_PERFORMANCE_PLAN.md §9.B item
+// 3); no other caller should depend on it.
+//
+// Same audit envelope as Recompute: ONE `findings.recomputed`
+// row with the supplied actor/actorType. Audit failure rolls
+// back the diff. Use only with the operator's own user id (or
+// SchedulerActorID for the scheduler-driven legacy path,
+// which exists only for completeness — the scheduler uses
+// RecomputeScheduled).
+func (s *Service) RecomputeLegacyLoadAll(ctx context.Context, in RecomputeInput) (*RecomputeResult, error) {
+	if strings.TrimSpace(in.OrganizationID) == "" {
+		return nil, fmt.Errorf("%w: organization id required", ErrInvalidRecomputeInput)
+	}
+	actor := strings.TrimSpace(in.ActorUserID)
+	actorType := "user"
+	if actor == "" {
+		actor = "system"
+		actorType = "system"
+	}
+	now := s.clock.Now()
+	var result RecomputeResult
+	if err := s.tx.WithTxLockedFindings(ctx, in.OrganizationID, func(ctx context.Context) error {
+		summary, err := s.runDiffLoadAll(ctx, in.OrganizationID, now)
+		if err != nil {
+			return err
+		}
+		result = summary.toRecomputeResult(len(s.rules))
+		if err := s.recordRecomputeAudit(ctx, in.OrganizationID, actor, actorType, &result, now); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return &result, nil
+}
+
+// diffSummary is the orchestration-layer return value from
+// the two runDiff variants. The counter layout matches
+// RecomputeResult.toRecomputeResult derives the public shape
+// from this internal one.
+type diffSummary struct {
+	evaluatedCertificates int
+	loadedCertificates    int
+	loadedFindings        int
+	counters              [4]int
+}
+
+func (d diffSummary) toRecomputeResult(ruleCount int) RecomputeResult {
+	return RecomputeResult{
+		EvaluatedCertificates: d.evaluatedCertificates,
+		Opened:                d.counters[counterOpened],
+		Updated:               d.counters[counterUpdated],
+		Resolved:              d.counters[counterResolved],
+		Unchanged:             d.counters[counterUnchanged],
+		RuleCount:             ruleCount,
+		LoadedCertificates:    d.loadedCertificates,
+		LoadedFindings:        d.loadedFindings,
+	}
+}
+
+// runDiffLoadAll is the legacy load-all diff algorithm. Kept
+// in-tree until the post-H-024B soak cleanup PR so the
+// byte-identical equivalence test in the integration suite
+// can drive both implementations against the same fixture and
+// compare the resulting `findings` table state.
+//
+// The behaviour is byte-equivalent to the original H-021
+// implementation — the per-(cert, rule) decisions are
+// delegated to decideMatchTransition / decideNoMatchTransition
+// (service_diff.go), and the orchestration loops match the
+// pre-H-024B shape exactly. Refactoring through the shared
+// helpers is what guarantees this path and runDiffStreaming
+// produce identical final state for the same input.
+func (s *Service) runDiffLoadAll(
 	ctx context.Context,
 	organizationID string,
 	now time.Time,
-) (evaluated, opened, updated, resolved, unchanged int, err error) {
+) (diffSummary, error) {
 	certs, err := s.certs.ListAllCertificateSummariesForOrg(ctx, organizationID)
 	if err != nil {
-		return 0, 0, 0, 0, 0, fmt.Errorf("findings: list certificates: %w", err)
+		return diffSummary{}, fmt.Errorf("findings: list certificates: %w", err)
 	}
-	evaluated = len(certs)
 
 	// Build the rule-match set keyed by (cert_id, rule_id).
-	type matchKey struct{ certID, ruleID string }
-	type match struct {
-		rule  Rule
-		match *RuleMatch
-	}
-	matches := make(map[matchKey]match)
+	matches := make(map[matchKey]matchEntry)
 	for i := range certs {
 		cert := &certs[i]
 		for _, rule := range s.rules {
@@ -247,16 +319,14 @@ func (s *Service) runDiff(
 			if m == nil {
 				continue
 			}
-			matches[matchKey{cert.ID, rule.ID()}] = match{rule: rule, match: m}
+			matches[matchKey{cert.ID, rule.ID()}] = matchEntry{rule: rule, match: m}
 		}
 	}
 
-	// Load every existing finding (open + resolved) for the org.
-	// At v0.1 scale this is a small set; at findings-era scale
-	// it gets paginated. See HARDENING_BACKLOG.
+	// Load every existing finding for the org.
 	existing, err := s.repo.ListAllForOrg(ctx, organizationID)
 	if err != nil {
-		return 0, 0, 0, 0, 0, fmt.Errorf("findings: list existing: %w", err)
+		return diffSummary{}, fmt.Errorf("findings: list existing: %w", err)
 	}
 	existingByKey := make(map[matchKey]*Finding, len(existing))
 	for i := range existing {
@@ -264,181 +334,210 @@ func (s *Service) runDiff(
 		existingByKey[matchKey{f.CertificateID, f.RuleID}] = f
 	}
 
+	var counters [4]int
+
 	// Apply matches first (insert / update / reopen).
 	for k, m := range matches {
-		prior, hasPrior := existingByKey[k]
-		switch {
-		case !hasPrior:
-			newID := ids.New()
-			if err := s.repo.InsertFinding(ctx, &Finding{
-				ID:             newID,
-				OrganizationID: organizationID,
-				CertificateID:  k.certID,
-				RuleID:         k.ruleID,
-				RuleVersion:    m.rule.Version(),
-				Severity:       m.rule.Severity(),
-				Status:         StatusOpen,
-				Title:          m.rule.Title(),
-				Evidence:       m.match.Evidence,
-				FirstSeenAt:    now,
-				LastSeenAt:     now,
-				ResolvedAt:     nil,
-				UpdatedAt:      now,
-			}); err != nil {
-				return 0, 0, 0, 0, 0, fmt.Errorf("findings: insert: %w", err)
-			}
-			opened++
-		case prior.Status == StatusOpen:
-			prior.LastSeenAt = now
-			prior.UpdatedAt = now
-			prior.Severity = m.rule.Severity()
-			prior.Title = m.rule.Title()
-			prior.RuleVersion = m.rule.Version()
-			prior.Evidence = m.match.Evidence
-			if err := s.repo.UpdateFinding(ctx, prior); err != nil {
-				return 0, 0, 0, 0, 0, fmt.Errorf("findings: update: %w", err)
-			}
-			updated++
-		case prior.Status == StatusResolved:
-			// resolved → reopen: rule matches again, lift the
-			// finding back into the operator-visible state.
-			// `opened_at` (= FirstSeenAt) is intentionally NOT
-			// touched here — it preserves the original detection
-			// moment across resolve/reopen cycles.
-			prior.Status = StatusOpen
-			prior.LastSeenAt = now
-			prior.UpdatedAt = now
-			prior.ResolvedAt = nil
-			prior.Severity = m.rule.Severity()
-			prior.Title = m.rule.Title()
-			prior.RuleVersion = m.rule.Version()
-			prior.Evidence = m.match.Evidence
-			if err := s.repo.UpdateFinding(ctx, prior); err != nil {
-				return 0, 0, 0, 0, 0, fmt.Errorf("findings: reopen: %w", err)
-			}
-			opened++
-		case prior.Status == StatusAcknowledged:
-			// acknowledged + rule still matches: stay
-			// acknowledged. Bump the rule-derived fields so
-			// last_seen_at + evidence + rule_version reflect
-			// the current evaluation, but PRESERVE the
-			// operator's override metadata (status_reason,
-			// status_actor, status_changed_at).
-			prior.LastSeenAt = now
-			prior.UpdatedAt = now
-			prior.Severity = m.rule.Severity()
-			prior.Title = m.rule.Title()
-			prior.RuleVersion = m.rule.Version()
-			prior.Evidence = m.match.Evidence
-			if err := s.repo.UpdateFinding(ctx, prior); err != nil {
-				return 0, 0, 0, 0, 0, fmt.Errorf("findings: update acknowledged: %w", err)
-			}
-			updated++
-		case prior.Status == StatusSuppressed:
-			// suppressed + rule still matches: either stay
-			// suppressed (not expired) or reopen (expired).
-			// `now` is the recompute's anchor — we compare
-			// against the operator-set SuppressExpiresAt
-			// strictly (>=) so a suppression that expires
-			// EXACTLY at `now` is considered expired and the
-			// finding reopens.
-			if prior.SuppressExpiresAt != nil && !now.Before(*prior.SuppressExpiresAt) {
-				// Suppression expired: reopen to `open` and
-				// clear the override metadata so the row no
-				// longer claims operator intent. The audit
-				// history of the original suppression remains
-				// in audit_events.
-				prior.Status = StatusOpen
-				prior.LastSeenAt = now
-				prior.UpdatedAt = now
-				prior.ResolvedAt = nil
-				prior.Severity = m.rule.Severity()
-				prior.Title = m.rule.Title()
-				prior.RuleVersion = m.rule.Version()
-				prior.Evidence = m.match.Evidence
-				prior.StatusReason = ""
-				prior.StatusActor = ""
-				prior.StatusChangedAt = nil
-				prior.SuppressExpiresAt = nil
-				if err := s.repo.UpdateFinding(ctx, prior); err != nil {
-					return 0, 0, 0, 0, 0, fmt.Errorf("findings: reopen expired suppression: %w", err)
-				}
-				opened++
-				break
-			}
-			// Not expired (or no expiry): stay suppressed,
-			// PRESERVE the override metadata.
-			prior.LastSeenAt = now
-			prior.UpdatedAt = now
-			prior.Severity = m.rule.Severity()
-			prior.Title = m.rule.Title()
-			prior.RuleVersion = m.rule.Version()
-			prior.Evidence = m.match.Evidence
-			if err := s.repo.UpdateFinding(ctx, prior); err != nil {
-				return 0, 0, 0, 0, 0, fmt.Errorf("findings: update suppressed: %w", err)
-			}
-			updated++
-		default:
-			// Any status outside open / resolved /
-			// acknowledged / suppressed is unexpected. Fail
-			// loudly so a future status addition (the
-			// schema's CHECK constraint is permissive enough
-			// to accept new strings via an upcoming migration)
-			// is forced to extend this switch explicitly.
-			return 0, 0, 0, 0, 0, fmt.Errorf(
-				"%w: finding %s has status %q (rule still matches)",
-				ErrUnsupportedFindingStatus, prior.ID, prior.Status,
-			)
+		prior := existingByKey[k]
+		next, op, bucket, err := decideMatchTransition(prior, organizationID, k.certID, m.rule, m.match, now)
+		if err != nil {
+			return diffSummary{}, err
 		}
+		if err := applyDecision(ctx, s.repo, next, op); err != nil {
+			return diffSummary{}, fmt.Errorf("findings: apply match diff: %w", err)
+		}
+		counters[bucket]++
 	}
 
-	// Then walk existing rows that did NOT match. open / ack /
-	// suppressed all become resolved (rule no longer fires —
-	// nothing to override). resolved stays resolved (unchanged).
+	// Then walk existing rows that did NOT match.
 	for k, f := range existingByKey {
 		if _, matched := matches[k]; matched {
 			continue
 		}
-		switch f.Status {
-		case StatusOpen:
-			resolvedAt := now
-			f.Status = StatusResolved
-			f.ResolvedAt = &resolvedAt
-			f.UpdatedAt = now
-			if err := s.repo.UpdateFinding(ctx, f); err != nil {
-				return 0, 0, 0, 0, 0, fmt.Errorf("findings: resolve: %w", err)
-			}
-			resolved++
-		case StatusAcknowledged, StatusSuppressed:
-			// acknowledged / suppressed + rule no longer
-			// matches: the underlying problem is gone, so the
-			// operator override is moot. Resolve the finding
-			// AND clear the override metadata so the row's
-			// current state reflects "nothing here, nothing to
-			// override". Audit history of the original
-			// override remains in audit_events.
-			resolvedAt := now
-			f.Status = StatusResolved
-			f.ResolvedAt = &resolvedAt
-			f.UpdatedAt = now
-			f.StatusReason = ""
-			f.StatusActor = ""
-			f.StatusChangedAt = nil
-			f.SuppressExpiresAt = nil
-			if err := s.repo.UpdateFinding(ctx, f); err != nil {
-				return 0, 0, 0, 0, 0, fmt.Errorf("findings: resolve overridden: %w", err)
-			}
-			resolved++
-		case StatusResolved:
-			unchanged++
-		default:
-			return 0, 0, 0, 0, 0, fmt.Errorf(
-				"%w: finding %s has status %q (rule no longer matches)",
-				ErrUnsupportedFindingStatus, f.ID, f.Status,
-			)
+		next, op, bucket, err := decideNoMatchTransition(f, now)
+		if err != nil {
+			return diffSummary{}, err
+		}
+		if err := applyDecision(ctx, s.repo, next, op); err != nil {
+			return diffSummary{}, fmt.Errorf("findings: apply no-match diff: %w", err)
+		}
+		counters[bucket]++
+	}
+
+	return diffSummary{
+		evaluatedCertificates: len(certs),
+		loadedCertificates:    len(certs),
+		loadedFindings:        len(existing),
+		counters:              counters,
+	}, nil
+}
+
+// recomputeStreamingPageSize is the page-size knob for the
+// H-024B streaming diff. 500 is a deliberate trade-off: large
+// enough that round-trip latency does not dominate; small
+// enough that per-page memory (cert summaries + per-page
+// finding rows + per-page rule matches) stays in the
+// low-megabytes range at fleet scale. The page-size choice is
+// internal; callers do not see it. If pilot-tier measurements
+// surface a different sweet spot, this is the one constant to
+// tune.
+const recomputeStreamingPageSize = 500
+
+// runDiffStreaming is the H-024B production diff algorithm.
+// Walks the org's certificates and existing findings in
+// fixed-size pages so peak memory stays bounded by
+// recomputeStreamingPageSize × (cert summary + finding row).
+// The full match map is still built in memory (it is bounded
+// by the rule-match cardinality, which is a subset of the
+// (cert × rule) cross product and typically far smaller than
+// the cert table itself), but the bulky per-finding `Evidence`
+// JSON is never loaded into a long-lived structure.
+//
+// Algorithm (three phases):
+//
+//  1. Page through CERTS by id ASC. For each cert × rule,
+//     evaluate the rule. Matches accumulate into the
+//     `matches` map keyed by (cert_id, rule_id).
+//
+//  2. Page through EXISTING FINDINGS by id ASC. For each
+//     finding, look up its (cert_id, rule_id) in `matches`:
+//
+//     - present → decideMatchTransition(prior, rule, match)
+//     and delete the entry from `matches` so phase 3 only
+//     sees never-existed-before matches.
+//     - absent  → decideNoMatchTransition(prior).
+//
+//  3. Remaining entries in `matches` have no prior finding,
+//     so they're brand-new INSERTs.
+//
+// State-machine equivalence with runDiffLoadAll comes from
+// both paths delegating to the SAME pure helpers
+// (decideMatchTransition / decideNoMatchTransition). The
+// orchestration differs (paged vs in-memory) but the
+// per-(cert, rule) decisions are byte-equivalent.
+//
+// Snapshot isolation: the calling tx is opened at REPEATABLE
+// READ via WithTxLockedFindingsRepeatableRead (Transactor
+// interface). Without that, the multiple paginated SELECTs
+// inside this function could each see a different snapshot
+// when a concurrent ingestion batch commits, breaking the
+// determinism guarantee CERTIFICATE_FINDINGS.md §5 commits
+// to.
+func (s *Service) runDiffStreaming(
+	ctx context.Context,
+	organizationID string,
+	now time.Time,
+) (diffSummary, error) {
+	// Phase 1: page through certs, build matches map.
+	matches := make(map[matchKey]matchEntry)
+	totalCerts := 0
+	certCursor := ""
+	for {
+		page, err := s.certs.ListCertificateBareSummariesForOrgPaged(ctx, organizationID, certCursor, recomputeStreamingPageSize)
+		if err != nil {
+			return diffSummary{}, fmt.Errorf("findings: list bare cert summaries: %w", err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		totalCerts += len(page)
+		for i := range page {
+			s.evaluateRulesForCert(&page[i], now, matches)
+		}
+		certCursor = page[len(page)-1].ID
+		if len(page) < recomputeStreamingPageSize {
+			break
 		}
 	}
-	return evaluated, opened, updated, resolved, unchanged, nil
+
+	var counters [4]int
+
+	// Phase 2: page through existing findings, apply
+	// match or no-match transitions per finding.
+	totalFindings := 0
+	findingCursor := ""
+	for {
+		page, err := s.repo.ListAllFindingsForOrgPaged(ctx, organizationID, findingCursor, recomputeStreamingPageSize)
+		if err != nil {
+			return diffSummary{}, fmt.Errorf("findings: list findings page: %w", err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		totalFindings += len(page)
+		for i := range page {
+			prior := &page[i]
+			key := matchKey{prior.CertificateID, prior.RuleID}
+			if m, hasMatch := matches[key]; hasMatch {
+				next, op, bucket, err := decideMatchTransition(prior, organizationID, key.certID, m.rule, m.match, now)
+				if err != nil {
+					return diffSummary{}, err
+				}
+				if err := applyDecision(ctx, s.repo, next, op); err != nil {
+					return diffSummary{}, fmt.Errorf("findings: apply streamed match diff: %w", err)
+				}
+				counters[bucket]++
+				// This match has been handled; remove it so
+				// phase 3 only sees true new inserts.
+				delete(matches, key)
+				continue
+			}
+			next, op, bucket, err := decideNoMatchTransition(prior, now)
+			if err != nil {
+				return diffSummary{}, err
+			}
+			if err := applyDecision(ctx, s.repo, next, op); err != nil {
+				return diffSummary{}, fmt.Errorf("findings: apply streamed no-match diff: %w", err)
+			}
+			counters[bucket]++
+		}
+		findingCursor = page[len(page)-1].ID
+		if len(page) < recomputeStreamingPageSize {
+			break
+		}
+	}
+
+	// Phase 3: remaining matches have no prior finding —
+	// INSERT them. Map iteration order is randomised, which is
+	// fine: each (key, m) decision is independent and the
+	// final table state is identical regardless of insert
+	// order.
+	for k, m := range matches {
+		next, op, bucket, err := decideMatchTransition(nil, organizationID, k.certID, m.rule, m.match, now)
+		if err != nil {
+			return diffSummary{}, err
+		}
+		if err := applyDecision(ctx, s.repo, next, op); err != nil {
+			return diffSummary{}, fmt.Errorf("findings: apply streamed insert diff: %w", err)
+		}
+		counters[bucket]++
+	}
+
+	return diffSummary{
+		evaluatedCertificates: totalCerts,
+		loadedCertificates:    totalCerts,
+		loadedFindings:        totalFindings,
+		counters:              counters,
+	}, nil
+}
+
+// evaluateRulesForCert applies the registered rules to one
+// certificate and records every matching (cert, rule) pair in
+// the supplied map. Extracted from the cert-page loop so the
+// in-page work reads as a single statement; no behaviour change
+// vs an inline loop.
+func (s *Service) evaluateRulesForCert(
+	cert *inventory.CertificateSummary,
+	now time.Time,
+	matches map[matchKey]matchEntry,
+) {
+	for _, rule := range s.rules {
+		m := rule.Evaluate(cert, now)
+		if m == nil {
+			continue
+		}
+		matches[matchKey{cert.ID, rule.ID()}] = matchEntry{rule: rule, match: m}
+	}
 }
 
 // recordRecomputeAudit writes the single audit row that summarizes
@@ -454,6 +553,14 @@ type recomputeAuditMetadata struct {
 	Resolved              int    `json:"resolved"`
 	Unchanged             int    `json:"unchanged"`
 	RuleCount             int    `json:"rule_count"`
+
+	// H-024B additive fields. Both streaming and legacy
+	// load-all paths populate them. JSON additions are
+	// backward-compatible per CLAUDE.md §17 — existing
+	// audit-event consumers ignoring the new keys keep
+	// working.
+	LoadedCertificates int `json:"loaded_certificates"`
+	LoadedFindings     int `json:"loaded_findings"`
 }
 
 // recordRecomputeAudit takes the resolved (actor, actorType)
@@ -475,6 +582,8 @@ func (s *Service) recordRecomputeAudit(
 		Resolved:              r.Resolved,
 		Unchanged:             r.Unchanged,
 		RuleCount:             r.RuleCount,
+		LoadedCertificates:    r.LoadedCertificates,
+		LoadedFindings:        r.LoadedFindings,
 	})
 	if err := s.audit.Record(ctx, audit.Event{
 		OrganizationID: organizationID,

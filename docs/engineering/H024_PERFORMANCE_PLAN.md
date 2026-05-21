@@ -1125,8 +1125,9 @@ resolve them:
 | Item                                                | Status                                  |
 | --------------------------------------------------- | --------------------------------------- |
 | H-024 plan (this doc)                               | shipped (PR #36)                        |
-| H-024A — fixtures, perf tier, indexes, RETURNING    | **shipped (this PR)**                   |
-| H-024B — paginated scans + streaming diff           | not started (depends on H-024A)          |
+| H-024A — fixtures, perf tier, indexes, RETURNING    | shipped (PR #37)                        |
+| H-024A post-groundwork hardening                    | shipped (PR #38)                        |
+| H-024B — streaming recompute + REPEATABLE READ      | **shipped (this PR)**                   |
 | Legacy-method cleanup PR (post-H-024B soak)         | deferred                                 |
 | H-024 nightly perf workflow                         | optional (§4.5)                          |
 | H-025 per-recompute timeout                         | tracked separately in HARDENING_BACKLOG  |

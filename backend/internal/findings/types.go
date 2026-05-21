@@ -121,6 +121,14 @@ type Finding struct {
 // RecomputeResult is the counter set returned by Service.Recompute.
 // Counts are mutually exclusive — a finding ends up in exactly
 // one bucket per run.
+//
+// LoadedCertificates and LoadedFindings (H-024B) are additive
+// telemetry — they expose the input-set sizes the recompute
+// processed. Streaming and legacy load-all paths both populate
+// them; their sum across runs lets operators reason about
+// recompute cost without reading every finding row. Per
+// CLAUDE.md §17 the JSON additions are backward-compatible:
+// existing callers ignoring the new fields keep working.
 type RecomputeResult struct {
 	EvaluatedCertificates int
 	Opened                int
@@ -128,6 +136,23 @@ type RecomputeResult struct {
 	Resolved              int
 	Unchanged             int
 	RuleCount             int
+
+	// LoadedCertificates is the count of certificate rows the
+	// recompute touched (sum across cert pages for the
+	// streaming path; the single load-all snapshot for the
+	// legacy path). Equals EvaluatedCertificates today because
+	// every loaded cert is rule-evaluated; the two stay
+	// separate so a future "evaluated subset" optimization
+	// can distinguish them.
+	LoadedCertificates int
+
+	// LoadedFindings is the count of pre-existing finding
+	// rows the recompute considered (sum across finding pages
+	// for streaming; the single load-all snapshot for legacy).
+	// Useful for operators watching steady-state recompute
+	// cost over time — a sudden jump signals fleet growth or
+	// rule-set drift.
+	LoadedFindings int
 }
 
 // ListQuery captures the operator-facing filters for GET /findings.

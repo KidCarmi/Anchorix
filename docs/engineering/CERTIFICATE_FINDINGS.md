@@ -126,48 +126,87 @@ get it via the (out-of-scope) override workflow.
 ## 5. Recompute lifecycle
 
 `POST /api/v1/findings/recompute` invokes `Service.Recompute`.
-The pass:
+The pass runs under
+`Transactor.WithTxLockedFindingsRepeatableRead` (H-024B): a
+session-scope advisory lock on `(findings-recompute, orgID)`
+serializes concurrent recomputes for the same org, then a
+REPEATABLE READ transaction opens AFTER the lock is held so
+every paginated read inside the recompute sees ONE consistent
+input snapshot. The lock-before-snapshot ordering is binding —
+acquiring an xact-scope lock inside the REPEATABLE READ tx
+would let the second tx's snapshot fix BEFORE the first tx
+commits, defeating snapshot isolation and re-introducing the
+unique-constraint race the H-021 advisory lock was meant to
+prevent.
 
-1. Open a transaction (`Transactor.WithTx`).
-2. Load every certificate summary for the organization
-   (`CertificateLister.ListAllCertificateSummariesForOrg`). v0.1
-   fleet scale per [CERTIFICATE_INVENTORY.md §10](./CERTIFICATE_INVENTORY.md)
-   is ≤ 1K certs per org; the full snapshot fits comfortably in
-   memory. A backlog entry tracks the findings-era replacement
-   (paginated scan).
-3. Run every registered rule against every cert. Each match
-   becomes a `(cert_id, rule_id) → evidence` entry in an
-   in-memory map.
-4. Load every existing finding for the organization
-   (`Repository.ListAllForOrg`).
-5. Walk the rule-match map:
-   - **No existing row**: INSERT a new open finding. Counter
-     `opened++`.
-   - **Existing OPEN row**: UPDATE `last_seen_at`, `severity`,
-     `title`, `rule_version`, `evidence`. Counter `updated++`.
-   - **Existing RESOLVED row** (rule matches again): UPDATE to
-     `status=open`, `last_seen_at=now`, `resolved_at=NULL`.
-     `opened_at` (API: `first_seen_at`) stays at the original
-     detection time. Counter `opened++` — from the operator's
-     POV the finding is newly visible again.
-6. Walk the existing-findings map:
-   - **OPEN row not in match set**: UPDATE to
-     `status=resolved`, `resolved_at=now`. `last_seen_at` is
-     unchanged. Counter `resolved++`.
-   - **RESOLVED row not in match set**: nothing to do. Counter
-     `unchanged++`.
-7. Insert the single `findings.recomputed` audit row with the
-   counter set in `metadata`.
-8. Commit.
+The streaming pass (`Service.runDiffStreaming`):
+
+1. **Phase 1 — Page certs by id ASC.** Calls
+   `CertificateLister.ListCertificateBareSummariesForOrgPaged`
+   in pages of `recomputeStreamingPageSize = 500`. The "bare"
+   variant deliberately omits the two scalar
+   observation-count subqueries that the operator list path
+   needs, shaving N×2 subquery executions per page. For each
+   cert × rule, evaluate the rule. Matches accumulate into the
+   `matches map[matchKey]matchEntry` keyed by
+   `(cert_id, rule_id)`.
+2. **Phase 2 — Page existing findings by id ASC.** Calls
+   `Repository.ListAllFindingsForOrgPaged` in pages of the
+   same size. For each finding:
+   - If `matches[key]` exists →
+     `decideMatchTransition(prior, rule, match, now)`, then
+     `delete(matches, key)` so phase 3 only sees never-existed
+     keys.
+   - Else → `decideNoMatchTransition(prior, now)`.
+3. **Phase 3 — Remaining matches.** Entries left in the map
+   after phase 2 have no prior finding row, so they're
+   brand-new INSERTs. `decideMatchTransition(nil, ...)`
+   produces the new row.
+4. Insert the single `findings.recomputed` audit row with the
+   counter set in `metadata` (including the H-024B additive
+   fields `loaded_certificates` and `loaded_findings`).
+5. Commit; the deferred path releases the session lock and
+   returns the connection to the pool.
+
+The per-(cert, rule) decisions live in
+`internal/findings/service_diff.go` as `decideMatchTransition`
+and `decideNoMatchTransition` — pure functions of
+`(prior, rule, match, now)`. Both the streaming path
+(production) and the legacy load-all path
+(`Service.RecomputeLegacyLoadAll`, retained for the H-024B
+byte-identical equivalence test) consume the same helpers,
+which is what guarantees final table state matches between
+the two implementations.
+
+### State transitions (matrix preserved across paths)
+
+| prior status | rule matches | action                                                                |
+| ------------ | ------------ | --------------------------------------------------------------------- |
+| (no row)     | yes          | INSERT open; counter `opened++`                                       |
+| open         | yes          | UPDATE rule-derived fields; counter `updated++`                       |
+| resolved     | yes          | UPDATE → open, preserve `first_seen_at`; counter `opened++`           |
+| acknowledged | yes          | UPDATE rule-derived, preserve override metadata; counter `updated++`  |
+| suppressed   | yes (live)   | UPDATE rule-derived, preserve override metadata; counter `updated++`  |
+| suppressed   | yes (expired)| UPDATE → open, clear override metadata; counter `opened++`            |
+| open         | no           | UPDATE → resolved, stamp `resolved_at`; counter `resolved++`          |
+| ack / sup    | no           | UPDATE → resolved, clear override metadata; counter `resolved++`      |
+| resolved     | no           | no write; counter `unchanged++`                                       |
+| any other    | either       | `ErrUnsupportedFindingStatus` (fail loudly)                           |
 
 ### Determinism
 
 Rules are pure. Given the same (cert summary, now), evaluation
 produces the same match decision and the same evidence. The
 recompute SQL is deterministic — `UPDATE` predicates bind on
-`(id, organization_id)`, ordering for the existing-findings
-load is `id ASC`, and the rule pass walks `certs ASC, rules in
+`(id, organization_id)`, ordering for paginated reads is
+`id ASC`, and the rule pass walks `certs ASC, rules in
 registration order`.
+
+REPEATABLE READ pins the snapshot at the first statement of
+the tx, taken AFTER the session-scope lock is acquired. A
+concurrent ingestion batch that commits during the recompute
+is INVISIBLE to the in-flight pass; the next recompute will
+see it.
 
 A recompute against unchanged inventory at the same wall-clock
 second produces:
@@ -176,6 +215,28 @@ second produces:
 - `updated = N` (one update per still-matching finding)
 - `resolved = 0`
 - `unchanged = M` (any pre-existing resolved findings)
+
+### Snapshot isolation guarantee (H-024B)
+
+The lock-before-snapshot ordering is exercised by
+`backend/test/integration/findings_streaming_test.go`
+`TestFindingsStreamingRecomputeSnapshotIsolation`, which
+commits a new weak-RSA cert through a deterministic channel
+barrier WHILE a streaming recompute is between cert pages
+and asserts the in-flight recompute does NOT see it. Without
+the session-scope lock + REPEATABLE READ this test fails.
+
+### Byte-identical equivalence with the legacy load-all path
+
+`TestFindingsByteIdenticalLoadAllVsStreaming` seeds the
+Smallv01 fixture twice (fresh DB between runs), runs
+`RecomputeLegacyLoadAll` against one copy and `Recompute`
+against the other, and asserts the resulting `findings`
+tables are equivalent up to row IDs (which are crypto/rand
+freshly minted on each insert). The legacy path stays in
+tree until the post-H-024B-soak cleanup PR (per
+[`H024_PERFORMANCE_PLAN.md`](./H024_PERFORMANCE_PLAN.md)
+§9.B item 3); no other caller depends on it.
 
 ### Audit-transaction coupling
 
@@ -195,21 +256,13 @@ regressions.
 
 ### Defensive: unsupported finding status fails loudly
 
-`Service.runDiff`'s state-transition switches handle exactly
-`StatusOpen` and `StatusResolved`. Any other value (the
-schema-reserved `acknowledged` / `suppressed`, or any future
-addition) hits an explicit `default:` arm that returns
-`ErrUnsupportedFindingStatus`. This is intentional: an earlier
-draft used `default: // resolved → reopen` which would have
-silently flipped a future `suppressed` finding back to `open`
-on every recompute, defeating the override workflow's purpose.
-
-The defensive arm is the H-023 breadcrumb: when the override
-workflow ships, it MUST extend both switches in `runDiff`
-(matches loop AND unmatched loop) to decide what to do for
-each reserved value. Until then, the path is unreachable
-because v0.1 has no public surface that writes those status
-values.
+`decideMatchTransition` and `decideNoMatchTransition` handle
+exactly `StatusOpen`, `StatusResolved`, `StatusAcknowledged`,
+and `StatusSuppressed`. Any other value hits an explicit
+`default:` arm that returns `ErrUnsupportedFindingStatus`.
+This is intentional: an earlier draft used `default: // …`
+fall-throughs which would have silently mis-handled a future
+status addition.
 
 Pinned by `service_test.go`
 `TestServiceRecompute_UnsupportedStatusFailsLoudly_StillMatching`
@@ -427,14 +480,17 @@ the same org). An audit failure ROLLS BACK the override.
 
 ## 10. Status
 
-| Phase                                   | Status                |
-| --------------------------------------- | --------------------- |
-| H-021 design (this doc)                 | shipped (PR #30)      |
-| H-021 implementation                    | shipped (PR #30)      |
-| H-022 scheduled recompute               | shipped (PR #32)      |
-| H-023 acknowledge / suppress workflow   | **shipped** (this PR) |
-| H-024 findings performance optimization | HARDENING_BACKLOG     |
-| H-025 per-recompute timeout             | HARDENING_BACKLOG     |
+| Phase                                       | Status                |
+| ------------------------------------------- | --------------------- |
+| H-021 design (this doc)                     | shipped (PR #30)      |
+| H-021 implementation                        | shipped (PR #30)      |
+| H-022 scheduled recompute                   | shipped (PR #32)      |
+| H-023 acknowledge / suppress workflow       | shipped (PR #34)      |
+| H-024A perf groundwork                      | shipped (PR #37)      |
+| H-024A post-groundwork hardening            | shipped (PR #38)      |
+| H-024B streaming recompute + REPEATABLE READ| **shipped (this PR)** |
+| Legacy load-all cleanup PR (post-soak)      | deferred              |
+| H-025 per-recompute timeout                 | HARDENING_BACKLOG     |
 
 ## 11. References
 

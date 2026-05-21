@@ -46,35 +46,6 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
   `recomputeOrg`; `docs/engineering/CERTIFICATE_FINDINGS.md`
   §7 (Background scheduler).
 
-### H-024 — Findings: recompute scan performance at fleet scale
-
-- **Title:** `perf(findings): paginate Recompute's full-org cert + finding loads`
-- **Risk:** low-medium (operational). `Service.Recompute`
-  loads ALL certs and ALL findings for the organization into
-  memory in one query each. At the v0.1 fleet sizing target
-  (≤ 1K certs per org per
-  [`CERTIFICATE_INVENTORY.md`](./CERTIFICATE_INVENTORY.md) §10)
-  this is fast and small (~1 MB total). At findings-era load
-  (10K–100K certs per org), the in-memory diff stage stays
-  acceptable but the cert-load query crosses past O(seconds)
-  and the request budget pressure becomes real.
-- **Scope:** replace the single `ListAllCertificateSummariesForOrg`
-  + `ListAllForOrg` reads with batched cursor-paginated scans
-  that the diff logic streams over. The existing rule
-  pipeline already operates row-by-row, so batching is
-  additive — no architectural change to the rule layer.
-  Background tick (H-022) is the natural consumer of this
-  optimization; until then, the synchronous endpoint covers
-  v0.1 scale comfortably.
-- **Recommended PR:** `perf(findings): paginate Recompute scans`.
-- **Reason not fixed now:** H-021 explicitly scopes out
-  performance optimization, and the v0.1 fleet target is
-  comfortably under the threshold where this becomes a real
-  problem. Adding speculative pagination now would conflict
-  with the "real items only" backlog rule (CLAUDE.md §19).
-- **References:** `docs/engineering/CERTIFICATE_FINDINGS.md`
-  §5 (recompute lifecycle, fleet sizing assumption).
-
 ### H-019 — Certificate ingestion: audit-row amplification under sustained rejected batches
 
 - **Title:** `feat(inventory): rate-limit per-agent batch-rejection audit rows`

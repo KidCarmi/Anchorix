@@ -72,10 +72,47 @@ func (f *fakeFindingsRepo) ListAllForOrg(_ context.Context, orgID string) ([]Fin
 	return out, nil
 }
 
+// ListAllFindingsForOrgPaged is the H-024B streaming-path
+// stub. Returns one id-ASC-ordered page > cursorID. Mirrors
+// the real Postgres semantics closely enough that the
+// streaming-runDiff unit tests exercise the same algorithmic
+// shape they would against a real DB.
+func (f *fakeFindingsRepo) ListAllFindingsForOrgPaged(_ context.Context, orgID, cursorID string, pageSize int) ([]Finding, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	all := make([]Finding, 0)
+	for _, r := range f.rows {
+		if r.OrganizationID == orgID && r.ID > cursorID {
+			all = append(all, *r)
+		}
+	}
+	// Sort by id ASC so paging is deterministic across runs.
+	sortFindingsByID(all)
+	if len(all) > pageSize {
+		all = all[:pageSize]
+	}
+	return all, nil
+}
+
 func (f *fakeFindingsRepo) ListFindings(_ context.Context, _ ListQuery) ([]Finding, error) {
 	// Not used by Recompute. Empty stub keeps the interface
 	// satisfied for any future test that wants it.
 	return nil, nil
+}
+
+// sortFindingsByID is a small helper kept package-local so the
+// streaming-path stubs don't have to import "sort" verbatim at
+// every call site.
+func sortFindingsByID(rows []Finding) {
+	// Simple insertion sort — adequate for the tiny row
+	// counts unit tests work with (< 100). Using
+	// `sort.Slice` would be equally fine; the manual loop
+	// here avoids one more stdlib import in the test file.
+	for i := 1; i < len(rows); i++ {
+		for j := i; j > 0 && rows[j-1].ID > rows[j].ID; j-- {
+			rows[j-1], rows[j] = rows[j], rows[j-1]
+		}
+	}
 }
 
 // fakeCertificateLister returns a fixed set of cert summaries.
@@ -85,6 +122,36 @@ type fakeCertificateLister struct {
 
 func (f fakeCertificateLister) ListAllCertificateSummariesForOrg(_ context.Context, _ string) ([]inventory.CertificateSummary, error) {
 	return f.certs, nil
+}
+
+// ListCertificateBareSummariesForOrgPaged is the H-024B
+// streaming-path stub. Mirrors the real Postgres semantics:
+// returns rows with id > cursorID, ordered by id ASC, capped
+// at pageSize. The "bare" suffix in production means "no
+// observation counters"; here the test set carries zeroed
+// counters by default, so the bare semantics are
+// indistinguishable from the load-all return.
+func (f fakeCertificateLister) ListCertificateBareSummariesForOrgPaged(_ context.Context, _, cursorID string, pageSize int) ([]inventory.CertificateSummary, error) {
+	// Copy so we can sort without mutating the source slice.
+	all := make([]inventory.CertificateSummary, 0, len(f.certs))
+	for _, c := range f.certs {
+		if c.ID > cursorID {
+			all = append(all, c)
+		}
+	}
+	sortCertSummariesByID(all)
+	if len(all) > pageSize {
+		all = all[:pageSize]
+	}
+	return all, nil
+}
+
+func sortCertSummariesByID(rows []inventory.CertificateSummary) {
+	for i := 1; i < len(rows); i++ {
+		for j := i; j > 0 && rows[j-1].ID > rows[j].ID; j-- {
+			rows[j-1], rows[j] = rows[j], rows[j-1]
+		}
+	}
 }
 
 // fakeAudit records every audit Event and optionally fails on
@@ -127,6 +194,22 @@ type fakeTransactor struct {
 }
 
 func (t *fakeTransactor) WithTxLockedFindings(_ context.Context, _ string, fn func(ctx context.Context) error) error {
+	t.rollbacks = nil
+	err := fn(context.Background())
+	if err != nil {
+		for i := len(t.rollbacks) - 1; i >= 0; i-- {
+			t.rollbacks[i]()
+		}
+	}
+	return err
+}
+
+// WithTxLockedFindingsRepeatableRead has the same fake-side
+// semantics as WithTxLockedFindings — the rollback / lock
+// behavior is what the unit tests care about; the isolation
+// level only matters against a real Postgres (exercised by the
+// H-024B snapshot-isolation integration test).
+func (t *fakeTransactor) WithTxLockedFindingsRepeatableRead(_ context.Context, _ string, fn func(ctx context.Context) error) error {
 	t.rollbacks = nil
 	err := fn(context.Background())
 	if err != nil {
@@ -186,6 +269,10 @@ func (r *rollbackAwareRepo) GetFinding(ctx context.Context, orgID, id string) (*
 
 func (r *rollbackAwareRepo) ListAllForOrg(ctx context.Context, orgID string) ([]Finding, error) {
 	return r.inner.ListAllForOrg(ctx, orgID)
+}
+
+func (r *rollbackAwareRepo) ListAllFindingsForOrgPaged(ctx context.Context, orgID, cursorID string, pageSize int) ([]Finding, error) {
+	return r.inner.ListAllFindingsForOrgPaged(ctx, orgID, cursorID, pageSize)
 }
 
 func (r *rollbackAwareRepo) ListFindings(ctx context.Context, q ListQuery) ([]Finding, error) {

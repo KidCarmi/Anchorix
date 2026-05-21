@@ -38,12 +38,30 @@ type Repository interface {
 	GetFinding(ctx context.Context, organizationID, findingID string) (*Finding, error)
 
 	// ListAllForOrg returns every finding row for the
-	// organization, regardless of status. Used by
-	// Service.Recompute to compute the diff against the
-	// freshly-evaluated rule matches. v0.1 fleet scale keeps
-	// this small (≤ a few thousand rows per org); a paginated
-	// variant becomes necessary at findings-era scale.
+	// organization, regardless of status. Used by the H-024A
+	// legacy load-all Recompute path
+	// (Service.recomputeLegacyLoadAll), and by the H-024B
+	// byte-identical equivalence test that drives both paths
+	// against the same fixture. v0.1 fleet scale keeps this
+	// small (≤ a few thousand rows per org); the streaming
+	// path (ListAllFindingsForOrgPaged) is the production path
+	// at fleet scale. Kept in-tree until the post-soak cleanup
+	// PR per H024_PERFORMANCE_PLAN.md §9.B.
 	ListAllForOrg(ctx context.Context, organizationID string) ([]Finding, error)
+
+	// ListAllFindingsForOrgPaged returns one page of findings
+	// whose id is strictly greater than `cursorID`, ordered by
+	// id ASC, capped at pageSize rows. The empty cursor means
+	// "from the start". Used by Service.recomputeStreaming
+	// (H-024B) to walk the org's finding state in fixed-memory
+	// chunks rather than loading it all at once.
+	//
+	// Returns every status (open, resolved, acknowledged,
+	// suppressed) — the diff has to consider all of them.
+	// Includes the H-023 override columns so the streaming
+	// state machine can apply override-preserving / -clearing
+	// transitions identically to the legacy load-all path.
+	ListAllFindingsForOrgPaged(ctx context.Context, organizationID, cursorID string, pageSize int) ([]Finding, error)
 
 	// ListFindings returns one paginated page of findings for
 	// the operator GET /findings endpoint. Filters live on the
@@ -60,12 +78,25 @@ type Repository interface {
 // observes.
 type CertificateLister interface {
 	// ListAllCertificateSummariesForOrg returns all cert
-	// summaries for one organization. NO pagination — the
-	// recompute pass needs a coherent snapshot of the org's
-	// cert inventory in one read. The cap belongs in the
-	// implementation; callers that exceed it surface
-	// operationally rather than silently truncating.
+	// summaries for one organization in id ASC order. NO
+	// pagination — the legacy load-all recompute path uses
+	// this. Kept in-tree until the post-H-024B-soak cleanup PR
+	// per H024_PERFORMANCE_PLAN.md §9.B; the H-024B
+	// byte-identical equivalence test still calls it.
 	ListAllCertificateSummariesForOrg(ctx context.Context, organizationID string) ([]inventory.CertificateSummary, error)
+
+	// ListCertificateBareSummariesForOrgPaged returns one page
+	// of cert summaries whose id is strictly greater than
+	// `cursorID`, ordered by id ASC, capped at pageSize rows.
+	// Used by Service.recomputeStreaming (H-024B).
+	//
+	// "Bare" = WITHOUT the two scalar observation-count
+	// subqueries that the operator-list path needs. The
+	// recompute rule pass never reads ObservationCount or
+	// ActiveObservationCount; skipping the COUNT(*) work is
+	// the single largest perf win H-024B delivers at fleet
+	// scale.
+	ListCertificateBareSummariesForOrgPaged(ctx context.Context, organizationID, cursorID string, pageSize int) ([]inventory.CertificateSummary, error)
 }
 
 // Transactor runs fn inside a single transaction with a
@@ -82,10 +113,26 @@ type CertificateLister interface {
 //     under concurrent operator requests).
 //
 // Concrete implementation lives on storage/postgres.DB
-// (WithTxLockedFindings). Different orgs proceed in parallel —
-// the lock is keyed by organization_id.
+// (WithTxLockedFindings, WithTxLockedFindingsRepeatableRead).
+// Different orgs proceed in parallel — the lock is keyed by
+// organization_id.
 type Transactor interface {
 	WithTxLockedFindings(ctx context.Context, organizationID string, fn func(ctx context.Context) error) error
+
+	// WithTxLockedFindingsRepeatableRead is the H-024B
+	// streaming-recompute sibling. Same advisory lock,
+	// REPEATABLE READ isolation so paginated reads inside fn
+	// see one consistent snapshot of the inputs even when a
+	// concurrent ingestion batch (under the different
+	// `cert-inventory` advisory-lock namespace) commits during
+	// the recompute. CERTIFICATE_FINDINGS.md §5 promises
+	// determinism, and that promise breaks under
+	// READ COMMITTED + pagination — this method is the fix.
+	//
+	// Override paths keep using WithTxLockedFindings (READ
+	// COMMITTED) — single-row touch, no need for snapshot
+	// isolation.
+	WithTxLockedFindingsRepeatableRead(ctx context.Context, organizationID string, fn func(ctx context.Context) error) error
 }
 
 // nowProvider is the minimal clock surface Service.Recompute
