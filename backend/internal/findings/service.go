@@ -32,12 +32,13 @@ const (
 // CertificateLister / Transactor types directly (CLAUDE.md §8.6,
 // §8.8).
 type Service struct {
-	repo  Repository
-	certs CertificateLister
-	tx    Transactor
-	audit audit.Recorder
-	clock clock.Clock
-	rules []Rule
+	repo                 Repository
+	certs                CertificateLister
+	tx                   Transactor
+	audit                audit.Recorder
+	clock                clock.Clock
+	rules                []Rule
+	streamingPageOverride int
 }
 
 // NewService wires the service. Constructor-based DI per
@@ -76,7 +77,39 @@ func NewService(
 	}, nil
 }
 
-// SchedulerActorID is the value the scheduled-recompute path
+// SetStreamingPageSizeForTest overrides
+// `recomputeStreamingPageSize` for the duration of this
+// Service instance. The default (0) means "use the
+// production const". Anything > 0 forces the streaming diff
+// to page at that size instead.
+//
+// Public to support cross-package integration tests that
+// need to exercise multi-page walks against small fixtures —
+// notably the H-024B snapshot-isolation test, which seeds
+// only a handful of certs but needs the streaming loop to
+// make MORE than one paginated cert read so the
+// REPEATABLE READ + session-lock guarantee can be observed
+// across page boundaries. Without this knob the test could
+// not distinguish READ COMMITTED from REPEATABLE READ at
+// fixture scale.
+//
+// Marked "ForTest" in the name so production callers
+// reaching for it see the documented intent. Production
+// code paths MUST NOT call this — operators tune memory
+// budget through fixture size, not page size.
+func (s *Service) SetStreamingPageSizeForTest(size int) {
+	s.streamingPageOverride = size
+}
+
+// effectiveStreamingPageSize returns the override when one
+// is set, the production const otherwise. Keeps the
+// `runDiffStreaming` body free of conditional logic.
+func (s *Service) effectiveStreamingPageSize() int {
+	if s.streamingPageOverride > 0 {
+		return s.streamingPageOverride
+	}
+	return recomputeStreamingPageSize
+}
 // records in the audit row's `actor` column. ActorType is then
 // "system" (the scheduler is not a user). Stable string so
 // operators can filter `audit_events.actor = 'scheduler'` to
@@ -428,12 +461,14 @@ func (s *Service) runDiffStreaming(
 	organizationID string,
 	now time.Time,
 ) (diffSummary, error) {
+	pageSize := s.effectiveStreamingPageSize()
+
 	// Phase 1: page through certs, build matches map.
 	matches := make(map[matchKey]matchEntry)
 	totalCerts := 0
 	certCursor := ""
 	for {
-		page, err := s.certs.ListCertificateBareSummariesForOrgPaged(ctx, organizationID, certCursor, recomputeStreamingPageSize)
+		page, err := s.certs.ListCertificateBareSummariesForOrgPaged(ctx, organizationID, certCursor, pageSize)
 		if err != nil {
 			return diffSummary{}, fmt.Errorf("findings: list bare cert summaries: %w", err)
 		}
@@ -445,7 +480,7 @@ func (s *Service) runDiffStreaming(
 			s.evaluateRulesForCert(&page[i], now, matches)
 		}
 		certCursor = page[len(page)-1].ID
-		if len(page) < recomputeStreamingPageSize {
+		if len(page) < pageSize {
 			break
 		}
 	}
@@ -457,7 +492,7 @@ func (s *Service) runDiffStreaming(
 	totalFindings := 0
 	findingCursor := ""
 	for {
-		page, err := s.repo.ListAllFindingsForOrgPaged(ctx, organizationID, findingCursor, recomputeStreamingPageSize)
+		page, err := s.repo.ListAllFindingsForOrgPaged(ctx, organizationID, findingCursor, pageSize)
 		if err != nil {
 			return diffSummary{}, fmt.Errorf("findings: list findings page: %w", err)
 		}
@@ -492,7 +527,7 @@ func (s *Service) runDiffStreaming(
 			counters[bucket]++
 		}
 		findingCursor = page[len(page)-1].ID
-		if len(page) < recomputeStreamingPageSize {
+		if len(page) < pageSize {
 			break
 		}
 	}

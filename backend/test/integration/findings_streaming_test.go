@@ -251,19 +251,36 @@ func TestFindingsByteIdenticalLoadAllVsStreaming(t *testing.T) {
 // recompute's paginated cert SELECTs would each take a fresh
 // READ COMMITTED snapshot and the in-flight run would surface
 // the mid-recompute cert.
+//
+// Page-size override:
+//
+// The production `recomputeStreamingPageSize` is 500. With
+// only a handful of seeded certs, the streaming loop would
+// read everything in one cert SELECT, terminate immediately
+// (`len(page) < pageSize`), and never make a second cert
+// read. The mid-test insert would then happen AFTER the only
+// cert SELECT — which means the test would pass even under
+// READ COMMITTED. The Codex P2 review on PR #39 caught
+// exactly this. Force pageSize=1 via
+// `SetStreamingPageSizeForTest` so the streaming loop makes
+// MULTIPLE cert SELECTs and the mid-recompute insert lands
+// between them.
 func TestFindingsStreamingRecomputeSnapshotIsolation(t *testing.T) {
 	db := testDB(t)
 	freshDatabase(t, db)
 
 	fixedNow := time.Date(2026, 5, 21, 12, 0, 0, 0, time.UTC)
 
-	// Seed two weak-RSA certs first (their ids and
-	// fingerprints differ via the seedCert helper's
-	// id-prefix scheme so they don't collide).
-	for i, subject := range []string{"weak-iso-a.example", "weak-iso-b.example"} {
-		fixture := mustWeakCertFixture("snapshot-iso-" + subject)
+	// Seed two weak-RSA certs first. IDs deliberately sort
+	// BEFORE the mid-recompute cert's id below, so a fresh
+	// snapshot (READ COMMITTED) would include the new row
+	// when the streaming loop's id-ASC cursor reaches it.
+	// Without this ordering, the test would false-pass under
+	// READ COMMITTED because the cursor would walk PAST the
+	// new cert's id (the new id is lexically earlier).
+	for _, subject := range []string{"weak-iso-a.example", "weak-iso-b.example"} {
+		fixture := mustWeakCertFixture("snapshot-iso-aa-" + subject)
 		fixture.Subject = "CN=" + subject
-		_ = i
 		seedCert(t, db, fixture)
 	}
 
@@ -277,6 +294,11 @@ func TestFindingsStreamingRecomputeSnapshotIsolation(t *testing.T) {
 	}
 
 	svc := newStreamingFindingsService(t, db, fixedNow, pauseLister)
+
+	// Force one-cert-per-page so the streaming loop makes
+	// multiple cert SELECTs against the small fixture. See
+	// the test doc for why this matters.
+	svc.SetStreamingPageSizeForTest(1)
 
 	type recomputeOutcome struct {
 		result *findings.RecomputeResult
@@ -297,7 +319,13 @@ func TestFindingsStreamingRecomputeSnapshotIsolation(t *testing.T) {
 	// in-flight recompute MUST NOT see it; its snapshot is
 	// fixed to a moment BEFORE this commit.
 	<-pauseAfterFirstPage
-	newFixture := mustWeakCertFixture("snapshot-iso-mid-recompute")
+	// ID prefix "zz" ensures the new row sorts AFTER the two
+	// seeded "aa" certs. The streaming loop's id-ASC cursor
+	// would visit it on a subsequent page IF the snapshot
+	// were re-read (READ COMMITTED). REPEATABLE READ keeps
+	// the snapshot fixed, so the new row stays invisible to
+	// the in-flight run.
+	newFixture := mustWeakCertFixture("snapshot-iso-zz-mid-recompute")
 	newFixture.Subject = "CN=snapshot-iso-mid-recompute.example"
 	seedCert(t, db, newFixture)
 	close(resumeAfterCommit)
