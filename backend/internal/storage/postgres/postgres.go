@@ -224,7 +224,17 @@ func (db *DB) WithTxLockedFindingsRepeatableRead(ctx context.Context, organizati
 	if err != nil {
 		return fmt.Errorf("postgres: acquire connection for findings recompute lock: %w", err)
 	}
-	defer conn.Release()
+	// connReleased toggles to true once we've handed the
+	// connection back to the pool — either via Release() in
+	// the happy path or via Hijack()+Close() when unlock
+	// fails. The final defer below uses it to ensure we
+	// don't double-release.
+	connReleased := false
+	defer func() {
+		if !connReleased {
+			conn.Release()
+		}
+	}()
 
 	// Session-scope lock — held until pg_advisory_unlock or
 	// connection close. Acquired BEFORE the tx so the
@@ -247,9 +257,39 @@ func (db *DB) WithTxLockedFindingsRepeatableRead(ctx context.Context, organizati
 		// lock. A 5-second budget is generous.
 		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, _ = conn.Exec(unlockCtx,
+		if _, err := conn.Exec(unlockCtx,
 			`SELECT pg_advisory_unlock(hashtext('findings-recompute'), hashtext($1))`,
-			organizationID)
+			organizationID); err != nil {
+			// Defensive cleanup: if the unlock SQL failed
+			// (timeout, network error, etc.) the session
+			// lock state on this connection is undefined —
+			// it MAY still be held. Returning the
+			// connection to the pool would let a subsequent
+			// borrower inherit the lock (`pg_advisory_lock`
+			// is reentrant per-session; an unreleased lock
+			// stays held across borrowers on the same
+			// physical connection).
+			//
+			// pgx's pool DOES discard connections that look
+			// broken on Release(), but a healthy-looking
+			// connection with a timed-out query body is NOT
+			// guaranteed to be detected. Be explicit: hijack
+			// the connection out of the pool and close the
+			// underlying conn. Closing the TCP connection
+			// drops every session-scope lock the backend was
+			// holding for it (PostgreSQL releases advisory
+			// locks on session end).
+			//
+			// The hijacked conn is closed with a fresh ctx
+			// so a cancelled caller-ctx can't prevent the
+			// close — same rationale as the unlock ctx.
+			if hijacked := conn.Hijack(); hijacked != nil {
+				closeCtx, cancelClose := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancelClose()
+				_ = hijacked.Close(closeCtx)
+			}
+			connReleased = true
+		}
 	}()
 
 	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
