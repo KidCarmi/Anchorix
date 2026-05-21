@@ -180,6 +180,61 @@ func (r *FindingsRepository) GetFinding(
 	return f, nil
 }
 
+// ListAllFindingsForOrgPaged returns one page of findings whose
+// id is strictly greater than `cursorID`, ordered by id ASC,
+// capped at pageSize rows. The empty cursor means "from the
+// start". Used by Service.recomputeStreaming to walk the org's
+// finding state in fixed-memory chunks rather than loading it
+// all at once like ListAllForOrg does.
+//
+// Returns every status (open, resolved, acknowledged,
+// suppressed) — the diff has to consider all of them. Includes
+// the H-023 override columns for the same reason as
+// ListAllForOrg.
+//
+// Cursor format: caller-supplied raw id (the last id of the
+// previous page). The cursor is opaque to the caller — the
+// repo does not encode it. cursorID == "" → "include the
+// smallest id" (NULL/empty string is the smallest text value).
+func (r *FindingsRepository) ListAllFindingsForOrgPaged(
+	ctx context.Context,
+	organizationID, cursorID string,
+	pageSize int,
+) ([]findings.Finding, error) {
+	if pageSize <= 0 {
+		return nil, fmt.Errorf("postgres: pageSize must be positive (got %d)", pageSize)
+	}
+	const q = `
+		SELECT id, organization_id, certificate_id,
+		       rule_id, rule_version,
+		       severity, status, title, evidence,
+		       opened_at, last_seen_at, resolved_at, updated_at,
+		       status_reason, status_actor, status_changed_at, suppress_expires_at
+		  FROM findings
+		 WHERE organization_id = $1
+		   AND id > $2
+		 ORDER BY id ASC
+		 LIMIT $3`
+	rows, err := r.db.querierFor(ctx).Query(ctx, q, organizationID, cursorID, pageSize)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list findings page: %w", err)
+	}
+	defer rows.Close()
+
+	var out []findings.Finding
+	for rows.Next() {
+		f, err := scanFinding(rows)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: scan finding: %w", err)
+		}
+		out = append(out, *f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate findings page: %w", err)
+	}
+	return out, nil
+}
+
 // ListAllForOrg returns every finding row for the organization,
 // regardless of status. Used by Service.Recompute to compute the
 // diff against the freshly-evaluated rule matches. The org
@@ -492,6 +547,82 @@ func (r *CertificateInventoryRepository) ListAllCertificateSummariesForOrg(
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("postgres: iterate cert summaries: %w", err)
+	}
+	return out, nil
+}
+
+// ListCertificateBareSummariesForOrgPaged is the
+// findings.CertificateLister streaming contract. Returns one
+// page of certificate summaries whose id is strictly greater
+// than `cursorID`, ordered by id ASC, capped at pageSize rows.
+//
+// The page query DELIBERATELY OMITS the two scalar
+// observation-count subqueries that `ListAllCertificateSummariesForOrg`
+// computes. The recompute rule pass never reads
+// ObservationCount or ActiveObservationCount — they exist on
+// `inventory.CertificateSummary` to feed the operator list
+// endpoint. Skipping the COUNT(*) work shaves N×2 subquery
+// executions per page (where N is pageSize), which is the
+// single largest perf win H-024B aims for. The returned
+// summaries carry zero in those count fields; callers that
+// need the counts MUST use the operator-list path, not the
+// streaming recompute path.
+//
+// Cursor format: caller-supplied raw id (the last id of the
+// previous page). Opaque to the caller; cursorID == "" → "from
+// the smallest id".
+//
+// Index served: `certificates_pkey` on `(id)` plus the
+// org filter via `certificates_org_idx`. At fleet scale a
+// `(organization_id, id)` composite index would be tighter,
+// but the v0.1 / pilot targets in H024_PERFORMANCE_PLAN.md §3
+// don't yet justify it. Re-evaluate after stress-tier
+// measurements.
+func (r *CertificateInventoryRepository) ListCertificateBareSummariesForOrgPaged(
+	ctx context.Context,
+	organizationID, cursorID string,
+	pageSize int,
+) ([]inventory.CertificateSummary, error) {
+	if pageSize <= 0 {
+		return nil, fmt.Errorf("postgres: pageSize must be positive (got %d)", pageSize)
+	}
+	const q = `
+		SELECT id, fingerprint_sha256, subject, issuer,
+		       serial_number_hex, signature_algorithm,
+		       public_key_algorithm, public_key_bits,
+		       not_before, not_after, is_self_signed, is_ca,
+		       first_seen_at, last_seen_at
+		  FROM certificates
+		 WHERE organization_id = $1
+		   AND id > $2
+		 ORDER BY id ASC
+		 LIMIT $3`
+	rows, err := r.db.querierFor(ctx).Query(ctx, q, organizationID, cursorID, pageSize)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list bare cert summaries page: %w", err)
+	}
+	defer rows.Close()
+
+	var out []inventory.CertificateSummary
+	for rows.Next() {
+		var s inventory.CertificateSummary
+		if err := rows.Scan(
+			&s.ID, &s.FingerprintSHA256, &s.Subject, &s.Issuer,
+			&s.SerialNumberHex, &s.SignatureAlg,
+			&s.PublicKeyAlg, &s.PublicKeyBits,
+			&s.NotBefore, &s.NotAfter, &s.IsSelfSigned, &s.IsCA,
+			&s.FirstSeenAt, &s.LastSeenAt,
+		); err != nil {
+			return nil, fmt.Errorf("postgres: scan bare cert summary: %w", err)
+		}
+		// ObservationCount and ActiveObservationCount are zero
+		// by zero-value initialization — explicitly NOT
+		// populated. Callers that need them must use the
+		// operator-list path.
+		out = append(out, s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate bare cert summaries: %w", err)
 	}
 	return out, nil
 }
