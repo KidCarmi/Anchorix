@@ -142,7 +142,6 @@ func TestOwnershipRuleRoundTrip(t *testing.T) {
 func TestCertificateOwnershipUpsertAndQueries(t *testing.T) {
 	db := testDB(t)
 	freshDatabase(t, db)
-	identityRepo := postgres.NewIdentityRepository(db)
 	repo := postgres.NewOwnershipRepository(db)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
