@@ -25,7 +25,7 @@ func TestOwnershipRuleRoundTrip(t *testing.T) {
 	defer cancel()
 	now := time.Now().UTC()
 
-	svc := &identity.Service{
+	svc := &identity.ServiceRecord{
 		ID:             "svc-rule-1",
 		OrganizationID: "anchorix",
 		Slug:           "svc-rule-1",

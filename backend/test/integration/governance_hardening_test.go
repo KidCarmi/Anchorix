@@ -110,7 +110,7 @@ func TestCrossOrgListIsolation(t *testing.T) {
 		t.Fatalf("seed tag: %v", err)
 	}
 	svcID := "svc-x"
-	if err := identityRepo.CreateService(ctx, &identity.Service{
+	if err := identityRepo.CreateService(ctx, &identity.ServiceRecord{
 		ID: svcID, OrganizationID: "anchorix", Slug: "svc-x", DisplayName: "X",
 		CreatedAt: now, UpdatedAt: now,
 	}); err != nil {
@@ -252,7 +252,7 @@ func TestServiceGroupMembershipCascadeAndRestrict(t *testing.T) {
 	defer cancel()
 	now := time.Now().UTC()
 
-	if err := identityRepo.CreateService(ctx, &identity.Service{
+	if err := identityRepo.CreateService(ctx, &identity.ServiceRecord{
 		ID: "svc-mem-1", OrganizationID: "anchorix", Slug: "svc-mem-1",
 		DisplayName: "Mem 1", CreatedAt: now, UpdatedAt: now,
 	}); err != nil {

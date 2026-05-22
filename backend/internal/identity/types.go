@@ -50,10 +50,16 @@ type TagAssignment struct {
 	AssignedAt     time.Time
 }
 
-// Service is the named ownership unit. It represents the thing
-// that gets paged when a cert expires. owner_email / owner_team
-// are descriptive — v0.x has no notification routing yet.
-type Service struct {
+// ServiceRecord is the named ownership unit (the row in the
+// `services` table). It represents the thing that gets paged
+// when a cert expires. owner_email / owner_team are
+// descriptive — v0.x has no notification routing yet.
+//
+// (Named ServiceRecord, not `Service`, so the domain
+// entrypoint can take the canonical `identity.Service` name
+// matching the convention established by inventory.Service,
+// findings.Service, etc.)
+type ServiceRecord struct {
 	ID             string
 	OrganizationID string
 	Slug           string

@@ -82,6 +82,20 @@ type Config struct {
 	FindingsSchedulerEnabled  bool
 	FindingsSchedulerInterval time.Duration
 
+	// GovernanceAPIEnabled controls whether the H-026A2
+	// identity / governance operator API is routed.
+	// Defaults true; an operator can flip it off without code
+	// rollback if the read/write paths cause production
+	// trouble. When false, every /api/v1/(tags|services|
+	// service-groups|agent-groups){,/...} route returns 404
+	// from the router (the routes are not registered).
+	//
+	// The feature gate is API-only — the schema is always
+	// present (it's append-only per CLAUDE.md §16). Repository
+	// reads from other packages (none today, the H-026B engine
+	// later) are not affected by this flag.
+	GovernanceAPIEnabled bool
+
 	TLSTermination TLSTermination
 	TLSCertFile    string
 	TLSKeyFile     string
@@ -122,6 +136,9 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if cfg.FindingsSchedulerInterval, err = parseDuration("ANCHORIX_FINDINGS_SCHEDULER_INTERVAL", "6h"); err != nil {
+		return nil, err
+	}
+	if cfg.GovernanceAPIEnabled, err = parseBool("ANCHORIX_GOVERNANCE_API_ENABLED", true); err != nil {
 		return nil, err
 	}
 	if cfg.SessionIdleLifetime, err = parseDuration("ANCHORIX_SESSION_IDLE_LIFETIME", "8h"); err != nil {

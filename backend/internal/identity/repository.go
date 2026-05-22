@@ -93,10 +93,10 @@ type Repository interface {
 
 	// ----- services -----
 
-	CreateService(ctx context.Context, s *Service) error
-	GetService(ctx context.Context, organizationID, serviceID string) (*Service, error)
-	GetServiceBySlug(ctx context.Context, organizationID, slug string) (*Service, error)
-	ListServices(ctx context.Context, organizationID string, activeOnly bool) ([]Service, error)
+	CreateService(ctx context.Context, s *ServiceRecord) error
+	GetService(ctx context.Context, organizationID, serviceID string) (*ServiceRecord, error)
+	GetServiceBySlug(ctx context.Context, organizationID, slug string) (*ServiceRecord, error)
+	ListServices(ctx context.Context, organizationID string, activeOnly bool) ([]ServiceRecord, error)
 	UpdateServiceMetadata(
 		ctx context.Context,
 		organizationID, serviceID string,

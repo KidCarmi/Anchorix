@@ -28,6 +28,7 @@ import (
 	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
 	"github.com/kidcarmi/anchorix/backend/internal/findings"
 	"github.com/kidcarmi/anchorix/backend/internal/httpapi"
+	"github.com/kidcarmi/anchorix/backend/internal/identity"
 	"github.com/kidcarmi/anchorix/backend/internal/inventory"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
 	"github.com/kidcarmi/anchorix/backend/internal/storage/postgres"
@@ -208,6 +209,21 @@ func testServer(t *testing.T, db *postgres.DB) (*httptest.Server, *auth.Service)
 		t.Fatalf("findings.NewService: %v", err)
 	}
 
+	// H-026A2 identity service. Wired unconditionally in
+	// integration tests so the /api/v1/(tags|services|
+	// service-groups|agent-groups) routes are routable. The
+	// production composition root gates this on
+	// ANCHORIX_GOVERNANCE_API_ENABLED (cfg knob); tests want
+	// the routes available so they can exercise them.
+	identityRepo := postgres.NewIdentityRepository(db)
+	targetResolver := postgres.NewIdentityTargetResolver(db)
+	identitySvc, err := identity.NewService(
+		identityRepo, db, auditRecorder, targetResolver, clock.System{},
+	)
+	if err != nil {
+		t.Fatalf("identity.NewService: %v", err)
+	}
+
 	srv, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{
 		AuthService:           svc,
 		CookieSigner:          signer,
@@ -215,6 +231,7 @@ func testServer(t *testing.T, db *postgres.DB) (*httptest.Server, *auth.Service)
 		AgentInventoryService: inventorySvc,
 		InventoryService:      certSvc,
 		FindingsService:       findingsSvc,
+		IdentityService:       identitySvc,
 	})
 	if err != nil {
 		t.Fatalf("httpapi.NewServer: %v", err)

@@ -13,6 +13,7 @@ import (
 	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
 	"github.com/kidcarmi/anchorix/backend/internal/findings"
 	"github.com/kidcarmi/anchorix/backend/internal/httpapi"
+	"github.com/kidcarmi/anchorix/backend/internal/identity"
 	"github.com/kidcarmi/anchorix/backend/internal/inventory"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
 	"github.com/kidcarmi/anchorix/backend/internal/storage/postgres"
@@ -119,6 +120,22 @@ func cmdServe(ctx context.Context, cfg *config.Config, log *logger.Logger) error
 		return fmt.Errorf("findings scheduler: %w", err)
 	}
 
+	// H-026A2: identity/governance vocabulary service. Wired
+	// only when ANCHORIX_GOVERNANCE_API_ENABLED is true so the
+	// feature gate is a true off-switch — routes are not
+	// registered when disabled.
+	var identityService *identity.Service
+	if cfg.GovernanceAPIEnabled {
+		identityRepo := postgres.NewIdentityRepository(db)
+		targetResolver := postgres.NewIdentityTargetResolver(db)
+		identityService, err = identity.NewService(
+			identityRepo, db, auditRecorder, targetResolver, clock.System{},
+		)
+		if err != nil {
+			return fmt.Errorf("identity service: %w", err)
+		}
+	}
+
 	// HTTP layer.
 	srv, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{
 		AuthService:           authService,
@@ -127,6 +144,7 @@ func cmdServe(ctx context.Context, cfg *config.Config, log *logger.Logger) error
 		AgentInventoryService: agentInventoryService,
 		InventoryService:      inventoryService,
 		FindingsService:       findingsService,
+		IdentityService:       identityService,
 	})
 	if err != nil {
 		return fmt.Errorf("init server: %w", err)
