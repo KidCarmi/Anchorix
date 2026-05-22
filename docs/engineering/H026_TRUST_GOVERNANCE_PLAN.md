@@ -2128,14 +2128,23 @@ read-heavy on `certificates`, `certificate_observations`,
 
 ### 9.11 Migration strategy
 
-| Phase    | DB migration                                                       | Rollback                                                  |
-| -------- | ------------------------------------------------------------------ | --------------------------------------------------------- |
-| H-026A1  | `0009_governance_identity.sql` (additive)                          | None needed; tables stay, code doesn't use them.          |
-| H-026A2  | `0010_governance_ownership.sql` (additive)                         | None needed; same.                                         |
-| H-026A3  | `0011_governance_policy.sql` (additive)                            | None needed; same.                                         |
-| H-026B   | (no new migration)                                                 | Disable scheduler env knob.                                |
-| H-026C   | (no new migration)                                                 | Code rollback; assignment / rule rows linger harmlessly.   |
-| H-026D   | `0012_findings_governance_columns.sql`                             | Additive columns nullable; code rollback ignores them.   |
+The full H-026 foundation schema (three migration files —
+identity, ownership, policy) lands together in H-026A1 so the
+repository tests can exercise every table from the start.
+H-026A2 and H-026A3 ship **no new migrations** — they add
+service-layer code and HTTP handlers against the schema A1
+established. H-026B re-uses the same schema. The next
+migration after H-026A is H-026D's additive columns on
+`findings`.
+
+| Phase    | DB migrations introduced                                                                                                       | Rollback                                                  |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------- |
+| H-026A1  | `0009_governance_identity.sql` + `0010_governance_ownership.sql` + `0011_governance_policy.sql` (all three; additive)          | None needed; tables stay, code doesn't use them.          |
+| H-026A2  | (no new migration)                                                                                                             | Code rollback; identity rows linger harmlessly.           |
+| H-026A3  | (no new migration)                                                                                                             | Trivial — composition wiring only.                         |
+| H-026B   | (no new migration)                                                                                                             | Disable scheduler env knob.                                |
+| H-026C   | (no new migration)                                                                                                             | Code rollback; assignment / rule rows linger harmlessly.   |
+| H-026D   | `0012_findings_governance_columns.sql`                                                                                         | Additive columns nullable; code rollback ignores them.   |
 
 No destructive migrations anywhere. CLAUDE.md §16's two-phase
 destructive-migration rule does not apply because nothing is
