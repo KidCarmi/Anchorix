@@ -374,10 +374,58 @@ The same H-009 cross-organization safety pattern (composite FK
   physical delete would invalidate explanation history. CLAUDE.md
   §16 (no destructive migrations) makes the soft-delete shape the
   natural fit.
-- **Migrations.** All schema for H-026 lands in a single
-  append-only migration `backend/migrations/0009_trust_governance.sql`
-  (H-026A scope). Subsequent phases add 0010, 0011, … each
-  documented inline per CLAUDE.md §16.
+- **Migrations.** Schema for H-026 may land across more than
+  one migration if the H-026A scope is split (see §11.1). The
+  per-phase migration files are: `0009_governance_identity.sql`
+  (tags, services, service_groups, agent_groups + memberships),
+  `0010_governance_ownership.sql` (ownership_rules,
+  certificate_ownership, overrides, explanations),
+  `0011_governance_policy.sql` (policy_definitions, assignments,
+  waivers, recompute_runs). All append-only; each documented
+  inline per CLAUDE.md §16. A single-PR variant can collapse
+  the three into one migration without changing the table
+  shape.
+
+- **Composite-FK target rule (H-009 pattern).** Every parent
+  table whose `(organization_id, id)` is referenced by a
+  composite FK declares `UNIQUE (organization_id, id)` in the
+  CREATE TABLE body. PostgreSQL requires the referenced column
+  tuple to form a UNIQUE or PRIMARY KEY; `id` being PK alone
+  does NOT make `(organization_id, id)` referenceable. This
+  mirrors `certificates_org_id_uniq` /
+  `agents_org_id_uniq` in migrations 0004 / 0005 and is non-
+  negotiable for cross-org safety per CLAUDE.md §6 / §16.
+
+- **Migration declaration order.** The §3.3–§3.14 sections are
+  written in narrative order (operator-facing concepts first,
+  derived state later). The **migration file** must declare
+  tables in **dependency order** so every FK target exists
+  before its FK is created. The dependency order is:
+
+  ```
+  organizations              (already in 0001)
+  ├─ tags                     (target of tag_assignments)
+  ├─ tag_assignments
+  ├─ services                 (target of multiple FKs)
+  ├─ service_groups           (target of memberships + self-FK)
+  │  └─ service_group_memberships
+  ├─ agent_groups             (target of memberships)
+  │  └─ agent_group_memberships  (FK to agents from migration 0001)
+  ├─ ownership_rules          (FK to services; target of cert_ownership FKs)
+  ├─ certificate_ownership_overrides   (target of cert_ownership.override_id)
+  ├─ ownership_match_explanations      (target of cert_ownership.explanation_id;
+  │                                     FK to ownership_rules + services)
+  ├─ certificate_ownership    (FK to certificates + services + rules + overrides + explanations)
+  ├─ policy_definitions       (target of assignments + waivers)
+  ├─ policy_assignments
+  ├─ policy_waivers
+  └─ governance_recompute_runs
+  ```
+
+  An implementer who copies the narrative-order SQL snippets
+  straight into a migration file would hit "relation does not
+  exist" on the first FK. The H-026A1 schema PR must reorder
+  the table declarations to match the dependency order above.
 
 ### 3.3 Tags
 
@@ -391,6 +439,7 @@ CREATE TABLE tags (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     disabled_at     TIMESTAMPTZ,
+    UNIQUE (organization_id, id),                    -- H-009 composite-FK target
     UNIQUE (organization_id, key, value)
 );
 ```
@@ -408,7 +457,8 @@ CREATE TABLE tag_assignments (
     id              TEXT        PRIMARY KEY,
     organization_id TEXT        NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
     tag_id          TEXT        NOT NULL,
-    target_type     TEXT        NOT NULL,           -- 'certificate' | 'agent' | 'service' | 'service_group' | 'agent_group'
+    target_type     TEXT        NOT NULL
+        CHECK (target_type IN ('certificate','agent','service','service_group','agent_group')),
     target_id       TEXT        NOT NULL,
     assigned_by     TEXT        NOT NULL,           -- user id; 'system' reserved
     assigned_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -424,6 +474,16 @@ CREATE TABLE tag_assignments (
 - A composite FK across multiple target tables is not
   expressible cleanly in PostgreSQL; the service-layer check is
   the right trade-off — same pattern used by audit_events.
+- The `target_type` enum is fenced by a CHECK constraint so a
+  buggy or hand-written insert cannot widen the polymorphism
+  silently (mirrors the `audit_events.actor_type` CHECK in
+  migration 0001).
+- **Dangling-row risk.** A `target_type='certificate'` row whose
+  cert is later deleted becomes dangling. v0.1 keeps every
+  certificate forever ([`CERTIFICATE_INVENTORY.md`](./CERTIFICATE_INVENTORY.md)
+  §10), so this is unreachable in v0.x. If a retention policy
+  ever lands, it MUST cascade through `tag_assignments` and
+  emit an audit row per cleaned-up assignment.
 - **Scale.** 50k certs × 3 tags each = 150k rows. The unique
   index covers the assignment write path.
 
@@ -442,6 +502,7 @@ CREATE TABLE services (
     created_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at               TIMESTAMPTZ NOT NULL DEFAULT now(),
     disabled_at              TIMESTAMPTZ,
+    UNIQUE (organization_id, id),                            -- H-009 composite-FK target
     UNIQUE (organization_id, slug)
 );
 ```
@@ -470,6 +531,7 @@ CREATE TABLE service_groups (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     disabled_at     TIMESTAMPTZ,
+    UNIQUE (organization_id, id),                            -- H-009 composite-FK target (incl. self-FK)
     UNIQUE (organization_id, slug),
     FOREIGN KEY (organization_id, parent_id) REFERENCES service_groups(organization_id, id) ON DELETE RESTRICT
 );
@@ -512,6 +574,7 @@ CREATE TABLE agent_groups (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     disabled_at     TIMESTAMPTZ,
+    UNIQUE (organization_id, id),                            -- H-009 composite-FK target
     UNIQUE (organization_id, slug)
 );
 
@@ -546,15 +609,18 @@ CREATE TABLE ownership_rules (
     name                TEXT        NOT NULL,
     description         TEXT        NOT NULL DEFAULT '',
     service_id          TEXT        NOT NULL,                  -- the service this rule grants ownership to
-    precedence_tier     TEXT        NOT NULL,                  -- enum, see §4.2
+    precedence_tier     TEXT        NOT NULL
+        CHECK (precedence_tier IN ('explicit','service_member','agent_group','san_pattern','subject_pattern','tag','issuer_store','fallback')),
     priority            INTEGER     NOT NULL,                  -- lower = higher precedence within tier
-    match_kind          TEXT        NOT NULL,                  -- 'san_glob' | 'san_regex' | 'subject_cn_glob' | 'agent_group' | 'issuer_dn' | 'store_location' | 'tag'
+    match_kind          TEXT        NOT NULL
+        CHECK (match_kind IN ('san_glob','san_regex','subject_cn_glob','agent_group','issuer_dn','store_location','tag','fallback')),
     match_value         TEXT        NOT NULL,                  -- the pattern / id / tag-key:value, depending on kind
     enabled             BOOLEAN     NOT NULL DEFAULT TRUE,
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_by          TEXT        NOT NULL,
     disabled_at         TIMESTAMPTZ,
+    UNIQUE (organization_id, id),                              -- H-009 composite-FK target
     UNIQUE (organization_id, name),
     FOREIGN KEY (organization_id, service_id) REFERENCES services(organization_id, id) ON DELETE RESTRICT
 );
@@ -590,11 +656,13 @@ CREATE TABLE certificate_ownership (
     organization_id          TEXT        NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
     certificate_id           TEXT        NOT NULL,
     service_id               TEXT,                              -- NULL = unowned
-    decision                 TEXT        NOT NULL,              -- 'matched' | 'overridden' | 'unowned' | 'ambiguous'
+    decision                 TEXT        NOT NULL
+        CHECK (decision IN ('matched','overridden','unowned','ambiguous')),
     winning_rule_id          TEXT,                              -- NULL when decision in ('overridden', 'unowned')
     override_id              TEXT,                              -- NULL when decision != 'overridden'
     explanation_id           TEXT        NOT NULL,              -- always points at the latest explanation row
-    confidence               TEXT        NOT NULL,              -- 'high' | 'medium' | 'low'
+    confidence               TEXT        NOT NULL
+        CHECK (confidence IN ('high','medium','low')),
     first_assigned_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_evaluated_at        TIMESTAMPTZ NOT NULL DEFAULT now(),
     last_changed_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -633,10 +701,11 @@ CREATE TABLE certificate_ownership_overrides (
     reason              TEXT        NOT NULL,                   -- operator's free-text justification, ≤ 1000 bytes
     set_by              TEXT        NOT NULL,
     set_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
-    expires_at          TIMESTAMPTZ,                            -- optional auto-expiry
+    expires_at          TIMESTAMPTZ,                            -- optional auto-expiry; see lifecycle below
     cleared_at          TIMESTAMPTZ,
     cleared_by          TEXT,
     cleared_reason      TEXT,
+    UNIQUE (organization_id, id),                               -- H-009 composite-FK target
     FOREIGN KEY (organization_id, certificate_id) REFERENCES certificates(organization_id, id) ON DELETE CASCADE,
     FOREIGN KEY (organization_id, service_id) REFERENCES services(organization_id, id) ON DELETE RESTRICT
 );
@@ -655,6 +724,33 @@ CREATE UNIQUE INDEX certificate_ownership_overrides_active_idx
   predicate is index-level only.
 - An override always wins — engine precedence tier "explicit"
   (§4.2) is the override path.
+- **Override expiry lifecycle.** Mirrors the waiver expiry shape
+  in §3.13.
+  - `expires_at IS NULL` → override never auto-expires; the
+    operator clears it explicitly via the DELETE endpoint.
+  - `expires_at IS NOT NULL` → at the first ownership recompute
+    pass where `expires_at <= now`, the engine sets
+    `cleared_at = now`, `cleared_by = 'system'`,
+    `cleared_reason = 'auto-expired'` in the same transaction
+    as the cert's re-derivation. The pass emits
+    `ownership.override_expired` (severity:"security") followed
+    by the consequent `ownership.flipped` / `ownership.cleared`
+    audit row, if the new winning decision differs.
+- **Concurrent override conflict.** A second operator POSTing
+  `/certificates/{id}/ownership/override` while an active row
+  exists hits the partial unique index. The handler converts
+  the unique-violation into `409 ownership_override_conflict`
+  (see §7.14). Operators clear the existing override first or
+  PATCH it.
+- **Operator-immediate effect.** The override POST handler
+  performs a single-cert recompute in the same transaction so
+  the cert's `certificate_ownership.decision` flips before the
+  response returns; operators see immediate effect without
+  waiting for the next scheduler tick. The single-cert
+  recompute runs under `WithTxLockedOwnership(orgID)` to
+  serialize with any in-flight full sweep, but the lock release
+  is bounded by the single-cert work (sub-millisecond) so it
+  does not stall the sweep meaningfully.
 - Clearing an override produces a soft-delete row (set
   `cleared_at`, `cleared_by`, `cleared_reason`) plus an
   `ownership_override_cleared` audit row. The recompute then
@@ -668,13 +764,17 @@ CREATE TABLE ownership_match_explanations (
     organization_id     TEXT        NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
     certificate_id      TEXT        NOT NULL,
     decided_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
-    decided_decision    TEXT        NOT NULL,                   -- mirrors certificate_ownership.decision
+    decided_decision    TEXT        NOT NULL
+        CHECK (decided_decision IN ('matched','overridden','unowned','ambiguous')),
     decided_service_id  TEXT,
     winning_rule_id     TEXT,
     losing_rules        JSONB       NOT NULL DEFAULT '[]'::jsonb,   -- ordered list of {rule_id, tier, priority, reason_not_chosen}
     signals_seen        JSONB       NOT NULL DEFAULT '{}'::jsonb,   -- {san, subject_cn, issuer, store_location, agent_ids, agent_groups, tags}
     engine_version      INTEGER     NOT NULL,
-    FOREIGN KEY (organization_id, certificate_id) REFERENCES certificates(organization_id, id) ON DELETE CASCADE
+    UNIQUE (organization_id, id),                                   -- H-009 composite-FK target
+    FOREIGN KEY (organization_id, certificate_id) REFERENCES certificates(organization_id, id) ON DELETE CASCADE,
+    FOREIGN KEY (organization_id, winning_rule_id) REFERENCES ownership_rules(organization_id, id) ON DELETE RESTRICT,
+    FOREIGN KEY (organization_id, decided_service_id) REFERENCES services(organization_id, id) ON DELETE RESTRICT
 );
 
 CREATE INDEX ownership_match_explanations_org_cert_decided_idx
@@ -702,6 +802,21 @@ CREATE INDEX ownership_match_explanations_org_cert_decided_idx
   explanations unambiguously.
 - **Scale.** 50k certs × ownership flips averaging 2/cert/year ≈
   100k rows/year per org. Negligible; pruning is deferred.
+- **Bulk-flip cardinality risk.** The first time an operator
+  installs a `fallback` rule (§4.2 tier 8), every previously-
+  `unowned` cert flips in a single recompute pass — for a 50k-
+  cert org that's 50k new explanation rows in one transaction.
+  Acceptable in v0.x (200-byte rows, < 10 MB) but the recompute
+  pass commits these in the same transaction as the per-cert
+  audit rows; see §4.6 for the bulk-audit rollup that keeps
+  this from amplifying the audit table by the same factor.
+- **Retention.** No automatic cleanup in H-026. The
+  `certificate_ownership.explanation_id` pointer guarantees the
+  current explanation is always reachable; historical rows are
+  queryable via `decided_at DESC` ordering. A future operator-
+  policy retention (e.g., "keep the latest 10 per cert, prune
+  the rest after 90 days") lives as a HARDENING_BACKLOG item;
+  it does not block H-026 implementation.
 
 ### 3.11 Policy definitions
 
@@ -713,11 +828,13 @@ CREATE TABLE policy_definitions (
     display_name        TEXT        NOT NULL,
     description         TEXT        NOT NULL DEFAULT '',
     rules               JSONB       NOT NULL,                   -- list of policy_rule objects; see §5
-    version             INTEGER     NOT NULL DEFAULT 1,
+    schema_version      INTEGER     NOT NULL DEFAULT 1,         -- shape of the rules JSONB (engine-side)
+    version             INTEGER     NOT NULL DEFAULT 1,         -- operator-editable per-slug version
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     created_by          TEXT        NOT NULL,
     disabled_at         TIMESTAMPTZ,
+    UNIQUE (organization_id, id),                               -- H-009 composite-FK target
     UNIQUE (organization_id, slug, version)
 );
 ```
@@ -735,6 +852,24 @@ CREATE TABLE policy_definitions (
   rule objects on read; CLAUDE.md §8.4 forbids
   `map[string]any` in domain models, so the parsed shape lives in
   `governance/policy/definition.go`.
+- **Two version columns, two purposes.**
+  - `version` is the **operator-facing per-slug version** —
+    increments when an operator publishes new rule contents
+    under the same slug. Old `(slug, version)` rows stay for
+    historical explanations.
+  - `schema_version` is the **engine-side JSONB shape version**
+    — increments only when the H-026D engine learns a new rule
+    `kind` or changes the param shape of an existing kind. The
+    engine refuses to parse a row whose `schema_version` is
+    higher than the binary supports (fail closed); a row whose
+    `schema_version` is lower is upgraded in place by a
+    follow-up migration, never silently re-interpreted.
+- **JSONB write validation.** Every `POST /policies` and
+  `POST /policies/{id}/versions` parses the `rules` JSONB into
+  the typed Go shape, validates every `kind`+`params` pair, and
+  rejects on first error with `400 bad_request`. Storage never
+  sees a half-validated payload; the JSONB column is the
+  serialization format, not the source of truth.
 - **Scale.** Dozens of definitions per org × tens of rules each.
   Tiny.
 
@@ -745,7 +880,8 @@ CREATE TABLE policy_assignments (
     id                       TEXT        PRIMARY KEY,
     organization_id          TEXT        NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
     policy_definition_id     TEXT        NOT NULL,
-    scope_kind               TEXT        NOT NULL,              -- 'organization' | 'service_group' | 'service' | 'certificate'
+    scope_kind               TEXT        NOT NULL
+        CHECK (scope_kind IN ('organization','service_group','service','certificate')),
     scope_id                 TEXT        NOT NULL,              -- the org / group / service / certificate id
     assigned_by              TEXT        NOT NULL,
     assigned_at              TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -781,7 +917,8 @@ CREATE TABLE policy_waivers (
     organization_id          TEXT        NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
     policy_definition_id     TEXT        NOT NULL,
     policy_rule_local_id     TEXT        NOT NULL,              -- the per-rule id inside the policy's rules JSONB
-    scope_kind               TEXT        NOT NULL,              -- same enum as policy_assignments
+    scope_kind               TEXT        NOT NULL
+        CHECK (scope_kind IN ('organization','service_group','service','certificate')),
     scope_id                 TEXT        NOT NULL,
     reason                   TEXT        NOT NULL,
     granted_by               TEXT        NOT NULL,
@@ -789,6 +926,7 @@ CREATE TABLE policy_waivers (
     expires_at               TIMESTAMPTZ NOT NULL,              -- non-NULL; waivers MUST expire
     cleared_at               TIMESTAMPTZ,
     cleared_by               TEXT,
+    CONSTRAINT policy_waivers_expires_after_granted CHECK (expires_at > granted_at),
     FOREIGN KEY (organization_id, policy_definition_id) REFERENCES policy_definitions(organization_id, id) ON DELETE RESTRICT
 );
 
@@ -800,15 +938,30 @@ CREATE UNIQUE INDEX policy_waivers_active_idx
 ```
 
 - Waivers are **rule-scoped, time-bounded** exceptions. A waiver
-  cannot be permanent — `expires_at` is NOT NULL.
+  cannot be permanent — `expires_at` is NOT NULL and the
+  `policy_waivers_expires_after_granted` CHECK constraint
+  refuses past-or-now expiries at the DB level.
 - The recompute checks `expires_at > now()`; expired waivers stop
   applying without any explicit clear step. The recompute emits
-  an `policy_waiver_expired` audit row at expiry; clearing
-  explicitly produces `policy_waiver_cleared`.
+  an `policy_waiver.expired` audit row at expiry; clearing
+  explicitly produces `policy_waiver.cleared`.
+- **Maximum TTL is operator-policy, not schema.** The service
+  layer rejects `POST /policy-waivers` whose
+  `expires_at - now() > ANCHORIX_POLICY_WAIVER_MAX_TTL` (default
+  365 days). The cap lives in `internal/config` so it can be
+  tuned per deployment without a schema change. CLAUDE.md §8.9
+  applies — config is loaded once at startup.
 - **No "permanent waiver" path.** A repeatedly extended waiver is
   fine; a permanent exception requires editing the policy itself
   to drop the offending rule (which is itself an auditable
   policy version bump).
+- **Anti-abuse.** Every `POST /policy-waivers` writes an audit
+  row with severity:"security" and the operator's `reason`
+  field. Repeated extension of the same waiver by the same
+  operator surfaces in audit history; v0.x relies on operator
+  review of audit, not automated rejection. A future automated
+  abuse signal (e.g., "≥ 4 extensions on the same waiver in
+  90d") lives in HARDENING_BACKLOG.
 
 ### 3.14 Governance recompute runs
 
@@ -816,11 +969,13 @@ CREATE UNIQUE INDEX policy_waivers_active_idx
 CREATE TABLE governance_recompute_runs (
     id                  TEXT        PRIMARY KEY,
     organization_id     TEXT        NOT NULL REFERENCES organizations(id) ON DELETE RESTRICT,
-    kind                TEXT        NOT NULL,                   -- 'ownership' | 'policy'
+    kind                TEXT        NOT NULL
+        CHECK (kind IN ('ownership','policy')),
     started_at          TIMESTAMPTZ NOT NULL,
     finished_at         TIMESTAMPTZ,
     actor               TEXT        NOT NULL,                   -- user id, 'scheduler', 'preview'
-    actor_kind          TEXT        NOT NULL,                   -- 'user' | 'system' | 'preview'
+    actor_kind          TEXT        NOT NULL
+        CHECK (actor_kind IN ('user','system','preview')),
     succeeded           BOOLEAN,
     error_class         TEXT        NOT NULL DEFAULT '',
     evaluated_count     INTEGER     NOT NULL DEFAULT 0,
@@ -839,18 +994,35 @@ CREATE INDEX governance_recompute_runs_org_kind_started_idx
 - One row per recompute pass. Append-only at the application
   level (no UPDATE except for `finished_at` and the counters on
   the row the pass itself just inserted).
-- This is **NOT** the audit_events table; this is a per-pass
-  operational record. Audit events still fire on individual
-  ownership flips and policy waiver state changes.
-- Why a separate table: audit_events is per-state-change; the
-  per-pass summary is "this scheduler tick changed N certs"
-  which doesn't map cleanly to audit. Operators want both shapes
-  for different questions.
+- **Relationship to `audit_events`.** Each completed recompute
+  pass also writes **one** `governance.recomputed` audit row
+  (analogous to `findings.recomputed` —
+  [`CERTIFICATE_FINDINGS.md`](./CERTIFICATE_FINDINGS.md) §5).
+  That audit row's `metadata` carries the run id of the
+  `governance_recompute_runs` row plus the counter set, so an
+  operator can link audit-history queries to per-pass details
+  without duplicating the counters across two tables.
+  - `audit_events` answers "what changed?" (per-state-change
+    rows for ownership flips, override grants, waiver grants,
+    rule edits, etc.).
+  - `governance_recompute_runs` answers "what happened in
+    pass X?" (per-pass counters + start/finish timings +
+    success/error class).
+  - The two tables are complementary, not duplicative; an
+    integration test in H-026B asserts every recompute pass
+    produces exactly one row in each.
 
 ### 3.15 Indexes summary
 
 All indexes are intentional and documented inline per CLAUDE.md
 §16. The list below restates them as a single audit point.
+
+Composite-FK target uniqueness constraints (`UNIQUE
+(organization_id, id)` on tags, services, service_groups,
+agent_groups, ownership_rules, certificate_ownership_overrides,
+ownership_match_explanations, policy_definitions) are declared
+inline in the §3.3–§3.13 CREATE TABLE blocks and are NOT
+restated below — the table here lists query-shape indexes only.
 
 | Index                                                                                       | Query                                                            |
 | ------------------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
@@ -1021,12 +1193,16 @@ state changes are security events).
 
 | Audit action                       | Emitted when                                                                                              |
 | ---------------------------------- | --------------------------------------------------------------------------------------------------------- |
+| `governance.recomputed`            | Once per completed recompute pass (operator-triggered or scheduled). Metadata carries the run id + counters; analogous to `findings.recomputed`. |
 | `ownership.assigned`               | Decision flipped from `unowned` to `matched` (or `overridden`).                                            |
 | `ownership.cleared`                | Decision flipped from `matched`/`overridden` to `unowned`.                                                |
 | `ownership.flipped`                | Decision stayed `matched` but `service_id` changed.                                                       |
 | `ownership.overridden`             | Operator created or replaced an override.                                                                 |
 | `ownership.override_cleared`       | Operator cleared an override.                                                                             |
+| `ownership.override_expired`       | Recompute observed `expires_at <= now` on a previously-active override and auto-cleared it (§3.9).        |
 | `ownership.ambiguous_match`        | Decision = `ambiguous` for a cert that was previously deterministic.                                       |
+| `ownership.bulk_assigned`          | Rollup row for a per-pass bulk transition: written **instead of** N per-cert `ownership.assigned` rows when N exceeds `ANCHORIX_OWNERSHIP_BULK_AUDIT_THRESHOLD` (default 500). Metadata: `{run_id, count, sample_cert_ids: [first 100], from_decision, to_decision, driver_rule_id?}`. The detail is recoverable from `certificate_ownership.last_changed_at = run.finished_at` plus the explanation table. |
+| `ownership.bulk_flipped`           | Same rollup shape for in-rule-edit flips beyond the threshold.                                            |
 | `ownership.rule_created`           | Operator created an ownership rule.                                                                       |
 | `ownership.rule_updated`           | Operator updated an ownership rule (fields and old/new values in metadata).                                |
 | `ownership.rule_disabled`          | Operator disabled an ownership rule.                                                                      |
@@ -1035,6 +1211,31 @@ state changes are security events).
 Audit rows are written **inside the same transaction** as the
 state change. An audit-write failure rolls the entire recompute
 back — same pattern as findings recompute.
+
+**Bulk-rollup rationale.** The first operator action that adds a
+`fallback` rule to a 50k-cert org flips 50k certs in a single
+recompute pass. Without a rollup the audit_events table gains
+50k rows in one transaction, all with the same `recorded_at` —
+each individually under the security severity label, all of
+them indistinguishable from a real security signal in audit
+queries. This is the exact alert-fatigue failure mode
+[`HARDENING_BACKLOG.md`](./HARDENING_BACKLOG.md) H-019 calls
+out for cert ingestion. The threshold-driven rollup:
+
+- preserves auditability — the per-pass run_id links back to
+  `governance_recompute_runs` for the counter set, and per-cert
+  state is fully recoverable from `certificate_ownership`
+  itself,
+- keeps the security signal sharp — small flips (operator
+  creates a service for one new team, claims 12 certs) still
+  emit per-cert rows; bulk events are clearly labelled,
+- is deterministic at the threshold — the same recompute pass
+  on the same input writes either N per-cert rows or one
+  rollup row, never a mix for the same `(from, to)` transition.
+
+The threshold knob lives in `internal/config` (CLAUDE.md §8.9)
+and applies per `(from_decision, to_decision, driver)` group
+within a single pass.
 
 ### 4.7 Engine explainability contract
 
@@ -1287,7 +1488,7 @@ credentials are NOT honored on governance endpoints (CLAUDE.md
 GET    /api/v1/tags?cursor=&limit=
 POST   /api/v1/tags                         {key, value?, description?}
 GET    /api/v1/tags/{id}
-PATCH  /api/v1/tags/{id}                    {description?, value?}
+PATCH  /api/v1/tags/{id}                    {description?}
 POST   /api/v1/tags/{id}/disable
 POST   /api/v1/tags/{id}/enable
 POST   /api/v1/tags/{id}/assignments        {target_type, target_id}
@@ -1314,6 +1515,15 @@ Sample response:
   "disabled_at": null
 }
 ```
+
+**`PATCH /tags/{id}` cannot rename `key` or `value`.** Both
+fields are part of the tag's identity (the
+`UNIQUE (organization_id, key, value)` constraint); rewriting
+either would silently break every `tag_assignments` row that
+already targeted the old identity. Operators rename by
+creating a new tag and bulk-reassigning, or by disabling the
+old tag and enabling a fresh one. PATCH accepts `description`
+only.
 
 ### 7.3 Services and service groups
 
@@ -1569,6 +1779,28 @@ operator rollouts at fleet scale. CLAUDE.md §7.1
 (operator-controlled) makes "no surprises before commit" a hard
 requirement.
 
+**Preview is point-in-time, not time-stable.** Preview reflects
+the engine's decision against the database snapshot at
+**preview-time**. If another operator commits a rule edit, a
+new override, or an ingestion batch lands between preview and
+apply, the apply may produce a different diff than the preview
+showed. This is **expected**:
+
+- Preview answers "what would happen if I applied this right
+  now?" — not "what will happen when I apply this later?".
+- Apply takes its own REPEATABLE READ snapshot at apply-time
+  and is the authoritative result.
+- Operator UIs should re-preview after any concurrent state
+  change is visible (a refresh button, ideally with a
+  timestamp watermark).
+- The apply response is a full diff payload (matching the
+  preview shape) so an operator can compare apply-actual vs
+  preview-expected and detect drift.
+
+No locking is held between preview and apply — that would let
+a slow preview block the whole org's governance writes.
+Lock-on-preview is **explicitly out of scope**.
+
 ### 7.14 Error envelope additions
 
 All within the existing canonical envelope. New codes:
@@ -1576,11 +1808,15 @@ All within the existing canonical envelope. New codes:
 | Code                              | HTTP | Meaning                                                              |
 | --------------------------------- | ---- | -------------------------------------------------------------------- |
 | `tag_in_use`                      | 409  | Cannot disable a tag still attached to targets.                       |
+| `tag_identity_immutable`          | 400  | PATCH attempted to change `key` or `value` (see §7.2).                |
 | `service_in_use`                  | 409  | Cannot disable a service still referenced by ownership rules / overrides. |
 | `service_group_has_children`      | 409  | Cannot disable a group with active children.                          |
 | `service_group_cycle`             | 400  | Proposed parent would create a cycle.                                 |
+| `ownership_override_conflict`     | 409  | POST `/ownership/override` while an active (uncleared) override already exists for the cert. Operator must clear or PATCH the existing override first. |
 | `policy_definition_in_use`        | 409  | Cannot disable a published policy with active assignments.            |
 | `policy_waiver_expired_required`  | 400  | Waiver `expires_at` is required and must be > now.                    |
+| `policy_waiver_ttl_too_long`      | 400  | `expires_at - now` exceeds `ANCHORIX_POLICY_WAIVER_MAX_TTL`.          |
+| `policy_rule_kind_unknown`        | 400  | `POST /policies` rules JSONB carries an unknown `kind` or invalid `params` for the engine's current `schema_version`. |
 | `ownership_recompute_in_progress` | 409  | Concurrent recompute for the same org; retry-able.                    |
 | `policy_recompute_in_progress`    | 409  | Same as above for policy recompute.                                   |
 
@@ -1892,12 +2128,23 @@ read-heavy on `certificates`, `certificate_observations`,
 
 ### 9.11 Migration strategy
 
-| Phase    | DB migration                               | Rollback                                                  |
-| -------- | ------------------------------------------ | --------------------------------------------------------- |
-| H-026A   | `0009_trust_governance.sql` (additive)     | None needed; tables stay, code doesn't use them.          |
-| H-026B   | (no new migration)                         | Disable scheduler env knob.                                |
-| H-026C   | (no new migration)                         | Code rollback; assignment / rule rows linger harmlessly.   |
-| H-026D   | `0010_findings_governance_columns.sql`     | Additive columns nullable; code rollback ignores them.   |
+The full H-026 foundation schema (three migration files —
+identity, ownership, policy) lands together in H-026A1 so the
+repository tests can exercise every table from the start.
+H-026A2 and H-026A3 ship **no new migrations** — they add
+service-layer code and HTTP handlers against the schema A1
+established. H-026B re-uses the same schema. The next
+migration after H-026A is H-026D's additive columns on
+`findings`.
+
+| Phase    | DB migrations introduced                                                                                                       | Rollback                                                  |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------- |
+| H-026A1  | `0009_governance_identity.sql` + `0010_governance_ownership.sql` + `0011_governance_policy.sql` (all three; additive)          | None needed; tables stay, code doesn't use them.          |
+| H-026A2  | (no new migration)                                                                                                             | Code rollback; identity rows linger harmlessly.           |
+| H-026A3  | (no new migration)                                                                                                             | Trivial — composition wiring only.                         |
+| H-026B   | (no new migration)                                                                                                             | Disable scheduler env knob.                                |
+| H-026C   | (no new migration)                                                                                                             | Code rollback; assignment / rule rows linger harmlessly.   |
+| H-026D   | `0012_findings_governance_columns.sql`                                                                                         | Additive columns nullable; code rollback ignores them.   |
 
 No destructive migrations anywhere. CLAUDE.md §16's two-phase
 destructive-migration rule does not apply because nothing is
@@ -1947,52 +2194,172 @@ The preview transaction:
 
 ## 11. Phased roadmap
 
-### 11.1 H-026A — Storage & vocabulary foundations
+### 11.1 H-026A — Storage & vocabulary foundations (split into A1 / A2 / A3)
 
-**Goal:** lay down the data model and minimal CRUD without
-activating the inference engine.
+**Original framing.** Earlier drafts targeted a single H-026A
+PR at < 1000 LOC. The hardening pass concluded this is
+unrealistic: 15 new tables + 4 Postgres repository files +
+service layer + HTTP handlers + integration tests is well over
+3000 LOC even with no engine code. Reviewing the full
+foundation in one PR would dilute attention exactly where it
+matters most — the schema correctness and cross-org safety
+invariants. H-026A therefore splits into three sequential PRs,
+each independently mergeable and reversible. None of the three
+turns on the engine; the engine is H-026B.
 
-**Migration:** `0009_trust_governance.sql` — all tables in §3.
-Each table carries inline index intent per CLAUDE.md §16.
+**Goal across A1+A2+A3:** lay down the data model and minimal
+CRUD without activating the inference engine. The vocabulary
+exists, the schema validates, but the recompute scheduler is
+not constructed and no `*/preview` endpoints are routed.
 
-**Code (domain):**
+---
 
-- `internal/identity/` package: types, repository interface,
-  service with CRUD for tags, services, service groups, agent
-  groups, and their assignment / membership tables.
-- `internal/governance/` package skeleton: types, repository
-  interfaces for ownership_rules, certificate_ownership,
-  certificate_ownership_overrides, ownership_match_explanations,
-  policy_definitions, policy_assignments, policy_waivers,
-  governance_recompute_runs. NO engine implementation.
-- `internal/storage/postgres/`: repository implementations for
-  the new tables.
-- `internal/httpapi/handlers/`: CRUD handlers for tags,
-  services, service groups, agent groups. NO ownership /
-  policy handlers (those require the engine).
+#### H-026A1 — schema + repository interfaces
+
+Lowest-risk PR. No service layer, no HTTP handlers. Verifies
+the schema works end-to-end via repository-layer tests.
+
+**Migration:** `0009_governance_identity.sql` +
+`0010_governance_ownership.sql` +
+`0011_governance_policy.sql`. Three append-only files in the
+dependency order from §3.2. Each table carries inline index
+intent + CHECK constraints per §3.
+
+**Code:**
+
+- `internal/identity/`: `doc.go`, `types.go` (Go shapes for
+  Tag, TagAssignment, Service, ServiceGroup,
+  ServiceGroupMembership, AgentGroup, AgentGroupMembership),
+  `repository.go` (consumer-owned interface). No service.go.
+- `internal/governance/`: `doc.go`, `types.go` (Go shapes for
+  OwnershipRule, CertificateOwnership, OverrideRow,
+  ExplanationRow, PolicyDefinition, PolicyAssignment,
+  PolicyWaiver, GovernanceRecomputeRun), `repository.go`
+  (consumer-owned interface). No engine code.
+- `internal/storage/postgres/`: `identity_repository.go`,
+  `governance_ownership_repository.go`,
+  `governance_policy_repository.go`,
+  `governance_recompute_runs_repository.go`. Implement the
+  repository interfaces with parameterized SQL.
 
 **Tests:**
 
-- Unit tests for service-layer validators (slug rules,
-  service_group cycle detection, polymorphic target dispatch).
-- Integration tests for each CRUD endpoint, cross-org isolation,
-  soft-delete behavior, audit row emission.
+- Schema test: migrations apply cleanly on a fresh DB and on
+  one carrying v0.1 + H-024 schema.
+- Repository tests for each table: insert / read / soft-delete
+  / unique-constraint behavior / CHECK-constraint rejection.
+- Cross-org isolation tests at the repository level (every
+  H-009 composite FK rejects mismatched-org rows).
+- Partial-unique index tests for overrides, assignments,
+  waivers.
 
-**Out of scope for H-026A:**
+**Out of scope for A1:**
 
-- Engine code (ownership inference, policy resolution).
-- Recompute scheduler.
-- `*/preview` endpoints.
-- Ownership / policy override and waiver handlers (rows can be
-  written via the repository layer for tests, but no HTTP
-  surface yet).
-- Findings integration.
+- Service layer code (validators, slug rules, cycle detection).
+- HTTP handlers.
+- Audit recording (no state changes yet — service layer owns
+  audit).
+- Composition-root wiring beyond what tests need.
 
-**LOC budget:** < 1000 LOC including tests. PR title:
-`feat(governance): trust governance storage foundations`.
+**LOC budget:** ~1200–1500 LOC including tests. PR title:
+`feat(governance): schema + repository interfaces`.
 
-**Reversibility:** complete. Tables are empty; no code reads
-them outside the test suite.
+**Reversibility:** complete. Tables empty; no production code
+reads them.
+
+---
+
+#### H-026A2 — identity service + HTTP handlers
+
+Builds on A1. Wires the operator-facing CRUD surface for the
+identity vocabulary (tags, services, service groups, agent
+groups, memberships). NO ownership / policy handlers — those
+need the engine (H-026B).
+
+**Code:**
+
+- `internal/identity/service.go`: CRUD with validators (slug
+  format, service_group cycle detection, polymorphic
+  tag_assignments target dispatch, tag identity-immutable
+  PATCH rejection, agent membership validation).
+- `internal/identity/errors.go`: sentinel errors for the new
+  error codes added in §7.14 (tag_in_use, tag_identity_immutable,
+  service_in_use, service_group_has_children,
+  service_group_cycle).
+- `internal/httpapi/handlers/identity_*.go`: handlers for
+  /tags, /services, /service-groups, /agent-groups +
+  memberships + tag assignments.
+- `internal/httpapi/router.go`: route registration.
+- `internal/audit`: extend the existing `audit.Recorder`
+  interface only if new action constants are needed; the
+  governance.recomputed / ownership.* actions land in H-026B.
+- `cmd/anchorix/serve.go`: compose identity.Service into the
+  router.
+
+**Tests:**
+
+- Unit tests for service-layer validators (deterministic
+  output for every input case).
+- Integration tests for each HTTP endpoint: success path,
+  cross-org → 404, cross-tenant tag-target rejection,
+  soft-delete + re-enable, tag identity-immutable PATCH
+  rejection, service_group cycle rejection.
+- Audit-row emission test for every state-changing endpoint.
+
+**LOC budget:** ~1500–1800 LOC including tests. PR title:
+`feat(identity): tags, services, groups CRUD`.
+
+**Reversibility:** disable the new routes via a feature gate
+in `internal/config` (`ANCHORIX_GOVERNANCE_API_ENABLED`,
+default true). Defaulting to true is acceptable because the
+endpoints have no governance side effects yet — they manage
+operator-curated metadata only.
+
+---
+
+#### H-026A3 — governance domain skeleton + composition
+
+Smallest of the three. Wires the governance domain types into
+the composition root so H-026B can consume them. No engine
+code, no handlers.
+
+**Code:**
+
+- `internal/governance/doc.go`: per-package responsibilities.
+- `internal/governance/ownership/doc.go`,
+  `internal/governance/policy/doc.go`: placeholder package
+  docs declaring forbidden imports (per §2.2). No `.go` files
+  beyond `doc.go` until H-026B.
+- `cmd/anchorix/serve.go`: pre-wires the governance repository
+  interfaces into a `governance.Repo` aggregate so H-026B's
+  service constructors slot in without composition-root
+  churn.
+- Sanity test: composition root constructs cleanly with the
+  new wiring; no behavior change.
+
+**LOC budget:** ~300–500 LOC including doc.go boilerplate and
+the sanity test. PR title:
+`chore(governance): wire governance domain skeleton`.
+
+**Reversibility:** trivial; no operator-visible change.
+
+---
+
+**Why three PRs and not one.**
+
+- A1's review focus is **schema correctness** (composite FKs,
+  CHECK constraints, partial unique indexes). Reviewers should
+  not have to skim past handler code to find a missing
+  `UNIQUE (organization_id, id)`.
+- A2's review focus is **operator-facing CRUD ergonomics**
+  (slug validation, identity immutability, cycle detection,
+  audit-row emission).
+- A3's review focus is **package boundary enforcement** (§2.2
+  forbidden imports). A small PR makes the boundary explicit.
+
+Each PR has its own correctness bar; none depends on a future
+phase. H-026B (engine) starts only after A1+A2+A3 are merged
+and the operator-curated vocabulary is in place.
 
 ### 11.2 H-026B — Ownership inference engine
 
@@ -2083,7 +2450,7 @@ implements the violation engine.
 violations as findings; existing finding rows get denormalized
 owner attribution.
 
-**Migration:** `0010_findings_governance_columns.sql` — additive
+**Migration:** `0012_findings_governance_columns.sql` — additive
 columns on `findings` (`owner_service_id`, `owner_decision`,
 `policy_violations`).
 
@@ -2280,10 +2647,13 @@ and CLAUDE.md:
 
 ## 15. Status
 
-| Item                                   | Status                          |
-| -------------------------------------- | ------------------------------- |
-| H-026 plan (this doc)                  | **proposed (this PR)**          |
-| H-026A — storage foundations           | not started                      |
-| H-026B — ownership inference engine    | not started                      |
-| H-026C — operator workflows            | not started                      |
-| H-026D — findings & policy integration | not started                      |
+| Item                                                       | Status                          |
+| ---------------------------------------------------------- | ------------------------------- |
+| H-026 plan                                                 | shipped (PR #41)                 |
+| H-026 post-design hardening (this PR)                      | **proposed**                     |
+| H-026A1 — schema + repository interfaces                   | not started                      |
+| H-026A2 — identity service + HTTP handlers                 | not started                      |
+| H-026A3 — governance domain skeleton + composition         | not started                      |
+| H-026B — ownership inference engine                        | not started                      |
+| H-026C — operator workflows                                | not started                      |
+| H-026D — findings & policy integration                     | not started                      |

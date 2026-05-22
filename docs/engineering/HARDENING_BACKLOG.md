@@ -16,6 +16,62 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
 
 ## Open Items
 
+### H-027 — Ownership explanation retention policy
+
+- **Title:** `feat(governance): ownership_match_explanations retention sweep`
+- **Risk:** low-medium (storage growth). H-026's
+  `ownership_match_explanations` table only writes a row when
+  a cert's decision changes; for a stable fleet this caps
+  cardinality. But fleets undergoing active classification
+  rollout (every operator iteration on rules flips a slice of
+  certs) can grow this table by tens of thousands of rows per
+  day during onboarding. v0.x keeps every row forever and
+  relies on the `certificate_ownership.explanation_id` pointer
+  to keep the latest reachable; older rows accumulate without
+  a query path beyond the explanation timeline endpoint.
+- **Scope:** background sweep (sibling to the ownership
+  scheduler) that prunes per-cert explanation history beyond a
+  retention window. Concrete policy: "keep the latest 10
+  explanations per cert; rows older than 90 days that are not
+  in the latest-10 set are deleted". Each cleanup pass emits
+  one `governance.explanation_pruned` audit row with a count;
+  no per-row audit. The sweep takes the per-org advisory lock
+  so it serializes with recompute. The
+  `certificate_ownership.explanation_id` invariant must hold —
+  the current explanation is never pruned.
+- **Recommended PR:** `feat(governance): explanation retention sweep`.
+- **Reason not fixed now:** picking a retention window before
+  pilot data exists picks an arbitrary number. The H-026A
+  schema is unchanged whichever policy lands. Defer until
+  pilot measurements indicate the storage cost is meaningful.
+- **References:** CLAUDE.md §16 (no destructive migrations —
+  this is a scheduled DELETE, not a migration);
+  `docs/engineering/H026_TRUST_GOVERNANCE_PLAN.md` §3.10.
+
+### H-028 — Policy waiver abuse signal
+
+- **Title:** `feat(governance): policy waiver extension abuse detection`
+- **Risk:** low (governance, not security). H-026's policy
+  waiver model requires `expires_at` and audits every grant,
+  but operators can repeatedly extend the same waiver to
+  effectively make it permanent. The audit history exposes
+  this, but no in-product signal surfaces "this waiver has
+  been extended four times in 90 days".
+- **Scope:** small read-side helper that returns a "waivers
+  needing governance review" list — waivers with N grants
+  for the same `(policy_definition_id, policy_rule_local_id,
+  scope_kind, scope_id)` tuple within the last 90 days where
+  N exceeds a configurable threshold. No automatic
+  rejection; the goal is surfacing for review. Lives behind
+  `GET /policy-waivers?review_needed=true`.
+- **Recommended PR:** `feat(governance): waiver review signal`.
+- **Reason not fixed now:** v0.x has no waivers yet; the
+  feature requires real data to tune the threshold. Defer
+  until H-026D ships and pilot operators have written enough
+  waivers to calibrate.
+- **References:** `docs/engineering/H026_TRUST_GOVERNANCE_PLAN.md`
+  §3.13, §5.6.
+
 ### H-025 — Findings scheduler: per-recompute timeout
 
 - **Title:** `feat(findings): per-org recompute timeout in scheduler`
