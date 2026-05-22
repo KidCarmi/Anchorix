@@ -17,6 +17,7 @@ import (
 	"github.com/kidcarmi/anchorix/backend/internal/config"
 	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
 	"github.com/kidcarmi/anchorix/backend/internal/findings"
+	"github.com/kidcarmi/anchorix/backend/internal/identity"
 	"github.com/kidcarmi/anchorix/backend/internal/inventory"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
 )
@@ -31,6 +32,13 @@ type Dependencies struct {
 	AgentInventoryService *agentinventory.Service
 	InventoryService      *inventory.Service
 	FindingsService       *findings.Service
+
+	// IdentityService is the H-026A2 trust-governance vocabulary
+	// service (tags, services, service groups, agent groups,
+	// memberships). May be nil when ANCHORIX_GOVERNANCE_API_ENABLED
+	// is false — in that case the router skips registering the
+	// identity routes and they return 404.
+	IdentityService *identity.Service
 }
 
 // Server owns the HTTP listener and graceful shutdown lifecycle.
@@ -58,6 +66,9 @@ func NewServer(cfg *config.Config, log *logger.Logger, deps Dependencies) (*Serv
 	if deps.AuthService == nil || deps.CookieSigner == nil || deps.EnrollmentService == nil || deps.AgentInventoryService == nil || deps.InventoryService == nil || deps.FindingsService == nil {
 		return nil, errors.New("httpapi: incomplete Dependencies (AuthService + CookieSigner + EnrollmentService + AgentInventoryService + InventoryService + FindingsService required)")
 	}
+	// IdentityService is OPTIONAL — controlled by the H-026A2
+	// ANCHORIX_GOVERNANCE_API_ENABLED feature gate. When nil,
+	// the router skips registering the identity routes.
 	readiness := NewReadiness()
 	router := newRouter(cfg, log, readiness, deps)
 	srv := &http.Server{

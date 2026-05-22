@@ -164,6 +164,60 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 	mux.Handle("POST /findings/{id}/suppress",
 		resolver(mw.RequireAuth(handlers.FindingsSuppress(findingsDeps))))
 
+	// --- identity / governance vocabulary (H-026A2) ---
+	// Operator-only. Routes are registered only when
+	// ANCHORIX_GOVERNANCE_API_ENABLED is true and the
+	// IdentityService dependency is wired. When the feature
+	// gate is off, every path below returns 404 (the routes
+	// are not present in the mux).
+	//
+	// Agent bearer credentials are NOT honored on these
+	// routes — the resolver attaches an operator session
+	// only, and RequireAuth gates anonymous traffic.
+	if deps.IdentityService != nil {
+		identityDeps := handlers.IdentityDeps{Service: deps.IdentityService}
+
+		// tags
+		mux.Handle("GET /tags", resolver(mw.RequireAuth(handlers.TagsList(identityDeps))))
+		mux.Handle("POST /tags", resolver(mw.RequireAuth(handlers.TagsCreate(identityDeps))))
+		mux.Handle("GET /tags/{id}", resolver(mw.RequireAuth(handlers.TagsGet(identityDeps))))
+		mux.Handle("PATCH /tags/{id}", resolver(mw.RequireAuth(handlers.TagsUpdate(identityDeps))))
+		mux.Handle("POST /tags/{id}/disable", resolver(mw.RequireAuth(handlers.TagsDisable(identityDeps))))
+		mux.Handle("POST /tags/{id}/enable", resolver(mw.RequireAuth(handlers.TagsEnable(identityDeps))))
+		mux.Handle("GET /tags/{id}/assignments", resolver(mw.RequireAuth(handlers.TagAssignmentsList(identityDeps))))
+		mux.Handle("POST /tags/{id}/assignments", resolver(mw.RequireAuth(handlers.TagAssignmentsCreate(identityDeps))))
+		mux.Handle("DELETE /tags/{id}/assignments", resolver(mw.RequireAuth(handlers.TagAssignmentsDelete(identityDeps))))
+
+		// services
+		mux.Handle("GET /services", resolver(mw.RequireAuth(handlers.ServicesList(identityDeps))))
+		mux.Handle("POST /services", resolver(mw.RequireAuth(handlers.ServicesCreate(identityDeps))))
+		mux.Handle("GET /services/{id}", resolver(mw.RequireAuth(handlers.ServicesGet(identityDeps))))
+		mux.Handle("PATCH /services/{id}", resolver(mw.RequireAuth(handlers.ServicesUpdate(identityDeps))))
+		mux.Handle("POST /services/{id}/disable", resolver(mw.RequireAuth(handlers.ServicesDisable(identityDeps))))
+		mux.Handle("POST /services/{id}/enable", resolver(mw.RequireAuth(handlers.ServicesEnable(identityDeps))))
+		mux.Handle("POST /services/{id}/group", resolver(mw.RequireAuth(handlers.ServicesSetGroup(identityDeps))))
+		mux.Handle("DELETE /services/{id}/group", resolver(mw.RequireAuth(handlers.ServicesClearGroup(identityDeps))))
+
+		// service groups
+		mux.Handle("GET /service-groups", resolver(mw.RequireAuth(handlers.ServiceGroupsList(identityDeps))))
+		mux.Handle("POST /service-groups", resolver(mw.RequireAuth(handlers.ServiceGroupsCreate(identityDeps))))
+		mux.Handle("GET /service-groups/{id}", resolver(mw.RequireAuth(handlers.ServiceGroupsGet(identityDeps))))
+		mux.Handle("POST /service-groups/{id}/parent", resolver(mw.RequireAuth(handlers.ServiceGroupsSetParent(identityDeps))))
+		mux.Handle("POST /service-groups/{id}/disable", resolver(mw.RequireAuth(handlers.ServiceGroupsDisable(identityDeps))))
+
+		// agent groups
+		mux.Handle("GET /agent-groups", resolver(mw.RequireAuth(handlers.AgentGroupsList(identityDeps))))
+		mux.Handle("POST /agent-groups", resolver(mw.RequireAuth(handlers.AgentGroupsCreate(identityDeps))))
+		mux.Handle("GET /agent-groups/{id}", resolver(mw.RequireAuth(handlers.AgentGroupsGet(identityDeps))))
+		mux.Handle("POST /agent-groups/{id}/disable", resolver(mw.RequireAuth(handlers.AgentGroupsDisable(identityDeps))))
+		mux.Handle("GET /agent-groups/{id}/members", resolver(mw.RequireAuth(handlers.AgentGroupsListMembers(identityDeps))))
+		mux.Handle("POST /agent-groups/{id}/members", resolver(mw.RequireAuth(handlers.AgentGroupsAddMember(identityDeps))))
+		mux.Handle("DELETE /agent-groups/{id}/members", resolver(mw.RequireAuth(handlers.AgentGroupsRemoveMember(identityDeps))))
+
+		// agents-side inverse view of group memberships
+		mux.Handle("GET /agents/{id}/groups", resolver(mw.RequireAuth(handlers.AgentsListGroups(identityDeps))))
+	}
+
 	// --- audit ---
 	mux.HandleFunc("GET /audit/events", handlers.AuditList)
 

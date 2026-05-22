@@ -120,7 +120,7 @@ func TestIdentityServicesRoundTrip(t *testing.T) {
 	defer cancel()
 	now := time.Now().UTC()
 
-	svc := &identity.Service{
+	svc := &identity.ServiceRecord{
 		ID:             "svc-rt-1",
 		OrganizationID: "anchorix",
 		Slug:           "billing",
@@ -220,7 +220,7 @@ func TestIdentityServiceGroupsHierarchy(t *testing.T) {
 	}
 
 	// Service + membership.
-	svc := &identity.Service{
+	svc := &identity.ServiceRecord{
 		ID:             "svc-checkout",
 		OrganizationID: "anchorix",
 		Slug:           "checkout",

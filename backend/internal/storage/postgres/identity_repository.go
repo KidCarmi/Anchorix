@@ -252,7 +252,7 @@ func (r *IdentityRepository) ListTagAssignmentsForTag(
 
 // ----- services -----
 
-func (r *IdentityRepository) CreateService(ctx context.Context, s *identity.Service) error {
+func (r *IdentityRepository) CreateService(ctx context.Context, s *identity.ServiceRecord) error {
 	if s == nil {
 		return errors.New("postgres: nil service")
 	}
@@ -276,7 +276,7 @@ func (r *IdentityRepository) CreateService(ctx context.Context, s *identity.Serv
 	return nil
 }
 
-func (r *IdentityRepository) GetService(ctx context.Context, organizationID, serviceID string) (*identity.Service, error) {
+func (r *IdentityRepository) GetService(ctx context.Context, organizationID, serviceID string) (*identity.ServiceRecord, error) {
 	const q = `
 		SELECT id, organization_id, slug, display_name, description,
 		       owner_email, owner_team, business_unit,
@@ -294,7 +294,7 @@ func (r *IdentityRepository) GetService(ctx context.Context, organizationID, ser
 	return s, nil
 }
 
-func (r *IdentityRepository) GetServiceBySlug(ctx context.Context, organizationID, slug string) (*identity.Service, error) {
+func (r *IdentityRepository) GetServiceBySlug(ctx context.Context, organizationID, slug string) (*identity.ServiceRecord, error) {
 	const q = `
 		SELECT id, organization_id, slug, display_name, description,
 		       owner_email, owner_team, business_unit,
@@ -316,7 +316,7 @@ func (r *IdentityRepository) ListServices(
 	ctx context.Context,
 	organizationID string,
 	activeOnly bool,
-) ([]identity.Service, error) {
+) ([]identity.ServiceRecord, error) {
 	q := `
 		SELECT id, organization_id, slug, display_name, description,
 		       owner_email, owner_team, business_unit,
@@ -332,7 +332,7 @@ func (r *IdentityRepository) ListServices(
 		return nil, fmt.Errorf("postgres: list services: %w", err)
 	}
 	defer rows.Close()
-	var out []identity.Service
+	var out []identity.ServiceRecord
 	for rows.Next() {
 		s, err := scanService(rows)
 		if err != nil {
@@ -819,8 +819,8 @@ func scanTagAssignmentList(rows pgx.Rows) ([]identity.TagAssignment, error) {
 	return out, nil
 }
 
-func scanService(r rowScanner) (*identity.Service, error) {
-	var s identity.Service
+func scanService(r rowScanner) (*identity.ServiceRecord, error) {
+	var s identity.ServiceRecord
 	if err := r.Scan(
 		&s.ID, &s.OrganizationID, &s.Slug, &s.DisplayName, &s.Description,
 		&s.OwnerEmail, &s.OwnerTeam, &s.BusinessUnit,
