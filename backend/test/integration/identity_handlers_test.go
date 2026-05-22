@@ -19,12 +19,26 @@ import (
 // nil), and asserts the status code matches.
 func doJSON(t *testing.T, client *http.Client, method, url string, body any, wantStatus int, out any) []byte {
 	t.Helper()
-	var rdr *bytes.Reader
+	var raw []byte
 	if body != nil {
-		raw, err := json.Marshal(body)
+		var err error
+		raw, err = json.Marshal(body)
 		if err != nil {
 			t.Fatalf("marshal: %v", err)
 		}
+	}
+	return doJSONRaw(t, client, method, url, raw, wantStatus, out)
+}
+
+// doJSONRaw is the bytes-in variant of doJSON. Use it when the
+// wire shape matters character-for-character (e.g. `null`
+// vs an omitted field, where Go's json.Marshal of *string nil
+// would emit `null` but Go's json.Marshal of a missing struct
+// field cannot be expressed at all).
+func doJSONRaw(t *testing.T, client *http.Client, method, url string, raw []byte, wantStatus int, out any) []byte {
+	t.Helper()
+	var rdr *bytes.Reader
+	if raw != nil {
 		rdr = bytes.NewReader(raw)
 	} else {
 		rdr = bytes.NewReader(nil)
@@ -33,7 +47,7 @@ func doJSON(t *testing.T, client *http.Client, method, url string, body any, wan
 	if err != nil {
 		t.Fatalf("new request: %v", err)
 	}
-	if body != nil {
+	if raw != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
 	resp, err := client.Do(req)
@@ -50,7 +64,6 @@ func doJSON(t *testing.T, client *http.Client, method, url string, body any, wan
 		if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
 			t.Fatalf("decode %s: %v", url, err)
 		}
-		return nil
 	}
 	return nil
 }
@@ -226,6 +239,59 @@ func TestServicesInvalidSlugRejected(t *testing.T) {
 		doJSON(t, client, http.MethodPost, srv.URL+"/api/v1/services",
 			map[string]any{"slug": bad, "display_name": "X"},
 			http.StatusBadRequest, nil)
+	}
+}
+
+// TestServiceGroupSetParentRequiresExplicitField pins the wire
+// contract for POST /service-groups/{id}/parent: a missing
+// parent_id field returns 400, an explicit `null` clears the
+// parent, and a string value sets it. Codex caught the original
+// bug on PR #45 where a missing field was silently clearing the
+// parent. The empty / no-body call MUST be rejected so a
+// malformed client cannot detach groups by accident.
+func TestServiceGroupSetParentRequiresExplicitField(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	srv, svc := testServer(t, db)
+	client := signInAdmin(t, urlSrv{url: srv.URL}, svc)
+
+	// Build root + child.
+	var root identityServiceGroup
+	doJSON(t, client, http.MethodPost, srv.URL+"/api/v1/service-groups",
+		map[string]any{"slug": "spr-root", "display_name": "Root"},
+		http.StatusCreated, &root)
+	var child identityServiceGroup
+	doJSON(t, client, http.MethodPost, srv.URL+"/api/v1/service-groups",
+		map[string]any{"slug": "spr-child", "display_name": "Child", "parent_id": root.ID},
+		http.StatusCreated, &child)
+
+	// Missing parent_id — must be rejected. The empty JSON
+	// object {} carries no field; previously this silently
+	// cleared the parent.
+	doJSON(t, client, http.MethodPost, srv.URL+"/api/v1/service-groups/"+child.ID+"/parent",
+		map[string]any{}, http.StatusBadRequest, nil)
+
+	// Confirm the child's parent is still root (the bug
+	// would have cleared it).
+	var after identityServiceGroup
+	doJSON(t, client, http.MethodGet, srv.URL+"/api/v1/service-groups/"+child.ID,
+		nil, http.StatusOK, &after)
+	if after.ParentID == nil || *after.ParentID != root.ID {
+		t.Fatalf("parent silently cleared by missing-field request: %+v", after.ParentID)
+	}
+
+	// Explicit null — clears the parent.
+	doJSONRaw(t, client, http.MethodPost, srv.URL+"/api/v1/service-groups/"+child.ID+"/parent",
+		[]byte(`{"parent_id": null}`), http.StatusOK, &after)
+	if after.ParentID != nil {
+		t.Fatalf("explicit null did not clear parent: %+v", after.ParentID)
+	}
+
+	// Set to a value — restores the parent.
+	doJSON(t, client, http.MethodPost, srv.URL+"/api/v1/service-groups/"+child.ID+"/parent",
+		map[string]any{"parent_id": root.ID}, http.StatusOK, &after)
+	if after.ParentID == nil || *after.ParentID != root.ID {
+		t.Fatalf("set-parent did not restore: %+v", after.ParentID)
 	}
 }
 

@@ -1,6 +1,8 @@
 package handlers
 
 import (
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"time"
 
@@ -142,9 +144,15 @@ func ServiceGroupsGet(deps IdentityDeps) http.HandlerFunc {
 //	{ "parent_id": null }        clears parent (group becomes root)
 //
 // The explicit null is required so callers cannot accidentally
-// clear a parent by omitting the field.
+// clear a parent by omitting the field. ParentID uses
+// json.RawMessage rather than `*string` because Go's encoding/json
+// cannot distinguish "field omitted" from "field set to null"
+// with a `*string` — both decode to nil. RawMessage preserves
+// the raw bytes so the handler can detect presence explicitly
+// (len(ParentID) == 0 ⇒ missing field; "null" ⇒ explicit clear;
+// quoted string ⇒ set).
 type setParentRequest struct {
-	ParentID *string `json:"parent_id"`
+	ParentID json.RawMessage `json:"parent_id"`
 }
 
 // ServiceGroupsSetParent handles POST
@@ -162,10 +170,32 @@ func ServiceGroupsSetParent(deps IdentityDeps) http.HandlerFunc {
 			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid request body")
 			return
 		}
+		// parent_id MUST be present. An omitted field would
+		// silently clear the parent — that's a behavior bug
+		// the explicit-null contract is designed to prevent.
+		// Codex caught this on PR #45.
+		if len(body.ParentID) == 0 {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request",
+				"parent_id is required (use null to clear)")
+			return
+		}
+		var parentID *string
+		// Trim whitespace before the literal `null` check so
+		// `{ "parent_id":  null }` parses cleanly.
+		trimmed := bytes.TrimSpace(body.ParentID)
+		if !bytes.Equal(trimmed, []byte("null")) {
+			var s string
+			if err := json.Unmarshal(body.ParentID, &s); err != nil {
+				envelope.WriteError(w, http.StatusBadRequest, "bad_request",
+					"parent_id must be a string or null")
+				return
+			}
+			parentID = &s
+		}
 		if err := deps.Service.UpdateServiceGroupParent(r.Context(), identity.UpdateServiceGroupParentInput{
 			OrganizationID: user.OrganizationID,
 			GroupID:        r.PathValue("id"),
-			ParentID:       body.ParentID,
+			ParentID:       parentID,
 			ActorUserID:    user.ID,
 		}); err != nil {
 			if !writeIdentityError(w, err) {
