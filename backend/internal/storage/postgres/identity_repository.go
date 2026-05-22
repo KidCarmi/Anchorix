@@ -45,6 +45,9 @@ func (r *IdentityRepository) CreateTag(ctx context.Context, t *identity.Tag) err
 		t.ID, t.OrganizationID, t.Key, t.Value, t.Description,
 		t.CreatedAt, t.UpdatedAt, t.DisabledAt,
 	); err != nil {
+		if isUniqueViolation(err) {
+			return identity.ErrAlreadyExists
+		}
 		return fmt.Errorf("postgres: create tag: %w", err)
 	}
 	return nil
@@ -183,6 +186,9 @@ func (r *IdentityRepository) CreateTagAssignment(ctx context.Context, a *identit
 		a.ID, a.OrganizationID, a.TagID, string(a.TargetType), a.TargetID,
 		a.AssignedBy, a.AssignedAt,
 	); err != nil {
+		if isUniqueViolation(err) {
+			return identity.ErrAlreadyExists
+		}
 		return fmt.Errorf("postgres: create tag assignment: %w", err)
 	}
 	return nil
@@ -271,6 +277,9 @@ func (r *IdentityRepository) CreateService(ctx context.Context, s *identity.Serv
 		s.OwnerEmail, s.OwnerTeam, s.BusinessUnit,
 		s.CreatedAt, s.UpdatedAt, s.DisabledAt,
 	); err != nil {
+		if isUniqueViolation(err) {
+			return identity.ErrAlreadyExists
+		}
 		return fmt.Errorf("postgres: create service: %w", err)
 	}
 	return nil
@@ -421,6 +430,9 @@ func (r *IdentityRepository) CreateServiceGroup(ctx context.Context, g *identity
 		g.ID, g.OrganizationID, g.Slug, g.DisplayName, g.ParentID,
 		g.Description, g.CreatedAt, g.UpdatedAt, g.DisabledAt,
 	); err != nil {
+		if isUniqueViolation(err) {
+			return identity.ErrAlreadyExists
+		}
 		return fmt.Errorf("postgres: create service group: %w", err)
 	}
 	return nil
@@ -624,6 +636,9 @@ func (r *IdentityRepository) CreateAgentGroup(ctx context.Context, g *identity.A
 		g.ID, g.OrganizationID, g.Slug, g.DisplayName, g.Description,
 		g.CreatedAt, g.UpdatedAt, g.DisabledAt,
 	); err != nil {
+		if isUniqueViolation(err) {
+			return identity.ErrAlreadyExists
+		}
 		return fmt.Errorf("postgres: create agent group: %w", err)
 	}
 	return nil
@@ -724,6 +739,9 @@ func (r *IdentityRepository) AddAgentToGroup(ctx context.Context, m *identity.Ag
 	if _, err := r.db.querierFor(ctx).Exec(ctx, q,
 		m.OrganizationID, m.AgentID, m.AgentGroupID, m.AssignedBy, m.AssignedAt,
 	); err != nil {
+		if isUniqueViolation(err) {
+			return identity.ErrAlreadyExists
+		}
 		return fmt.Errorf("postgres: add agent to group: %w", err)
 	}
 	return nil

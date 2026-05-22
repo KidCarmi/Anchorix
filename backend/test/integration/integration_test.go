@@ -154,7 +154,28 @@ func freshDatabase(t *testing.T, db *postgres.DB) {
 // against httptest, so handler tests can hit the real router without
 // binding a TCP port. Returns the server (Close on cleanup) and the
 // auth service for tests that exercise the domain directly.
+//
+// Delegates to testServerWithOptions with the identity service
+// enabled — the common case for integration tests.
 func testServer(t *testing.T, db *postgres.DB) (*httptest.Server, *auth.Service) {
+	return testServerWithOptions(t, db, testServerOpts{IdentityEnabled: true})
+}
+
+// testServerOpts toggles dependency wiring at construction
+// time. Today's only knob is IdentityEnabled, which mirrors
+// the production ANCHORIX_GOVERNANCE_API_ENABLED feature gate:
+// when false, the identity service is NOT constructed and the
+// router skips registering the H-026A2 routes. Used by the
+// feature-gate regression test (TestFeatureGateOffReturns404).
+type testServerOpts struct {
+	IdentityEnabled bool
+}
+
+// testServerWithOptions is the parameterized variant of
+// testServer. Tests that need a non-default dependency set
+// (the feature-gate-off test, future opt-in features) call
+// this directly; everything else goes through testServer.
+func testServerWithOptions(t *testing.T, db *postgres.DB, opts testServerOpts) (*httptest.Server, *auth.Service) {
 	t.Helper()
 	cfg := testConfig(t)
 	log := logger.New("error", config.EnvDevelopment)
@@ -209,19 +230,21 @@ func testServer(t *testing.T, db *postgres.DB) (*httptest.Server, *auth.Service)
 		t.Fatalf("findings.NewService: %v", err)
 	}
 
-	// H-026A2 identity service. Wired unconditionally in
-	// integration tests so the /api/v1/(tags|services|
-	// service-groups|agent-groups) routes are routable. The
-	// production composition root gates this on
-	// ANCHORIX_GOVERNANCE_API_ENABLED (cfg knob); tests want
-	// the routes available so they can exercise them.
-	identityRepo := postgres.NewIdentityRepository(db)
-	targetResolver := postgres.NewIdentityTargetResolver(db)
-	identitySvc, err := identity.NewService(
-		identityRepo, db, auditRecorder, targetResolver, clock.System{},
-	)
-	if err != nil {
-		t.Fatalf("identity.NewService: %v", err)
+	// H-026A2 identity service. Wired when opts.IdentityEnabled
+	// is true. The production composition root gates this on
+	// ANCHORIX_GOVERNANCE_API_ENABLED; setting IdentityEnabled
+	// to false from a test mirrors the gate-off behavior so the
+	// route-not-registered path can be exercised.
+	var identitySvc *identity.Service
+	if opts.IdentityEnabled {
+		identityRepo := postgres.NewIdentityRepository(db)
+		targetResolver := postgres.NewIdentityTargetResolver(db)
+		identitySvc, err = identity.NewService(
+			identityRepo, db, auditRecorder, targetResolver, clock.System{},
+		)
+		if err != nil {
+			t.Fatalf("identity.NewService: %v", err)
+		}
 	}
 
 	srv, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{

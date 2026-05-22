@@ -61,9 +61,19 @@ type createServiceRequest struct {
 }
 
 // patchServiceRequest is the PATCH /services/{id} body. All
-// fields are optional; the handler resolves missing fields by
-// merging with the stored row.
+// mutable fields are optional; the handler resolves missing
+// fields by merging with the stored row.
+//
+// Slug is intentionally listed (as a pointer) so the handler
+// can detect attempted slug changes and reject them explicitly
+// with service_slug_immutable rather than silently ignoring
+// them. Slug is part of the service's unique identity
+// (organization_id, slug); silently dropping the field would
+// lull operators into thinking the rename succeeded when it
+// did not. The pattern mirrors PATCH /tags' key/value
+// rejection.
 type patchServiceRequest struct {
+	Slug         *string `json:"slug,omitempty"`
 	DisplayName  *string `json:"display_name,omitempty"`
 	Description  *string `json:"description,omitempty"`
 	OwnerEmail   *string `json:"owner_email,omitempty"`
@@ -176,6 +186,11 @@ func ServicesUpdate(deps IdentityDeps) http.HandlerFunc {
 		var body patchServiceRequest
 		if err := envelope.DecodeStrictOptionalJSON(w, r, &body); err != nil {
 			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+			return
+		}
+		if body.Slug != nil {
+			envelope.WriteError(w, http.StatusBadRequest, "service_slug_immutable",
+				"service slug cannot be changed after creation")
 			return
 		}
 		display := current.DisplayName
