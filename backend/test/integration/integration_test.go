@@ -100,10 +100,26 @@ func freshDatabase(t *testing.T, db *postgres.DB) {
 			"DELETE FROM agent_group_memberships",
 			"DELETE FROM agent_groups",
 			"DELETE FROM service_group_memberships",
-			"DELETE FROM service_groups",
 			"DELETE FROM tag_assignments",
 			"DELETE FROM tags",
 			"DELETE FROM services",
+			// service_groups has a self-referencing FK
+			// (parent_id) with ON DELETE RESTRICT. Within a
+			// single multi-row DELETE FROM the row-deletion
+			// order is undefined, so a parent row can be
+			// processed before its children — RESTRICT fires
+			// and the whole statement aborts. NULLing out
+			// parent_id first guarantees no row references
+			// another at delete-time. The two-statement
+			// approach is safe regardless of PG's heap-scan
+			// order. (Switching parent_id to ON DELETE CASCADE
+			// would silently orphan operator-curated
+			// hierarchies on accidental service-group delete,
+			// which is exactly what RESTRICT exists to
+			// prevent — the cleanup pays this small cost
+			// instead.)
+			"UPDATE service_groups SET parent_id = NULL",
+			"DELETE FROM service_groups",
 			"DELETE FROM certificate_observations",
 			"DELETE FROM certificates",
 			// agents must go before deployment_packages because of the
