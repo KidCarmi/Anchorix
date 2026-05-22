@@ -96,3 +96,30 @@ var ErrMembershipTargetInvalid = errors.New("identity: membership target does no
 // are not optional on security flows).
 // Maps to 500 internal_error.
 var ErrInternalAudit = errors.New("identity: audit write failed")
+
+// ErrAlreadyExists is returned when a Create* call collides
+// with an existing row's unique constraint:
+//
+//   - tags (organization_id, key, value)
+//   - tag_assignments (organization_id, tag_id, target_type, target_id)
+//   - services (organization_id, slug)
+//   - service_groups (organization_id, slug)
+//   - agent_groups (organization_id, slug)
+//   - agent_group_memberships (organization_id, agent_id, agent_group_id) PK
+//
+// Without this sentinel the raw pgconn.PgError (SQLSTATE 23505)
+// surfaces through the handler as 500 internal_error — which
+// hides a routine operator misstep behind a server-fault code.
+// The handler maps this sentinel to 409 conflict with a
+// descriptive message.
+var ErrAlreadyExists = errors.New("identity: resource already exists")
+
+// ErrSlugImmutable is returned by UpdateService when the
+// caller-supplied input would mutate the service's slug.
+// Services share the same identity-immutability invariant as
+// tags: slug is part of the unique key
+// (organization_id, slug), and renaming would silently break
+// every downstream reference (ownership rules, audit history,
+// operator dashboards) that points at the slug.
+// Maps to 400 service_slug_immutable.
+var ErrSlugImmutable = errors.New("identity: service slug is immutable")

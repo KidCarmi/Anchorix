@@ -64,6 +64,14 @@ func writeIdentityError(w http.ResponseWriter, err error) bool {
 		envelope.WriteError(w, http.StatusBadRequest, "bad_request",
 			"invalid input")
 		return true
+	case errors.Is(err, identity.ErrAlreadyExists):
+		envelope.WriteError(w, http.StatusConflict, "already_exists",
+			"resource already exists")
+		return true
+	case errors.Is(err, identity.ErrSlugImmutable):
+		envelope.WriteError(w, http.StatusBadRequest, "service_slug_immutable",
+			"service slug cannot be changed after creation")
+		return true
 	}
 	return false
 }

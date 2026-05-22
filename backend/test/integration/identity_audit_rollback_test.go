@@ -208,6 +208,81 @@ func TestIdentityAuditRollback(t *testing.T) {
 			t.Fatalf("service_group row leaked: count=%d", count)
 		}
 	})
+
+	t.Run("DisableServiceGroup rolls back on audit failure", func(t *testing.T) {
+		// Disable path is structurally different from the
+		// INSERT paths above: it threads a children
+		// preflight + an UPDATE under WithTx. A regression
+		// that moves the audit Record() outside the
+		// preflight tx would let the disable land even when
+		// the audit row fails.
+		freshDatabase(t, db)
+		seedSvc := newSvc("")
+		group, err := seedSvc.CreateServiceGroup(ctx, identity.CreateServiceGroupInput{
+			OrganizationID: "anchorix", Slug: "sg-rb-disable",
+			DisplayName: "RB Disable", ActorUserID: "op",
+		})
+		if err != nil {
+			t.Fatalf("seed CreateServiceGroup: %v", err)
+		}
+		disableSvc := newSvc("service_group.disabled")
+		err = disableSvc.DisableServiceGroup(ctx, identity.DisableServiceGroupInput{
+			OrganizationID: "anchorix", GroupID: group.ID,
+			Reason: "rb", ActorUserID: "op",
+		})
+		if !errors.Is(err, identity.ErrInternalAudit) {
+			t.Fatalf("DisableServiceGroup err = %v; want ErrInternalAudit", err)
+		}
+		var disabledAt *time.Time
+		if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+			return tx.QueryRow(ctx,
+				`SELECT disabled_at FROM service_groups WHERE id = $1`, group.ID,
+			).Scan(&disabledAt)
+		}); err != nil {
+			t.Fatalf("query service_group: %v", err)
+		}
+		if disabledAt != nil {
+			t.Fatalf("service_group.disabled_at populated despite audit failure")
+		}
+	})
+
+	t.Run("AddAgentToGroup rolls back on audit failure", func(t *testing.T) {
+		freshDatabase(t, db)
+		// Seed an agent + an agent group via direct repo
+		// access so the seed audit doesn't fail. The
+		// agent must be a real row for the resolver's
+		// AgentExists check to pass.
+		if err := execRawSQL(ctx, db, rawStmt{
+			`INSERT INTO agents (id, organization_id, hostname, status, public_key_fingerprint)
+			 VALUES ('agent-rb-1', 'anchorix', 'host', 'active', 'fp-rb-1')`, nil,
+		}); err != nil {
+			t.Fatalf("seed agent: %v", err)
+		}
+		seedSvc := newSvc("")
+		group, err := seedSvc.CreateAgentGroup(ctx, identity.CreateAgentGroupInput{
+			OrganizationID: "anchorix", Slug: "ag-rb",
+			DisplayName: "RB", ActorUserID: "op",
+		})
+		if err != nil {
+			t.Fatalf("seed CreateAgentGroup: %v", err)
+		}
+		svc := newSvc("agent_group.membership_created")
+		err = svc.AddAgentToGroup(ctx, identity.AddAgentToGroupInput{
+			OrganizationID: "anchorix",
+			AgentID:        "agent-rb-1",
+			GroupID:        group.ID,
+			ActorUserID:    "op",
+		})
+		if !errors.Is(err, identity.ErrInternalAudit) {
+			t.Fatalf("AddAgentToGroup err = %v; want ErrInternalAudit", err)
+		}
+		count := countRows(t, db, ctx,
+			`SELECT COUNT(*) FROM agent_group_memberships WHERE agent_id = $1 AND agent_group_id = $2`,
+			"agent-rb-1", group.ID)
+		if count != 0 {
+			t.Fatalf("agent_group_memberships row leaked: count=%d", count)
+		}
+	})
 }
 
 // countRows is a narrow scalar-count helper for the rollback
