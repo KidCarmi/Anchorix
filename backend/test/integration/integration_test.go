@@ -82,6 +82,28 @@ func freshDatabase(t *testing.T, db *postgres.DB) {
 			// ON DELETE CASCADE; deleting findings first is
 			// belt-and-braces against a partial-cascade bug.
 			"DELETE FROM findings",
+			// H-026A1 governance tables (migrations 0009/0010/0011).
+			// Order matters: derived-state tables before their
+			// reference targets, partial-unique-protected tables in
+			// their natural dependency order. The composite FKs are
+			// mostly ON DELETE RESTRICT, so the explicit per-table
+			// DELETEs are required to bring an org back to a clean
+			// state between integration runs.
+			"DELETE FROM governance_recompute_runs",
+			"DELETE FROM policy_waivers",
+			"DELETE FROM policy_assignments",
+			"DELETE FROM policy_definitions",
+			"DELETE FROM certificate_ownership",
+			"DELETE FROM ownership_match_explanations",
+			"DELETE FROM certificate_ownership_overrides",
+			"DELETE FROM ownership_rules",
+			"DELETE FROM agent_group_memberships",
+			"DELETE FROM agent_groups",
+			"DELETE FROM service_group_memberships",
+			"DELETE FROM service_groups",
+			"DELETE FROM tag_assignments",
+			"DELETE FROM tags",
+			"DELETE FROM services",
 			"DELETE FROM certificate_observations",
 			"DELETE FROM certificates",
 			// agents must go before deployment_packages because of the
