@@ -22,6 +22,20 @@ type OwnershipRepository interface {
 	// ListOwnershipRules returns every rule in the organization
 	// ordered by id ASC. When enabledOnly is true, disabled
 	// rules are excluded.
+	//
+	// The order is `id ASC` — operator-facing stable pagination.
+	// This is **deliberately NOT** the engine walk order, which
+	// is `(precedence_tier, priority, created_at, id)`. The
+	// engine's read path will live in
+	// internal/governance/ownership/ (H-026B) and use the
+	// partial index `ownership_rules_org_enabled_walk_idx` from
+	// migration 0010 directly via a separate repository method
+	// — H-026B must add that method, not reuse this one. The
+	// distinction matters because the engine's determinism
+	// guarantee (governance plan §4.4) depends on the tier /
+	// priority / created_at tiebreaker; calling this method
+	// would walk rules in id order, which is non-deterministic
+	// w.r.t. the precedence ladder.
 	ListOwnershipRules(ctx context.Context, organizationID string, enabledOnly bool) ([]OwnershipRule, error)
 
 	// ListOwnershipRulesByService returns every rule pointing at
