@@ -12,6 +12,7 @@ import (
 	"github.com/kidcarmi/anchorix/backend/internal/config"
 	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
 	"github.com/kidcarmi/anchorix/backend/internal/findings"
+	"github.com/kidcarmi/anchorix/backend/internal/governance"
 	"github.com/kidcarmi/anchorix/backend/internal/httpapi"
 	"github.com/kidcarmi/anchorix/backend/internal/identity"
 	"github.com/kidcarmi/anchorix/backend/internal/inventory"
@@ -135,6 +136,31 @@ func cmdServe(ctx context.Context, cfg *config.Config, log *logger.Logger) error
 			return fmt.Errorf("identity service: %w", err)
 		}
 	}
+
+	// H-026A3: governance repository aggregate. The H-026B
+	// ownership engine and the H-026D policy engine each take
+	// one *governance.Repo argument instead of three separate
+	// interfaces, so the engine constructors slot in here
+	// without re-shaping the composition root. Constructed
+	// unconditionally because the engines haven't landed yet
+	// (the value is intentionally unused for the duration of
+	// this PR — the `_ = governanceRepo` suppresses the
+	// "declared and not used" check). The first engine PR
+	// (H-026B) drops the suppression and passes the aggregate
+	// to ownership.NewService.
+	//
+	// Validating the aggregate at construction means a future
+	// partially-wired Repo fails closed at startup rather than
+	// on the first recompute.
+	governanceRepo := &governance.Repo{
+		Ownership:     postgres.NewOwnershipRepository(db),
+		Policy:        postgres.NewPolicyRepository(db),
+		RecomputeRuns: postgres.NewGovernanceRecomputeRunsRepository(db),
+	}
+	if err := governanceRepo.Validate(); err != nil {
+		return fmt.Errorf("governance repo: %w", err)
+	}
+	_ = governanceRepo
 
 	// HTTP layer.
 	srv, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{
