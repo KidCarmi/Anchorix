@@ -160,6 +160,59 @@ type OwnershipMatchExplanation struct {
 	EngineVersion    int
 }
 
+// TagPair is one (key, value) classification tag as seen by the
+// ownership signal reader. It is the storage-read projection of a
+// tags row reached through a tag_assignments edge; the engine
+// (H-026B) consumes it as a match signal. Distinct from the
+// operator-curated identity.Tag — this carries only the two fields
+// the engine matches on.
+type TagPair struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// CertificateSignals is the flat, per-certificate bundle of inputs
+// the H-026B ownership engine evaluates rules against. It is produced
+// by OwnershipRepository.ListCertificateSignalsPaged as a single
+// paged SQL join over certificates + certificate_observations +
+// agent_group_memberships + tag_assignments, so the engine makes ZERO
+// per-cert follow-up queries.
+//
+// This is a governance-owned value type on purpose: it lets the
+// engine read inventory + identity signals WITHOUT importing those
+// packages (H026B plan §3.1 / §2.2 boundary rule). The storage layer
+// owns the SQL that assembles it.
+//
+// Field provenance:
+//
+//   - Subject / Issuer / SANs are intrinsic certificate metadata and
+//     are populated regardless of observation state.
+//   - StoreLocations / ObservingAgentIDs / ObservingAgentGroupIDs /
+//     AgentTags are derived ONLY from ACTIVE observations
+//     (certificate_observations.removed_at IS NULL): a cert no longer
+//     present on a host must not be owned via that host's signals.
+//   - CertTags are tag_assignments with target_type = 'certificate'.
+//   - AgentTags are tag_assignments with target_type = 'agent' for the
+//     cert's actively-observing agents.
+//
+// Every slice is DISTINCT and deterministically ordered by the read
+// path (text sets ascending; tag sets by key then value), so the
+// engine's explanation snapshot is byte-stable.
+//
+// Subject and Issuer carry the raw DN strings; CN parsing is an
+// engine concern (H-026B), not a storage one.
+type CertificateSignals struct {
+	CertificateID          string
+	Subject                string
+	Issuer                 string
+	SANs                   []string
+	StoreLocations         []string
+	ObservingAgentIDs      []string
+	ObservingAgentGroupIDs []string
+	CertTags               []TagPair
+	AgentTags              []TagPair
+}
+
 // ----- Policy types -----
 
 // PolicyDefinition is a versioned bundle of policy rules. Two

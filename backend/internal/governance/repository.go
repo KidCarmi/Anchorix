@@ -42,6 +42,18 @@ type OwnershipRepository interface {
 	// serviceID, regardless of enabled / disabled state.
 	ListOwnershipRulesByService(ctx context.Context, organizationID, serviceID string) ([]OwnershipRule, error)
 
+	// ListOwnershipRulesForEngine returns the org's ENABLED rules in
+	// the engine's deterministic walk order:
+	// (precedence_tier ladder ordinal ASC, priority ASC,
+	// created_at ASC, id ASC). The tier ordinal is the §4.2 ladder
+	// (explicit=1 … fallback=8), NOT the lexical text order — the
+	// implementation CASE-maps the tier so a tier rename cannot
+	// silently reorder the ladder (H026B plan §3.2). This is the read
+	// the H-026B engine walks; it is deliberately distinct from
+	// ListOwnershipRules (id ASC, operator pagination), which the
+	// engine MUST NOT use.
+	ListOwnershipRulesForEngine(ctx context.Context, organizationID string) ([]OwnershipRule, error)
+
 	// UpdateOwnershipRuleMutable updates the operator-editable
 	// fields (priority, match_value, description).
 	// Identity-shaping fields (precedence_tier, match_kind,
@@ -91,6 +103,32 @@ type OwnershipRepository interface {
 		decision Decision,
 	) ([]CertificateOwnership, error)
 
+	// ListCertificateOwnershipPaged returns one page of the org's
+	// current ownership rows whose certificate_id is strictly greater
+	// than cursorCertID, ordered by certificate_id ASC, capped at
+	// pageSize. The empty cursor starts from the beginning. The
+	// H-026B recompute pages this in lockstep with
+	// ListCertificateSignalsPaged (both keyed by certificate_id ASC)
+	// so the streaming diff never holds the whole fleet in memory.
+	ListCertificateOwnershipPaged(
+		ctx context.Context,
+		organizationID, cursorCertID string,
+		pageSize int,
+	) ([]CertificateOwnership, error)
+
+	// ListCertificateOwnershipStale returns one page of ownership
+	// rows whose last_evaluated_at is strictly before olderThan,
+	// ordered by certificate_id ASC, paged by cursorCertID, capped at
+	// limit. Backs GET /ownership/stale; the staleness threshold is a
+	// config knob, not a stored column (H026B plan §4.5).
+	ListCertificateOwnershipStale(
+		ctx context.Context,
+		organizationID string,
+		olderThan time.Time,
+		cursorCertID string,
+		limit int,
+	) ([]CertificateOwnership, error)
+
 	// ----- overrides -----
 
 	CreateOwnershipOverride(ctx context.Context, o *CertificateOwnershipOverride) error
@@ -112,6 +150,52 @@ type OwnershipRepository interface {
 		organizationID, overrideID, clearedBy, clearedReason string,
 		clearedAt time.Time,
 	) error
+
+	// ListActiveOwnershipOverridesPaged returns one page of the org's
+	// ACTIVE (cleared_at IS NULL) overrides whose certificate_id is
+	// strictly greater than cursorCertID, ordered by certificate_id
+	// ASC, capped at pageSize. The active partial-unique index
+	// guarantees one active override per cert, so certificate_id is a
+	// valid unique cursor. The H-026B recompute uses this to apply
+	// tier-1 (explicit) ownership without a per-cert override lookup.
+	ListActiveOwnershipOverridesPaged(
+		ctx context.Context,
+		organizationID, cursorCertID string,
+		pageSize int,
+	) ([]CertificateOwnershipOverride, error)
+
+	// ListOverridesExpiringBy returns every ACTIVE override in the org
+	// whose expires_at is non-NULL and <= now, ordered by
+	// certificate_id ASC. The H-026B recompute auto-clears these in
+	// the same pass. The expired set is small at fleet scale, so this
+	// is unpaged by design.
+	ListOverridesExpiringBy(
+		ctx context.Context,
+		organizationID string,
+		now time.Time,
+	) ([]CertificateOwnershipOverride, error)
+
+	// ----- engine signal reads -----
+
+	// ListCertificateSignalsPaged returns one page of per-certificate
+	// ownership signals whose certificate_id is strictly greater than
+	// cursorCertID, ordered by certificate_id ASC, capped at pageSize.
+	// The empty cursor starts from the beginning.
+	//
+	// The implementation MUST page by the certificates table and
+	// gather each cert's observation / agent-group / tag signal sets
+	// via per-certificate LATERAL sub-aggregates (or an equivalent
+	// bounded per-cert strategy). It MUST NOT use a fleet-wide GROUP
+	// BY across certificates × observations × memberships ×
+	// tag_assignments — that materializes the whole fleet and defeats
+	// paging (binding requirement, H026B plan §3.1). The engine makes
+	// ZERO per-cert follow-up queries: every signal it needs is on the
+	// returned CertificateSignals.
+	ListCertificateSignalsPaged(
+		ctx context.Context,
+		organizationID, cursorCertID string,
+		pageSize int,
+	) ([]CertificateSignals, error)
 
 	// ----- explanations -----
 
