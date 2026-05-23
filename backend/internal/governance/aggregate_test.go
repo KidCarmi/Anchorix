@@ -10,7 +10,9 @@ import (
 // values; the bodies are never called.
 type nilOwnershipRepo struct{ OwnershipRepository }
 type nilPolicyRepo struct{ PolicyRepository }
-type nilRecomputeRunsRepo struct{ GovernanceRecomputeRunsRepository }
+type nilRecomputeRunsRepo struct {
+	GovernanceRecomputeRunsRepository
+}
 
 func TestRepoValidate(t *testing.T) {
 	tests := []struct {
