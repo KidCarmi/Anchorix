@@ -314,16 +314,27 @@ For one certificate, `decideOwnership` evaluates in this exact order.
     ambiguity check), but evaluation stops scanning at the first
     full tier whose set of matches is non-empty.
 
-4.  TIE CHECK within the winning tier:
+4.  AMBIGUITY CHECK + winner selection within the winning tier:
       collect all rules in the SAME tier as the candidate that ALSO
       match. Sort them by (priority ASC, created_at ASC, id ASC).
-      - exactly one, OR a unique lowest (priority, created_at, id)
-        → decision = matched, winning_rule = that rule.
-      - two+ rules tie on (priority, created_at, id) [same priority
-        AND same created_at — only reachable via same-tx creation]
-        → decision = ambiguous, winning_rule = lowest id (ops keep
-          working), the tied rules recorded in losingRules with
-          reason_not_chosen = "tied with winner; tiebreaker on id".
+      Ambiguity is detected on the (priority, created_at) PREFIX only —
+      id is deliberately EXCLUDED from the tie test, because id is
+      unique and including it would make the ambiguous case
+      unreachable (the bug this step guards against):
+      - a unique lowest (priority, created_at) — i.e. no other matched
+        rule in the tier shares BOTH the winner's priority AND its
+        created_at → decision = matched, winning_rule = the rule with
+        the lowest (priority, created_at, id).
+      - two+ matched rules share the lowest (priority, created_at)
+        [same priority AND same created_at — only reachable via
+        same-tx rule creation] → decision = ambiguous. winning_rule =
+        the lowest id among the tied set, so operations keep working
+        deterministically; every OTHER tied rule is recorded in
+        losingRules with reason_not_chosen =
+        "tied with winner; tiebreaker on id". id breaks the tie for
+        WINNER SELECTION but does NOT clear the ambiguous flag — the
+        cert is still surfaced via /ownership/ambiguous and emits
+        ownership.ambiguous_match.
 
 5.  NO TIER MATCHED:
       decision = unowned, service = NULL, winning_rule = NULL,
@@ -333,7 +344,11 @@ For one certificate, `decideOwnership` evaluates in this exact order.
 **Determinism guarantees:**
 - Rule order is total: `(tierOrdinal, priority, created_at, id)`.
   `id` is the final, always-unique tiebreaker — there is **no path to
-  a nondeterministic result**, even on same-`created_at` ties.
+  a nondeterministic result**, even on same-`created_at` ties. Note the
+  ambiguous flag is **orthogonal** to winner determinism: the winner is
+  always deterministic (lowest id), while `ambiguous` is raised purely
+  on the `(priority, created_at)` tie — it never makes the result
+  nondeterministic, it only marks the cert for operator review.
 - Predicates are pure: glob/regex matching, set membership. No clock
   reads inside predicates (the only `now` use is override expiry,
   passed in explicitly).
