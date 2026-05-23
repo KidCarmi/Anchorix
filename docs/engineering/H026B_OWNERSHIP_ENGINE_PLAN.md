@@ -202,13 +202,21 @@ place that knows SQL, CLAUDE.md §16); the engine consumes the flat
 `inventory` nor `identity`** — the join result is a governance-owned
 value type. Boundary preserved.
 
-> Adversarial note: `array_agg(DISTINCT ...)` over a 50k-cert ⋈
-> observations ⋈ memberships ⋈ tag_assignments join must be **paged by
-> the driving table** (`certificates`) with `LATERAL` sub-aggregates
-> per cert, not a single GROUP BY over the full cross product (which
-> materializes the whole fleet). Pin the query plan in an integration
-> test with `EXPLAIN` assertions at fixture scale, and verify pages
-> are disjoint and ordered.
+> **Binding query-shape requirement (B1, not advisory).**
+> `ListCertificateSignalsPaged` **MUST** be paged by the driving table
+> (`certificates`, cursor by `certificate_id ASC`) and **MUST** gather
+> the per-cert signal sets via per-certificate `LATERAL` subqueries —
+> or an equivalent bounded per-cert aggregation strategy that touches
+> only the page's certificates. It **MUST NOT** use a single
+> fleet-wide `GROUP BY` across `certificates × observations ×
+> memberships × tag_assignments` (which materializes the whole fleet
+> and defeats paging). This is a binding B1 acceptance criterion, not
+> a performance suggestion: the N+1 *and* the full-cross-product GROUP
+> BY are both rejected shapes. PR-B1 (§13) MUST include an integration
+> test that pins the plan with an `EXPLAIN` assertion at fixture scale
+> (page driven by an index scan on `certificates`, no fleet-wide
+> aggregate node) and verifies pages are disjoint, ordered, and
+> complete.
 
 ### 3.2 Engine-walk rule ordering
 
@@ -360,14 +368,23 @@ For one certificate, `decideOwnership` evaluates in this exact order.
   issuer_store/fallback→low.
 
 **Regex safety (adversarial):** `san_regex` rules carry
-operator-supplied patterns. Compile once per recompute in `rules.go`;
-on compile failure the rule is **skipped + flagged** (an
-`ownership.rule_compile_failed` audit row, severity:"security", and
-the rule is treated as non-matching for this pass — fail closed,
-CLAUDE.md §6.12). A bad regex must never panic the pass or match
-everything. Apply a pattern-length cap and reject catastrophic
-constructs at rule-create validation time (a service-layer guard),
-not at engine time.
+operator-supplied patterns. Go's `regexp` is **RE2**, so classic
+"catastrophic backtracking" is not the threat — RE2 has no
+backtracking and guarantees linear-time matching. The real risks are:
+(a) **oversized patterns** (pathologically long source strings),
+(b) **expensive giant alternations** that inflate compiled-program
+size and per-match CPU/memory, and (c) **plain operator mistake** (a
+pattern that matches far more, or far less, than intended). Mitigations:
+- **Compile once per recompute** in `rules.go` (never per cert).
+- **Fail closed on compile error:** the rule is **skipped + flagged**
+  via an `ownership.rule_compile_failed` audit row (severity:"security")
+  and treated as non-matching for the pass (CLAUDE.md §6.12). A bad
+  regex must never panic the pass.
+- **Cap the pattern length** and reject oversized / excessively-alternated
+  patterns at **rule-create validation time** (a service-layer guard),
+  not at engine time, so operators get immediate feedback.
+- Operator-mistake breadth is caught by the **preview** workflow (§7),
+  which shows the affected-cert diff before any rule is applied.
 
 ---
 
@@ -398,6 +415,26 @@ ownership + explanation row (so the explainability contract holds) but
 emits no audit action and counts as `unchanged`. Only a *transition
 into* unowned from a previously-owned state is audited. This is the
 "no surprises on first deploy" property (parent §9.9) made precise.
+
+**First-run metadata (anti-confusion, binding).** Suppressing
+per-cert audit on the first run creates a different surprise: a SOC or
+operator sees the pass created tens of thousands of
+`certificate_ownership` rows yet finds **zero** `ownership.assigned`
+audit rows — which can read like an audit gap. To make the "many rows
+created, no per-cert audit" state self-explanatory, the single
+`governance.recomputed` audit row's metadata MUST carry, on a pass
+where it applies:
+- `first_run: true` — set when the pass found no prior
+  `certificate_ownership` rows for the org (the engine's first
+  materialization).
+- `created_unowned_rows: N` — count of `unowned` rows written without
+  a per-cert audit transition on this pass.
+
+These sit alongside the existing `run_id` + counter set (§9, §11). A
+later pass on an already-materialized org reports `first_run: false`
+(or omits the field) and `created_unowned_rows: 0`. This is additive
+metadata per CLAUDE.md §17; existing audit consumers ignore the new
+keys.
 
 ### 5.2 Same-decision recompute is a no-op write-wise except `last_evaluated_at`
 
@@ -494,10 +531,16 @@ Contract (parent §7.13, made concrete):
    `certificate_ownership`.
 5. Return the diff; **roll back**; **no run row, no audit row**.
 
-Response (exact counts, capped samples):
+Response (exact counts, capped samples, **plus snapshot metadata for
+operator clarity**):
 
 ```json
 {
+  "snapshot_at": "2026-05-23T07:00:00Z",
+  "engine_version": 1,
+  "ruleset_version": 37,
+  "ruleset_hash": "sha256:9f2c...",
+  "snapshot_warning": "Point-in-time preview. Apply/recompute takes a NEW snapshot; the actual diff may differ if rules, overrides, or inventory change in between.",
   "affected_count": 142,
   "would_flip_count": 38,
   "would_newly_assign_count": 104,
@@ -514,6 +557,22 @@ Response (exact counts, capped samples):
 
 `affected_count` is exact (full stream); `sample_certs` is capped at
 `limit ≤ 200` (OQ-7) and paginates via `cursor`.
+
+**Snapshot metadata (binding fields):**
+- `snapshot_at` — the REPEATABLE READ snapshot timestamp the preview
+  evaluated against (the engine's `now`).
+- `engine_version` — the `engineVersion` const (§6) that produced the
+  decision, so a preview captured before an engine bump is
+  unambiguous.
+- `ruleset_version` / `ruleset_hash` — a monotonic counter or a stable
+  hash over the enabled rule set (including the synthetic proposed
+  rule) at snapshot time, so an operator (or UI) can detect that the
+  ruleset changed between preview and apply. If a cheap monotonic
+  ruleset version is not yet available, emit `ruleset_hash` alone
+  (a sha256 over the sorted `(id, updated_at)` of the enabled rules);
+  one of the two MUST be present.
+- `snapshot_warning` — a literal human-readable string stating that
+  apply/recompute takes a new snapshot and the result may differ.
 
 **Preview is point-in-time, not time-stable** (parent §7.13): apply
 takes its own snapshot and is authoritative. No lock is held between
@@ -665,6 +724,12 @@ parent §4.6). Actions: `ownership.assigned`, `.cleared`, `.flipped`,
 `.rule_compile_failed` (new, §4), plus the per-pass
 `governance.recomputed` summary.
 
+The `governance.recomputed` summary metadata carries `run_id` + the
+counter set (§9) and, on the engine's first materialization for an
+org, the `first_run: true` / `created_unowned_rows: N` anti-confusion
+fields (§5.1) — so a pass that creates many rows with no per-cert
+audit is self-explanatory in audit history.
+
 **Audit amplification — the bulk rollup (binding):** the first
 `fallback` rule on a 50k-cert org flips 50k certs in one pass. Without
 a rollup that is 50k security-severity rows with identical
@@ -706,7 +771,8 @@ rollup, never a mix.
   created_at & id permutations.
 - `confidenceForTier` — every tier maps to the documented label.
 - regex/glob predicates — anchoring, case, `\\` store-path escapes,
-  catastrophic-pattern rejection, compile-failure → skip+flag.
+  oversized / over-alternated pattern rejection at create-time (RE2,
+  not backtracking), compile-failure → skip+flag.
 - explanation builders — `losing_rules` bounded at K=8, sorted,
   byte-stable; `reason_not_chosen` closed enum.
 
@@ -739,7 +805,10 @@ rollup, never a mix.
   `bulk_assigned` row, not N; a sub-threshold flip emits per-cert rows.
 - **First-deploy quiet:** fresh org, first recompute → every cert
   `unowned`, **no** `became_unowned` audit rows, one
-  `governance.recomputed`.
+  `governance.recomputed` whose metadata carries `first_run: true` and
+  `created_unowned_rows: N` (= cert count); a second recompute on the
+  now-materialized org reports `first_run: false` /
+  `created_unowned_rows: 0`.
 - **Cross-org isolation:** recompute for org A never reads/writes org
   B rows; cross-org cert id on the ownership endpoints → 404.
 - **Scheduler:** disabled → Run returns immediately; enabled → ticks
@@ -750,9 +819,28 @@ rollup, never a mix.
 validation 400, override conflict 409, preview writes nothing/no
 audit, recompute returns counters.
 
-**Performance smoke (planning anchor, not a blocking SLO):** the
-signal-join query plan at fixture scale (`EXPLAIN` assertion that it
-pages by `certificates`, not a full-fleet GROUP BY).
+**Performance smoke (planning anchor, not a blocking SLO):**
+- The signal-join query plan at fixture scale (`EXPLAIN` assertion that
+  it pages by `certificates`, not a full-fleet GROUP BY) — see the
+  binding B1 requirement in §3.1.
+- **Write / WAL amplification (B2, required measurement — not just
+  wall-clock).** A first `fallback` rule on a large org flips every
+  previously-`unowned` cert in one pass, writing one
+  `certificate_ownership` upsert + one `ownership_match_explanations`
+  row per changed cert — tens of thousands of rows, plus index
+  maintenance, in a single transaction. The B2 test suite MUST
+  **measure** the write amplification of a bulk-flip pass at fixture
+  scale, not only its runtime: capture rows written to
+  `certificate_ownership` + `ownership_match_explanations`, and the
+  WAL bytes generated by the pass (e.g. via
+  `pg_current_wal_lsn()` deltas around the transaction, or
+  `pg_stat_wal` / `EXPLAIN (ANALYZE, WAL)` on the dominant statements).
+  The goal is an explicit, recorded amplification figure (rows and WAL
+  bytes per changed cert) so a regression — or a fixture that quietly
+  10×'s the per-cert write cost — is visible in review, and so the
+  single-transaction commit size for a 50k-cert bulk flip is a known
+  number rather than a guess. This complements, and does not replace,
+  the bulk-rollup audit control (§11).
 
 ---
 
@@ -786,6 +874,9 @@ The highest-risk code, **alone**, where review attention concentrates.
 - All pure-function tests + the equivalence / snapshot-isolation /
   concurrency / idempotency / ambiguity / bulk-rollup / first-deploy /
   audit-atomicity integration tests.
+- **Required:** the write / WAL amplification measurement for a
+  bulk-flip pass at fixture scale (§12) — recorded rows + WAL bytes
+  per changed cert, not just wall-clock.
 - Composition: construct `ownership.Service` in `serve.go`; expose
   `POST /ownership/recompute` + `GET /ownership/unowned|ambiguous|stale`
   + `GET /governance/recompute-runs` only (the minimal surface to
@@ -838,7 +929,7 @@ required before merge by CLAUDE.md §6.10 / §19.
 | **Ambiguous ownership** | Surfaced as `decision=ambiguous`, lowest-id winner keeps ops working, `ambiguous_match` audit, `/ownership/ambiguous` triage view. |
 | **Bulk onboarding** | First fallback rule → one bulk audit row + 50k explanation rows in one tx (≈10MB, acceptable v0.x); first-deploy unowned is quiet (not audited). |
 | **Operator surprise** | Preview-before-apply is the primary safety mechanism; rule edits don't auto-recompute; recompute returns counters; every flip is audited. |
-| **Malicious regex** | Compile once, length-cap + reject catastrophic at create-time, skip+flag on compile fail at engine-time — never panic, never match-all. |
+| **Abusive regex** | RE2 (no backtracking); compile once per pass; length-cap + reject oversized/over-alternated patterns at create-time; skip+flag on compile fail at engine-time — never panic, never match-all. Operator-mistake breadth caught by preview. |
 | **N+1 at fleet scale** | Single SQL signal-join paged by `certificates`; `EXPLAIN`-pinned; no per-cert follow-up queries. |
 | **Cross-org leakage** | Composite FKs (A1); every new read scoped by org; cross-org id → 404; isolation test per new read. |
 | **Orphan run rows** | `StartRecomputeRun` is in-tx → rolled back on failure (no orphan). Trade-off: no durable failed-run record; surfaced via logs (revisit if forensics needed). |
