@@ -2,8 +2,10 @@ package postgres
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -107,6 +109,47 @@ func (r *OwnershipRepository) ListOwnershipRulesByService(
 	rows, err := r.db.querierFor(ctx).Query(ctx, q, organizationID, serviceID)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list ownership rules by service: %w", err)
+	}
+	defer rows.Close()
+	return scanOwnershipRuleList(rows)
+}
+
+// ListOwnershipRulesForEngine returns the org's enabled rules in the
+// engine walk order. precedence_tier is CASE-mapped to the §4.2
+// ladder ordinal so the ORDER BY is the ladder, not the lexical text
+// order of the enum — a tier value rename therefore cannot silently
+// reshuffle precedence. The ELSE 99 sinks any unknown tier below the
+// known ladder rather than failing the read (fail-closed: an
+// unrecognized tier loses to every recognized one). The
+// `WHERE enabled = TRUE` clause is served by
+// ownership_rules_org_enabled_walk_idx (migration 0010); the small
+// rule set (≤ a few thousand) makes the CASE sort negligible.
+func (r *OwnershipRepository) ListOwnershipRulesForEngine(
+	ctx context.Context,
+	organizationID string,
+) ([]governance.OwnershipRule, error) {
+	const q = `
+		SELECT id, organization_id, name, description, service_id,
+		       precedence_tier, priority, match_kind, match_value,
+		       enabled, created_at, updated_at, created_by, disabled_at
+		  FROM ownership_rules
+		 WHERE organization_id = $1 AND enabled = TRUE
+		 ORDER BY
+		   CASE precedence_tier
+		     WHEN 'explicit'        THEN 1
+		     WHEN 'service_member'  THEN 2
+		     WHEN 'agent_group'     THEN 3
+		     WHEN 'san_pattern'     THEN 4
+		     WHEN 'subject_pattern' THEN 5
+		     WHEN 'tag'             THEN 6
+		     WHEN 'issuer_store'    THEN 7
+		     WHEN 'fallback'        THEN 8
+		     ELSE 99
+		   END ASC,
+		   priority ASC, created_at ASC, id ASC`
+	rows, err := r.db.querierFor(ctx).Query(ctx, q, organizationID)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list ownership rules for engine: %w", err)
 	}
 	defer rows.Close()
 	return scanOwnershipRuleList(rows)
@@ -267,6 +310,59 @@ func (r *OwnershipRepository) ListCertificateOwnershipByDecision(
 	return scanCertificateOwnershipList(rows)
 }
 
+// ListCertificateOwnershipPaged returns one page of ownership rows
+// keyed by certificate_id > cursor, ordered ASC, capped at pageSize.
+// Backed by the certificate_ownership PK (organization_id,
+// certificate_id), so the cursor range scan is index-only.
+func (r *OwnershipRepository) ListCertificateOwnershipPaged(
+	ctx context.Context,
+	organizationID, cursorCertID string,
+	pageSize int,
+) ([]governance.CertificateOwnership, error) {
+	const q = `
+		SELECT organization_id, certificate_id, service_id, decision,
+		       winning_rule_id, override_id, explanation_id, confidence,
+		       first_assigned_at, last_evaluated_at, last_changed_at
+		  FROM certificate_ownership
+		 WHERE organization_id = $1 AND certificate_id > $2
+		 ORDER BY certificate_id ASC
+		 LIMIT $3`
+	rows, err := r.db.querierFor(ctx).Query(ctx, q, organizationID, cursorCertID, pageSize)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list cert ownership paged: %w", err)
+	}
+	defer rows.Close()
+	return scanCertificateOwnershipList(rows)
+}
+
+// ListCertificateOwnershipStale returns one page of ownership rows
+// last evaluated before olderThan, keyed by certificate_id > cursor,
+// ordered ASC, capped at limit.
+func (r *OwnershipRepository) ListCertificateOwnershipStale(
+	ctx context.Context,
+	organizationID string,
+	olderThan time.Time,
+	cursorCertID string,
+	limit int,
+) ([]governance.CertificateOwnership, error) {
+	const q = `
+		SELECT organization_id, certificate_id, service_id, decision,
+		       winning_rule_id, override_id, explanation_id, confidence,
+		       first_assigned_at, last_evaluated_at, last_changed_at
+		  FROM certificate_ownership
+		 WHERE organization_id = $1
+		   AND last_evaluated_at < $2
+		   AND certificate_id > $3
+		 ORDER BY certificate_id ASC
+		 LIMIT $4`
+	rows, err := r.db.querierFor(ctx).Query(ctx, q, organizationID, olderThan, cursorCertID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list cert ownership stale: %w", err)
+	}
+	defer rows.Close()
+	return scanCertificateOwnershipList(rows)
+}
+
 // ----- overrides -----
 
 func (r *OwnershipRepository) CreateOwnershipOverride(
@@ -363,6 +459,60 @@ func (r *OwnershipRepository) ClearOwnershipOverride(
 	return nil
 }
 
+// ListActiveOwnershipOverridesPaged returns one page of active
+// overrides keyed by certificate_id > cursor, ordered ASC, capped at
+// pageSize. `cleared_at IS NULL` selects the active set; the active
+// partial-unique index guarantees one active row per cert, so
+// certificate_id is a unique, gap-free cursor.
+func (r *OwnershipRepository) ListActiveOwnershipOverridesPaged(
+	ctx context.Context,
+	organizationID, cursorCertID string,
+	pageSize int,
+) ([]governance.CertificateOwnershipOverride, error) {
+	const q = `
+		SELECT id, organization_id, certificate_id, service_id,
+		       reason, set_by, set_at, expires_at,
+		       cleared_at, cleared_by, cleared_reason
+		  FROM certificate_ownership_overrides
+		 WHERE organization_id = $1
+		   AND cleared_at IS NULL
+		   AND certificate_id > $2
+		 ORDER BY certificate_id ASC
+		 LIMIT $3`
+	rows, err := r.db.querierFor(ctx).Query(ctx, q, organizationID, cursorCertID, pageSize)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list active ownership overrides paged: %w", err)
+	}
+	defer rows.Close()
+	return scanOwnershipOverrideList(rows)
+}
+
+// ListOverridesExpiringBy returns active overrides whose expiry has
+// passed (expires_at non-NULL and <= now), ordered by certificate_id
+// ASC. Unpaged: the expired set is small relative to the fleet.
+func (r *OwnershipRepository) ListOverridesExpiringBy(
+	ctx context.Context,
+	organizationID string,
+	now time.Time,
+) ([]governance.CertificateOwnershipOverride, error) {
+	const q = `
+		SELECT id, organization_id, certificate_id, service_id,
+		       reason, set_by, set_at, expires_at,
+		       cleared_at, cleared_by, cleared_reason
+		  FROM certificate_ownership_overrides
+		 WHERE organization_id = $1
+		   AND cleared_at IS NULL
+		   AND expires_at IS NOT NULL
+		   AND expires_at <= $2
+		 ORDER BY certificate_id ASC`
+	rows, err := r.db.querierFor(ctx).Query(ctx, q, organizationID, now)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list overrides expiring by: %w", err)
+	}
+	defer rows.Close()
+	return scanOwnershipOverrideList(rows)
+}
+
 // ----- explanations -----
 
 func (r *OwnershipRepository) CreateOwnershipExplanation(
@@ -453,6 +603,137 @@ func (r *OwnershipRepository) ListOwnershipExplanationsForCertificate(
 	return out, nil
 }
 
+// ----- engine signal reads -----
+
+// CertificateSignalsPagedQuery is the SQL behind
+// ListCertificateSignalsPaged. It is a package-level const (and
+// exported) so the integration EXPLAIN test can assert the binding
+// query shape from H026B plan §3.1: paged by the certificates table,
+// with per-certificate LATERAL sub-aggregates, and NO fleet-wide
+// GROUP BY (the plan must contain a Limit and must NOT contain a
+// "Group Key"). Keeping the query in one named place means the test
+// pins the exact production statement, not a paraphrase.
+//
+// $1 = organization_id, $2 = cursor certificate id (exclusive),
+// $3 = page size.
+const CertificateSignalsPagedQuery = `
+		SELECT
+		    c.id,
+		    c.subject,
+		    c.issuer,
+		    c.sans,
+		    COALESCE(sl.store_locations, ARRAY[]::text[])  AS store_locations,
+		    COALESCE(ag.agent_ids,       ARRAY[]::text[])  AS agent_ids,
+		    COALESCE(grp.agent_group_ids, ARRAY[]::text[]) AS agent_group_ids,
+		    COALESCE(ct.cert_tags,  '[]'::jsonb)           AS cert_tags,
+		    COALESCE(atg.agent_tags, '[]'::jsonb)          AS agent_tags
+		FROM certificates c
+		LEFT JOIN LATERAL (
+		    SELECT array_agg(DISTINCT o.store_location ORDER BY o.store_location) AS store_locations
+		      FROM certificate_observations o
+		     WHERE o.organization_id = c.organization_id
+		       AND o.certificate_id  = c.id
+		       AND o.removed_at IS NULL
+		) sl ON TRUE
+		LEFT JOIN LATERAL (
+		    SELECT array_agg(DISTINCT o.agent_id ORDER BY o.agent_id) AS agent_ids
+		      FROM certificate_observations o
+		     WHERE o.organization_id = c.organization_id
+		       AND o.certificate_id  = c.id
+		       AND o.removed_at IS NULL
+		) ag ON TRUE
+		LEFT JOIN LATERAL (
+		    SELECT array_agg(DISTINCT m.agent_group_id ORDER BY m.agent_group_id) AS agent_group_ids
+		      FROM certificate_observations o
+		      JOIN agent_group_memberships m
+		        ON m.organization_id = o.organization_id
+		       AND m.agent_id        = o.agent_id
+		     WHERE o.organization_id = c.organization_id
+		       AND o.certificate_id  = c.id
+		       AND o.removed_at IS NULL
+		) grp ON TRUE
+		LEFT JOIN LATERAL (
+		    SELECT jsonb_agg(DISTINCT jsonb_build_object('key', t.key, 'value', t.value)) AS cert_tags
+		      FROM tag_assignments ta
+		      JOIN tags t
+		        ON t.organization_id = ta.organization_id
+		       AND t.id              = ta.tag_id
+		     WHERE ta.organization_id = c.organization_id
+		       AND ta.target_type     = 'certificate'
+		       AND ta.target_id       = c.id
+		) ct ON TRUE
+		LEFT JOIN LATERAL (
+		    SELECT jsonb_agg(DISTINCT jsonb_build_object('key', t.key, 'value', t.value)) AS agent_tags
+		      FROM certificate_observations o
+		      JOIN tag_assignments ta
+		        ON ta.organization_id = o.organization_id
+		       AND ta.target_type     = 'agent'
+		       AND ta.target_id       = o.agent_id
+		      JOIN tags t
+		        ON t.organization_id = ta.organization_id
+		       AND t.id              = ta.tag_id
+		     WHERE o.organization_id = c.organization_id
+		       AND o.certificate_id  = c.id
+		       AND o.removed_at IS NULL
+		) atg ON TRUE
+		WHERE c.organization_id = $1
+		  AND c.id > $2
+		ORDER BY c.id ASC
+		LIMIT $3`
+
+// ListCertificateSignalsPaged assembles the per-certificate signal
+// bundle the H-026B engine evaluates rules against, one page at a
+// time.
+//
+// Query shape (binding, H026B plan §3.1): the FROM clause is the
+// certificates table, paged by `id > cursor ORDER BY id ASC LIMIT n`
+// — so the driver is an index range scan on the certificates PK and
+// each page touches exactly that page's certs. The five signal sets
+// are gathered by per-certificate LEFT JOIN LATERAL sub-aggregates,
+// each correlated on the cert's (organization_id, id); the planner
+// runs them as nested-loop lookups against
+// certificate_observations_org_certificate_idx and the
+// tag_assignments / agent_group_memberships indexes. There is NO
+// fleet-wide GROUP BY across the cert × observation × membership ×
+// tag cross product — that shape is explicitly forbidden because it
+// would materialize the whole fleet and defeat paging.
+//
+// Active-observation scoping: every observation-derived LATERAL
+// filters `o.removed_at IS NULL`, so store locations, observing
+// agents, observing agent groups, and agent tags reflect only certs
+// still present on a host. Intrinsic cert fields (subject, issuer,
+// sans) are read straight off the certificates row regardless.
+//
+// Determinism: the text-set aggregates use
+// `array_agg(DISTINCT x ORDER BY x)` so store_locations / agent_ids /
+// agent_group_ids come back sorted and de-duplicated; the tag
+// aggregates de-duplicate via `jsonb_agg(DISTINCT …)` and the scan
+// helper sorts them by (key, value). Multiple observations of the
+// same cert therefore never produce duplicate signals.
+func (r *OwnershipRepository) ListCertificateSignalsPaged(
+	ctx context.Context,
+	organizationID, cursorCertID string,
+	pageSize int,
+) ([]governance.CertificateSignals, error) {
+	rows, err := r.db.querierFor(ctx).Query(ctx, CertificateSignalsPagedQuery, organizationID, cursorCertID, pageSize)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list certificate signals paged: %w", err)
+	}
+	defer rows.Close()
+	var out []governance.CertificateSignals
+	for rows.Next() {
+		s, err := scanCertificateSignals(rows)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: scan certificate signals: %w", err)
+		}
+		out = append(out, *s)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate certificate signals: %w", err)
+	}
+	return out, nil
+}
+
 // ----- scan helpers -----
 
 // jsonValueOr returns v if non-empty, otherwise the supplied
@@ -539,6 +820,71 @@ func scanOwnershipOverride(r rowScanner) (*governance.CertificateOwnershipOverri
 		return nil, err
 	}
 	return &o, nil
+}
+
+func scanOwnershipOverrideList(rows pgx.Rows) ([]governance.CertificateOwnershipOverride, error) {
+	var out []governance.CertificateOwnershipOverride
+	for rows.Next() {
+		o, err := scanOwnershipOverride(rows)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: scan ownership override: %w", err)
+		}
+		out = append(out, *o)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate ownership overrides: %w", err)
+	}
+	return out, nil
+}
+
+// scanCertificateSignals reads one row of the signal-join query.
+// SANs and the two tag sets arrive as JSON / JSONB and are
+// unmarshalled here; the text-array sets arrive already DISTINCT and
+// sorted from the SQL aggregates. Tag sets are sorted by (key, value)
+// in Go so the bundle is deterministic regardless of jsonb_agg
+// ordering.
+func scanCertificateSignals(r rowScanner) (*governance.CertificateSignals, error) {
+	var s governance.CertificateSignals
+	var sansRaw, certTagsRaw, agentTagsRaw []byte
+	if err := r.Scan(
+		&s.CertificateID, &s.Subject, &s.Issuer, &sansRaw,
+		&s.StoreLocations, &s.ObservingAgentIDs, &s.ObservingAgentGroupIDs,
+		&certTagsRaw, &agentTagsRaw,
+	); err != nil {
+		return nil, err
+	}
+	if len(sansRaw) > 0 {
+		if err := json.Unmarshal(sansRaw, &s.SANs); err != nil {
+			return nil, fmt.Errorf("postgres: unmarshal sans: %w", err)
+		}
+	}
+	var err error
+	if s.CertTags, err = unmarshalTagPairs(certTagsRaw); err != nil {
+		return nil, fmt.Errorf("postgres: unmarshal cert tags: %w", err)
+	}
+	if s.AgentTags, err = unmarshalTagPairs(agentTagsRaw); err != nil {
+		return nil, fmt.Errorf("postgres: unmarshal agent tags: %w", err)
+	}
+	return &s, nil
+}
+
+// unmarshalTagPairs decodes a jsonb array of {key,value} objects into
+// a (key, value)-sorted slice. Empty / null input yields a nil slice.
+func unmarshalTagPairs(raw []byte) ([]governance.TagPair, error) {
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var pairs []governance.TagPair
+	if err := json.Unmarshal(raw, &pairs); err != nil {
+		return nil, err
+	}
+	sort.Slice(pairs, func(i, j int) bool {
+		if pairs[i].Key != pairs[j].Key {
+			return pairs[i].Key < pairs[j].Key
+		}
+		return pairs[i].Value < pairs[j].Value
+	})
+	return pairs, nil
 }
 
 func scanOwnershipExplanation(r rowScanner) (*governance.OwnershipMatchExplanation, error) {

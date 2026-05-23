@@ -313,6 +313,126 @@ func (db *DB) WithTxLockedFindingsRepeatableRead(ctx context.Context, organizati
 	return nil
 }
 
+// WithTxLockedOwnership runs fn inside a single transaction with an
+// exclusive transaction-scope advisory lock keyed by organizationID,
+// namespaced to ownership recompute. It is the H-026B sibling of
+// WithTxLockedFindings: same xact-scope advisory-lock semantics, a
+// DIFFERENT namespace ('ownership-recompute') so ownership work does
+// NOT contend on the findings or cert-inventory locks (H026B plan
+// §9). Used by single-cert, single-row ownership writes (the H-026B
+// override apply path) that need to serialize against an in-flight
+// full sweep but do not need snapshot isolation.
+//
+// Lock namespace + key: hashtext('ownership-recompute') for the
+// namespace, hashtext(organization_id) for the key. Different orgs
+// proceed in parallel. Released automatically at tx commit/rollback.
+// CLAUDE.md §8.10: documented owner, deterministic release path,
+// bounded lifetime.
+func (db *DB) WithTxLockedOwnership(ctx context.Context, organizationID string, fn func(ctx context.Context) error) error {
+	return db.WithTx(ctx, func(ctx context.Context) error {
+		if _, err := db.querierFor(ctx).Exec(ctx,
+			`SELECT pg_advisory_xact_lock(hashtext('ownership-recompute'), hashtext($1))`,
+			organizationID); err != nil {
+			return fmt.Errorf("postgres: advisory lock ownership org %s: %w", organizationID, err)
+		}
+		return fn(ctx)
+	})
+}
+
+// WithTxLockedOwnershipRepeatableRead is the H-026B sibling of
+// WithTxLockedFindingsRepeatableRead. Same session-lock-before-tx +
+// REPEATABLE READ + connection-cleanup-on-unlock-failure structure;
+// the ONLY differences are the advisory-lock namespace
+// ('ownership-recompute') and the error/diagnostic strings. The
+// ownership recompute streams many paginated reads
+// (ListCertificateSignalsPaged, ListCertificateOwnershipPaged, …) and
+// MUST see one consistent input snapshot even while cert ingestion
+// (a DIFFERENT lock namespace) commits concurrently — exactly the
+// guarantee the findings streaming recompute relies on.
+//
+// Why a SESSION-scope lock (not xact-scope): PostgreSQL fixes the
+// REPEATABLE READ snapshot at the first statement of the tx,
+// INCLUDING the lock-acquisition SELECT. Taking a session-scope lock
+// on a borrowed connection BEFORE BeginTx guarantees a second
+// concurrent recompute snapshots state AFTER the first commits,
+// avoiding duplicate-key races on certificate_ownership. This mirrors
+// the reasoning pinned by the findings concurrent-safety regression
+// test; see WithTxLockedFindingsRepeatableRead for the full rationale.
+//
+// CLAUDE.md §8.10: documented owner (the ownership streaming
+// recompute path), deterministic release (deferred unlock with a
+// fresh-ctx budget; hijack+close on unlock failure), bounded lifetime
+// (single connection acquisition).
+func (db *DB) WithTxLockedOwnershipRepeatableRead(ctx context.Context, organizationID string, fn func(ctx context.Context) error) error {
+	conn, err := db.pool.Acquire(ctx)
+	if err != nil {
+		return fmt.Errorf("postgres: acquire connection for ownership recompute lock: %w", err)
+	}
+	// connReleased toggles to true once we've handed the connection
+	// back — via Release() on the happy path or Hijack()+Close() when
+	// unlock fails — so the final defer never double-releases.
+	connReleased := false
+	defer func() {
+		if !connReleased {
+			conn.Release()
+		}
+	}()
+
+	// Session-scope lock — held until pg_advisory_unlock or
+	// connection close. Acquired BEFORE the tx so the REPEATABLE READ
+	// snapshot below sees state after any previous holder committed.
+	if _, err := conn.Exec(ctx,
+		`SELECT pg_advisory_lock(hashtext('ownership-recompute'), hashtext($1))`,
+		organizationID); err != nil {
+		return fmt.Errorf("postgres: advisory lock ownership org %s (session): %w", organizationID, err)
+	}
+	defer func() {
+		// Release the lock explicitly so the connection returns to
+		// the pool with a clean lock state. Use a fresh context so a
+		// cancelled caller-ctx cannot prevent the release.
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(unlockCtx,
+			`SELECT pg_advisory_unlock(hashtext('ownership-recompute'), hashtext($1))`,
+			organizationID); err != nil {
+			// If the unlock SQL failed, the session lock state on
+			// this connection is undefined — it MAY still be held.
+			// Returning it to the pool would let a subsequent
+			// borrower inherit the lock. Hijack the connection out
+			// of the pool and close the underlying conn; closing the
+			// TCP connection drops every session-scope lock the
+			// backend held for it. Same defensive cleanup as the
+			// findings RR helper.
+			if hijacked := conn.Hijack(); hijacked != nil {
+				closeCtx, cancelClose := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancelClose()
+				_ = hijacked.Close(closeCtx)
+			}
+			connReleased = true
+		}
+	}()
+
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		return fmt.Errorf("postgres: begin repeatable-read tx for ownership org %s: %w", organizationID, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	if err := fn(contextWithTx(ctx, tx)); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("postgres: commit ownership recompute tx: %w", err)
+	}
+	committed = true
+	return nil
+}
+
 // WithTxRaw exposes the underlying pgx.Tx for callers inside this
 // package (migrations.go) and for integration tests that need to
 // exercise raw SQL (audit-events-are-append-only). Production
