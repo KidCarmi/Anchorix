@@ -63,6 +63,40 @@ func TestRepoValidate(t *testing.T) {
 			},
 			want: nil,
 		},
+		// Typed-nil cases: an interface field holding a nil
+		// CONCRETE POINTER is non-nil at the interface level
+		// (v == nil is false) but would panic on first method
+		// call. Validate must reject these via the reflect
+		// path. Each subtest uses a nil *nilXxxRepo (the
+		// pointer receiver still satisfies the interface via
+		// the embedded interface's promoted method set).
+		{
+			name: "typed-nil ownership",
+			repo: &Repo{
+				Ownership:     (*nilOwnershipRepo)(nil),
+				Policy:        nilPolicyRepo{},
+				RecomputeRuns: nilRecomputeRunsRepo{},
+			},
+			want: ErrIncompleteRepo,
+		},
+		{
+			name: "typed-nil policy",
+			repo: &Repo{
+				Ownership:     nilOwnershipRepo{},
+				Policy:        (*nilPolicyRepo)(nil),
+				RecomputeRuns: nilRecomputeRunsRepo{},
+			},
+			want: ErrIncompleteRepo,
+		},
+		{
+			name: "typed-nil recompute_runs",
+			repo: &Repo{
+				Ownership:     nilOwnershipRepo{},
+				Policy:        nilPolicyRepo{},
+				RecomputeRuns: (*nilRecomputeRunsRepo)(nil),
+			},
+			want: ErrIncompleteRepo,
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

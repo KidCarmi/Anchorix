@@ -1,6 +1,9 @@
 package governance
 
-import "errors"
+import (
+	"errors"
+	"reflect"
+)
 
 // Repo is the aggregate handle for the three governance
 // repository interfaces. The H-026B engine and the H-026D
@@ -42,17 +45,53 @@ type Repo struct {
 var ErrIncompleteRepo = errors.New("governance: incomplete Repo (Ownership + Policy + RecomputeRuns required)")
 
 // Validate returns ErrIncompleteRepo when any of the three
-// interface fields is nil. Engines invoke this once during
-// their own constructor so a partially-wired Repo can never
-// reach a runtime call site. The check is intentionally
-// shallow — it does NOT exercise the database, just the
-// in-process composition shape.
+// interface fields is nil OR holds a typed-nil pointer.
+// Engines invoke this once during their own constructor so a
+// partially-wired Repo can never reach a runtime call site.
+// The check is intentionally shallow — it does NOT exercise
+// the database, just the in-process composition shape.
+//
+// Why typed-nil matters (Go gotcha): an interface value holding
+// a nil concrete pointer is NOT == nil. A composition root that
+// wires
+//
+//	var ownership *postgres.OwnershipRepository // nil
+//	&Repo{Ownership: ownership, ...}
+//
+// produces a non-nil interface that a plain `== nil` check
+// passes — and then the first method call dereferences the nil
+// receiver and panics mid-recompute. The whole point of the
+// aggregate is fail-closed composition at startup, so Validate
+// must catch this. isNilInterface uses reflection to reject
+// typed-nil values of any nilable kind.
 func (r *Repo) Validate() error {
 	if r == nil {
 		return ErrIncompleteRepo
 	}
-	if r.Ownership == nil || r.Policy == nil || r.RecomputeRuns == nil {
+	if isNilInterface(r.Ownership) || isNilInterface(r.Policy) || isNilInterface(r.RecomputeRuns) {
 		return ErrIncompleteRepo
 	}
 	return nil
+}
+
+// isNilInterface reports whether v is a nil interface OR an
+// interface holding a nil value of a nilable kind (pointer,
+// interface, map, slice, func, channel). A non-nilable kind
+// (e.g. a struct value) is never "nil" and returns false.
+//
+// This is the standard guard for the typed-nil-in-interface
+// trap: `v == nil` only catches the untyped-nil case; the
+// reflect path catches `(*T)(nil)` boxed into the interface.
+func isNilInterface(v any) bool {
+	if v == nil {
+		return true
+	}
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Pointer, reflect.Interface, reflect.Map,
+		reflect.Slice, reflect.Func, reflect.Chan:
+		return rv.IsNil()
+	default:
+		return false
+	}
 }
