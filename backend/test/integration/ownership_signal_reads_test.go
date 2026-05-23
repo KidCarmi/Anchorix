@@ -230,6 +230,69 @@ func TestListCertificateSignalsNoDuplicates(t *testing.T) {
 	}
 }
 
+// TestListCertificateSignalsExcludesDisabledClassification verifies
+// that soft-deleted classification — disabled tags and disabled agent
+// groups — never surfaces as a signal, matching the convention that
+// disabled ownership rules are excluded from the engine walk.
+func TestListCertificateSignalsExcludesDisabledClassification(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	repo := postgres.NewOwnershipRepository(db)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	seedCertMeta(t, db, ctx, "anchorix", "cert-dis-1", "CN=dis", "CN=ca", nil)
+	agent := seedAgent(t, db, "anchorix", "dis")
+	seedObservationRow(t, db, ctx, "anchorix", "obs-dis", "cert-dis-1", agent, "LocalMachine\\X", false)
+
+	// One active + one disabled tag on the cert.
+	seedTagAssign(t, db, ctx, "anchorix", "tag-live", "live", "yes", "certificate", "cert-dis-1")
+	seedTagAssign(t, db, ctx, "anchorix", "tag-dead", "dead", "yes", "certificate", "cert-dis-1")
+	disableTag(t, db, ctx, "tag-dead")
+
+	// One active + one disabled tag on the observing agent.
+	seedTagAssign(t, db, ctx, "anchorix", "atag-live", "alive", "yes", "agent", agent)
+	seedTagAssign(t, db, ctx, "anchorix", "atag-dead", "adead", "yes", "agent", agent)
+	disableTag(t, db, ctx, "atag-dead")
+
+	// One active + one disabled agent group on the observing agent.
+	seedAgentGroupMembership(t, db, ctx, "anchorix", "grp-live", agent)
+	seedAgentGroupMembership(t, db, ctx, "anchorix", "grp-dead", agent)
+	disableAgentGroup(t, db, ctx, "grp-dead")
+
+	sigs, err := repo.ListCertificateSignalsPaged(ctx, "anchorix", "", 100)
+	if err != nil {
+		t.Fatalf("ListCertificateSignalsPaged: %v", err)
+	}
+	s := findSignals(sigs, "cert-dis-1")
+	if s == nil {
+		t.Fatalf("cert-dis-1 not returned")
+	}
+	if len(s.CertTags) != 1 || s.CertTags[0].Key != "live" {
+		t.Fatalf("cert tags = %+v; want only the active [live]", s.CertTags)
+	}
+	if len(s.AgentTags) != 1 || s.AgentTags[0].Key != "alive" {
+		t.Fatalf("agent tags = %+v; want only the active [alive]", s.AgentTags)
+	}
+	if !sameSet(s.ObservingAgentGroupIDs, []string{"grp-live"}) {
+		t.Fatalf("agent groups = %v; want only the active [grp-live]", s.ObservingAgentGroupIDs)
+	}
+}
+
+func disableTag(t *testing.T, db *postgres.DB, ctx context.Context, tagID string) {
+	t.Helper()
+	if err := execRawSQL(ctx, db, rawStmt{`UPDATE tags SET disabled_at = now() WHERE id = $1`, []any{tagID}}); err != nil {
+		t.Fatalf("disable tag %s: %v", tagID, err)
+	}
+}
+
+func disableAgentGroup(t *testing.T, db *postgres.DB, ctx context.Context, groupID string) {
+	t.Helper()
+	if err := execRawSQL(ctx, db, rawStmt{`UPDATE agent_groups SET disabled_at = now() WHERE id = $1`, []any{groupID}}); err != nil {
+		t.Fatalf("disable agent group %s: %v", groupID, err)
+	}
+}
+
 // TestListCertificateSignalsCrossOrgIsolation verifies the signal
 // join never reaches across organizations — neither for the cert
 // row itself nor for any of its joined signal sets.

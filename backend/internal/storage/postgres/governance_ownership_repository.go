@@ -120,8 +120,11 @@ func (r *OwnershipRepository) ListOwnershipRulesByService(
 // order of the enum — a tier value rename therefore cannot silently
 // reshuffle precedence. The ELSE 99 sinks any unknown tier below the
 // known ladder rather than failing the read (fail-closed: an
-// unrecognized tier loses to every recognized one). The
-// `WHERE enabled = TRUE` clause is served by
+// unrecognized tier loses to every recognized one, so even if the
+// migration 0010 CHECK constraint ever drifted and let a bad tier in,
+// that rule can never silently outrank a real one). Surfacing such a
+// rule loudly is the H-026B engine's responsibility, not the read's.
+// The `WHERE enabled = TRUE` clause is served by
 // ownership_rules_org_enabled_walk_idx (migration 0010); the small
 // rule set (≤ a few thousand) makes the CASE sort negligible.
 func (r *OwnershipRepository) ListOwnershipRulesForEngine(
@@ -489,7 +492,10 @@ func (r *OwnershipRepository) ListActiveOwnershipOverridesPaged(
 
 // ListOverridesExpiringBy returns active overrides whose expiry has
 // passed (expires_at non-NULL and <= now), ordered by certificate_id
-// ASC. Unpaged: the expired set is small relative to the fleet.
+// ASC. Unpaged: overrides are low-cardinality operator pins and the
+// B2 recompute auto-clears them each pass, so the expired set stays
+// bounded. Pagination is a documented backlog item (HARDENING_BACKLOG
+// H-029) for the pathological bulk-import + long-outage case.
 func (r *OwnershipRepository) ListOverridesExpiringBy(
 	ctx context.Context,
 	organizationID string,
@@ -648,6 +654,10 @@ const CertificateSignalsPagedQuery = `
 		      JOIN agent_group_memberships m
 		        ON m.organization_id = o.organization_id
 		       AND m.agent_id        = o.agent_id
+		      JOIN agent_groups g
+		        ON g.organization_id = m.organization_id
+		       AND g.id              = m.agent_group_id
+		       AND g.disabled_at IS NULL
 		     WHERE o.organization_id = c.organization_id
 		       AND o.certificate_id  = c.id
 		       AND o.removed_at IS NULL
@@ -658,6 +668,7 @@ const CertificateSignalsPagedQuery = `
 		      JOIN tags t
 		        ON t.organization_id = ta.organization_id
 		       AND t.id              = ta.tag_id
+		       AND t.disabled_at IS NULL
 		     WHERE ta.organization_id = c.organization_id
 		       AND ta.target_type     = 'certificate'
 		       AND ta.target_id       = c.id
@@ -672,6 +683,7 @@ const CertificateSignalsPagedQuery = `
 		      JOIN tags t
 		        ON t.organization_id = ta.organization_id
 		       AND t.id              = ta.tag_id
+		       AND t.disabled_at IS NULL
 		     WHERE o.organization_id = c.organization_id
 		       AND o.certificate_id  = c.id
 		       AND o.removed_at IS NULL
@@ -703,6 +715,15 @@ const CertificateSignalsPagedQuery = `
 // agents, observing agent groups, and agent tags reflect only certs
 // still present on a host. Intrinsic cert fields (subject, issuer,
 // sans) are read straight off the certificates row regardless.
+//
+// Active-classification scoping: a soft-deleted classification is not
+// a live signal. The cert-tag and agent-tag LATERALs filter
+// `t.disabled_at IS NULL`, and the agent-group LATERAL joins
+// agent_groups with `g.disabled_at IS NULL`, so disabled tags and
+// disabled agent groups never reach the engine — consistent with the
+// engine excluding disabled ownership rules. (tag_assignments and
+// agent_group_memberships have no soft-delete of their own; the
+// definition's disabled_at is the authority.)
 //
 // Determinism: the text-set aggregates use
 // `array_agg(DISTINCT x ORDER BY x)` so store_locations / agent_ids /
