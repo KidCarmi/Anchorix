@@ -152,6 +152,18 @@ func cmdServe(ctx context.Context, cfg *config.Config, log *logger.Logger) error
 	// Validating the aggregate at construction means a future
 	// partially-wired Repo fails closed at startup rather than
 	// on the first recompute.
+	//
+	// Construction here is inert: the three postgres.NewXxx
+	// constructors only stash the *DB pointer — no queries, no
+	// goroutines — so building the aggregate unconditionally
+	// (outside the GovernanceAPIEnabled gate above) has zero
+	// runtime cost and starts nothing. H-026B MUST gate the
+	// engine + scheduler it constructs from this aggregate
+	// behind a feature flag (GovernanceAPIEnabled or a
+	// dedicated ANCHORIX_OWNERSHIP_ENGINE_ENABLED) so a
+	// governance-disabled deployment does not spin up a
+	// recompute loop. Do NOT wire the scheduler immediately
+	// after this block without that gate.
 	governanceRepo := &governance.Repo{
 		Ownership:     postgres.NewOwnershipRepository(db),
 		Policy:        postgres.NewPolicyRepository(db),
