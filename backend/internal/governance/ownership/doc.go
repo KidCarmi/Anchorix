@@ -34,7 +34,9 @@
 //     governance.GovernanceRecomputeRunsRepository, both of
 //     which are interfaces in the parent governance package.
 //   - It DOES NOT execute any HTTP I/O — the H-026B handlers
-//     translate the wire shape into engine.Service calls.
+//     translate the wire shape into ownership.Service calls
+//     (the Service type lives in this package; there is no
+//     separate "engine" package).
 //
 // Forbidden dependencies (binding in this PR; the H-026B engine
 // PR must respect them):
