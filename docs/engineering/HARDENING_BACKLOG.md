@@ -72,6 +72,33 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
 - **References:** `docs/engineering/H026_TRUST_GOVERNANCE_PLAN.md`
   §3.13, §5.6.
 
+### H-029 — Ownership: paginate `ListOverridesExpiringBy`
+
+- **Title:** `perf(governance): paginate expiring-override sweep read`
+- **Risk:** low (memory, not correctness). H-026B1's
+  `OwnershipRepository.ListOverridesExpiringBy` is intentionally
+  unpaged: it returns every active override whose `expires_at`
+  has passed in one slice. Overrides are operator-created pins,
+  expected to be low-cardinality (hundreds), and the H-026B
+  recompute auto-clears them every pass so the expired set stays
+  bounded by what expired since the previous pass. The unbounded
+  read is therefore safe for the expected workload.
+- **Scope:** add a cursor-paged variant
+  (`ListOverridesExpiringByPaged(ctx, orgID, now, cursorCertID, limit)`)
+  and switch the H-026B recompute to drain it page-by-page, the
+  same way it pages signals and ownership rows. Keep the unpaged
+  method or remove it once no caller remains.
+- **Reason not fixed now:** building pagination before a caller
+  (the B2 recompute) exists is speculative, and the realistic
+  override cardinality does not justify it yet. The risk only
+  materializes under a pathological pattern — e.g. a bulk
+  override import followed by a long scheduler outage so tens of
+  thousands expire before the next sweep. If bulk override
+  import lands (it is not in v0.x scope), revisit this first.
+- **References:**
+  `docs/engineering/H026B_OWNERSHIP_ENGINE_PLAN.md` §3.4;
+  `docs/engineering/H026_TRUST_GOVERNANCE_PLAN.md` §3.9.
+
 ### H-025 — Findings scheduler: per-recompute timeout
 
 - **Title:** `feat(findings): per-org recompute timeout in scheduler`

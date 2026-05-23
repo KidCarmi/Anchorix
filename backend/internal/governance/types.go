@@ -191,9 +191,14 @@ type TagPair struct {
 //     AgentTags are derived ONLY from ACTIVE observations
 //     (certificate_observations.removed_at IS NULL): a cert no longer
 //     present on a host must not be owned via that host's signals.
-//   - CertTags are tag_assignments with target_type = 'certificate'.
-//   - AgentTags are tag_assignments with target_type = 'agent' for the
-//     cert's actively-observing agents.
+//   - ObservingAgentGroupIDs excludes disabled agent groups
+//     (agent_groups.disabled_at IS NULL): a retired grouping is not a
+//     live signal.
+//   - CertTags are active (tags.disabled_at IS NULL) tag_assignments
+//     with target_type = 'certificate'.
+//   - AgentTags are active tag_assignments with target_type = 'agent'
+//     for the cert's actively-observing agents; disabled tags are
+//     excluded.
 //
 // Every slice is DISTINCT and deterministically ordered by the read
 // path (text sets ascending; tag sets by key then value), so the

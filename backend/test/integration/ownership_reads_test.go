@@ -128,6 +128,84 @@ func TestListOwnershipRulesForEngineOrdering(t *testing.T) {
 	}
 }
 
+// TestListOwnershipRulesForEngineUnknownTierSortsLast is the
+// constraint-drift guard: if the migration 0010 CHECK on
+// precedence_tier ever drifted and let an unrecognized tier in, the
+// engine read's CASE ELSE-99 fallback must sort that rule LAST (never
+// ahead of a recognized tier) and must still return it — so an
+// unknown tier can never silently outrank a real one. The test drops
+// the CHECK to inject the impossible-by-constraint row, then restores
+// it on cleanup so other tests are unaffected.
+func TestListOwnershipRulesForEngineUnknownTierSortsLast(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	repo := postgres.NewOwnershipRepository(db)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	now := time.Now().UTC()
+
+	seedService(t, db, ctx, "svc-drift")
+
+	// Drop the precedence_tier CHECK (whatever it is named) so we can
+	// inject a tier the ladder does not recognize. Restore it on
+	// cleanup — deleting any rule first so the re-add validates.
+	dropCheck := `DO $$
+		DECLARE cname text;
+		BEGIN
+		  SELECT conname INTO cname FROM pg_constraint
+		   WHERE conrelid = 'ownership_rules'::regclass AND contype = 'c'
+		     AND pg_get_constraintdef(oid) LIKE '%precedence_tier%';
+		  IF cname IS NOT NULL THEN
+		    EXECUTE 'ALTER TABLE ownership_rules DROP CONSTRAINT ' || quote_ident(cname);
+		  END IF;
+		END $$;`
+	if err := execRawSQL(ctx, db, rawStmt{dropCheck, nil}); err != nil {
+		t.Fatalf("drop check: %v", err)
+	}
+	t.Cleanup(func() {
+		cctx, ccancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer ccancel()
+		_ = execRawSQL(cctx, db, rawStmt{`DELETE FROM ownership_rules`, nil})
+		_ = execRawSQL(cctx, db, rawStmt{
+			`ALTER TABLE ownership_rules ADD CONSTRAINT ownership_rules_precedence_tier_check
+			   CHECK (precedence_tier IN ('explicit','service_member','agent_group','san_pattern','subject_pattern','tag','issuer_store','fallback'))`,
+			nil,
+		})
+	})
+
+	mk := func(id string, tier governance.PrecedenceTier) {
+		if err := repo.CreateOwnershipRule(ctx, &governance.OwnershipRule{
+			ID:             id,
+			OrganizationID: "anchorix",
+			Name:           id,
+			ServiceID:      "svc-drift",
+			PrecedenceTier: tier,
+			Priority:       1,
+			MatchKind:      governance.MatchFallback,
+			MatchValue:     "",
+			Enabled:        true,
+			CreatedAt:      now,
+			UpdatedAt:      now,
+			CreatedBy:      "tester",
+		}); err != nil {
+			t.Fatalf("create rule %s: %v", id, err)
+		}
+	}
+	mk("r-fallback", governance.PrecedenceFallback)        // known, ordinal 8
+	mk("r-bogus", governance.PrecedenceTier("bogus_tier")) // unknown, ELSE 99
+
+	rules, err := repo.ListOwnershipRulesForEngine(ctx, "anchorix")
+	if err != nil {
+		t.Fatalf("ListOwnershipRulesForEngine: %v", err)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("engine rules = %d; want 2 (unknown tier still returned, not dropped)", len(rules))
+	}
+	if rules[0].ID != "r-fallback" || rules[1].ID != "r-bogus" {
+		t.Fatalf("order = %s,%s; want r-fallback then r-bogus (unknown tier must sort LAST)", rules[0].ID, rules[1].ID)
+	}
+}
+
 // TestListCertificateOwnershipPaged walks the derived-ownership read
 // in small pages and asserts ordered, disjoint, complete coverage.
 func TestListCertificateOwnershipPaged(t *testing.T) {
