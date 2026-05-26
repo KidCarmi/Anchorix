@@ -21,16 +21,26 @@ const auditSampleCap = 100
 // the bridge between the streaming pass and the audit emission +
 // run-finish steps, all of which run inside the same transaction.
 type recomputeOutcome struct {
-	firstRun        bool
-	evaluated       int
-	changed         int
-	unchanged       int
-	becameOwned     int
-	becameUnowned   int
-	flippedOwner    int
-	createdUnowned  int
-	compileFailures []ruleCompileFailure
-	auditGroups     map[auditGroupKey]*auditGroup
+	firstRun         bool
+	evaluated        int
+	changed          int
+	unchanged        int
+	reclassified     int
+	becameOwned      int
+	becameUnowned    int
+	flippedOwner     int
+	createdUnowned   int
+	compileFailures  []ruleCompileFailure
+	expiredOverrides []expiredOverrideInfo
+	auditGroups      map[auditGroupKey]*auditGroup
+}
+
+// expiredOverrideInfo records an override the pass auto-cleared
+// because its expiry passed, for the ownership.override_expired audit.
+type expiredOverrideInfo struct {
+	certID     string
+	overrideID string
+	serviceID  string
 }
 
 // auditGroupKey groups per-cert transitions so the emitter can roll
@@ -125,6 +135,9 @@ func (s *Service) runRecomputeTx(ctx context.Context, organizationID, actor stri
 	if err := s.emitCompileFailures(ctx, organizationID, actor, actorKind, runID, now, compileFailures); err != nil {
 		return nil, err
 	}
+	if err := s.emitExpiredOverrides(ctx, organizationID, actor, actorKind, runID, now, out); err != nil {
+		return nil, err
+	}
 	if err := s.emitAuditGroups(ctx, organizationID, actor, actorKind, runID, now, out); err != nil {
 		return nil, err
 	}
@@ -152,10 +165,12 @@ func (s *Service) runRecomputeTx(ctx context.Context, organizationID, actor stri
 		EvaluatedCertificates: out.evaluated,
 		ChangedCertificates:   out.changed,
 		UnchangedCertificates: out.unchanged,
+		Reclassified:          out.reclassified,
 		BecameOwned:           out.becameOwned,
 		BecameUnowned:         out.becameUnowned,
 		FlippedOwner:          out.flippedOwner,
 		CreatedUnownedRows:    out.createdUnowned,
+		ExpiredOverrides:      len(out.expiredOverrides),
 		RuleCompileFailures:   len(compileFailures),
 		EngineVersion:         engineVersion,
 	}, nil
@@ -270,6 +285,23 @@ func (s *Service) processCert(
 	out *recomputeOutcome,
 ) error {
 	out.evaluated++
+
+	// Auto-expire: an active override past its expiry is cleared now
+	// (cleared_by="system", reason="auto-expired"), which frees the
+	// cleared_at IS NULL slot so a replacement override can be created
+	// for this cert, and is recorded for an ownership.override_expired
+	// audit row. The decision then re-derives as if no override exists
+	// (the consequent flip/clear is audited by the normal diff below).
+	if override != nil && override.ExpiresAt != nil && !override.ExpiresAt.After(now) {
+		if err := s.repo.Ownership.ClearOwnershipOverride(ctx, organizationID, override.ID, "system", "auto-expired", now); err != nil {
+			return fmt.Errorf("ownership: clear expired override: %w", err)
+		}
+		out.expiredOverrides = append(out.expiredOverrides, expiredOverrideInfo{
+			certID: sig.CertificateID, overrideID: override.ID, serviceID: override.ServiceID,
+		})
+		override = nil
+	}
+
 	d := decideOwnership(sig, override, rules, now)
 	nowOwned := d.serviceID != nil
 
@@ -296,23 +328,61 @@ func (s *Service) processCert(
 
 	priorOwned := prior.ServiceID != nil
 	sameService := samePtr(prior.ServiceID, d.serviceID)
-	if prior.Decision == d.decision && sameService {
-		// Unchanged: bump last_evaluated_at, keep the existing
-		// explanation (caps explanation cardinality, §5.2).
-		co := *prior
-		co.LastEvaluatedAt = now
-		if err := s.repo.Ownership.UpsertCertificateOwnership(ctx, &co); err != nil {
-			return fmt.Errorf("ownership: upsert (unchanged): %w", err)
+	ownerChanged := prior.Decision != d.decision || !sameService
+
+	if !ownerChanged {
+		// Same decision AND same service. Distinguish a true no-op from
+		// an owner-stable RECLASSIFICATION: the owner is unchanged but
+		// the decision BASIS moved — a different winning rule, override,
+		// or confidence (e.g. a fallback owner later also matched by a
+		// higher-precedence SAN rule pointing at the same service).
+		// Without this, winning_rule_id / confidence / explanation_id /
+		// signals_seen would go stale while the owner stayed put.
+		basisChanged := !samePtr(prior.WinningRuleID, d.winningRuleID) ||
+			!samePtr(prior.OverrideID, d.overrideID) ||
+			prior.Confidence != d.confidence
+		if !basisChanged {
+			// True unchanged: bump last_evaluated_at only, keep the
+			// existing explanation (caps explanation cardinality, §5.2).
+			co := *prior
+			co.LastEvaluatedAt = now
+			if err := s.repo.Ownership.UpsertCertificateOwnership(ctx, &co); err != nil {
+				return fmt.Errorf("ownership: upsert (unchanged): %w", err)
+			}
+			out.unchanged++
+			return nil
 		}
-		out.unchanged++
+		// Reclassification: write a fresh explanation and refresh the
+		// ownership metadata (winning_rule_id, override_id, confidence,
+		// explanation_id), but PRESERVE last_changed_at — the owner did
+		// not change — and emit NO transition audit (no assigned /
+		// flipped spam for a same-owner basis refresh).
+		expID := ids.New()
+		if err := s.writeExplanation(ctx, organizationID, sig, d, expID, now); err != nil {
+			return err
+		}
+		if err := s.repo.Ownership.UpsertCertificateOwnership(ctx, buildOwnership(organizationID, sig.CertificateID, d, expID, prior.FirstAssignedAt, now, prior.LastChangedAt)); err != nil {
+			return fmt.Errorf("ownership: upsert (reclassified): %w", err)
+		}
+		out.changed++
+		out.reclassified++
 		return nil
 	}
 
+	// Owner transition: new explanation, last_changed_at=now, audit.
+	// first_assigned_at is reset to now on the FIRST real assignment so
+	// a cert that was materialized unowned does not carry the
+	// unowned-creation timestamp forward as its first-owned time;
+	// already-owned flips preserve the original assignment time.
+	firstAssigned := prior.FirstAssignedAt
+	if !priorOwned && nowOwned {
+		firstAssigned = now
+	}
 	expID := ids.New()
 	if err := s.writeExplanation(ctx, organizationID, sig, d, expID, now); err != nil {
 		return err
 	}
-	if err := s.repo.Ownership.UpsertCertificateOwnership(ctx, buildOwnership(organizationID, sig.CertificateID, d, expID, prior.FirstAssignedAt, now, now)); err != nil {
+	if err := s.repo.Ownership.UpsertCertificateOwnership(ctx, buildOwnership(organizationID, sig.CertificateID, d, expID, firstAssigned, now, now)); err != nil {
 		return fmt.Errorf("ownership: upsert (changed): %w", err)
 	}
 	out.changed++

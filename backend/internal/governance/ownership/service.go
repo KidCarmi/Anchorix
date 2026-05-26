@@ -106,10 +106,12 @@ type RecomputeResult struct {
 	EvaluatedCertificates int
 	ChangedCertificates   int
 	UnchangedCertificates int
+	Reclassified          int
 	BecameOwned           int
 	BecameUnowned         int
 	FlippedOwner          int
 	CreatedUnownedRows    int
+	ExpiredOverrides      int
 	RuleCompileFailures   int
 	EngineVersion         int
 }
@@ -176,6 +178,7 @@ type recomputedAuditMetadata struct {
 	EvaluatedCertificates int                  `json:"evaluated_certificates"`
 	ChangedCertificates   int                  `json:"changed_certificates"`
 	UnchangedCertificates int                  `json:"unchanged_certificates"`
+	Reclassified          int                  `json:"reclassified"`
 	BecameOwned           int                  `json:"became_owned"`
 	BecameUnowned         int                  `json:"became_unowned"`
 	FlippedOwner          int                  `json:"flipped_owner"`
@@ -193,6 +196,7 @@ func (s *Service) emitRecomputed(ctx context.Context, organizationID, actor stri
 		EvaluatedCertificates: out.evaluated,
 		ChangedCertificates:   out.changed,
 		UnchangedCertificates: out.unchanged,
+		Reclassified:          out.reclassified,
 		BecameOwned:           out.becameOwned,
 		BecameUnowned:         out.becameUnowned,
 		FlippedOwner:          out.flippedOwner,
@@ -210,6 +214,39 @@ func (s *Service) emitRecomputed(ctx context.Context, organizationID, actor stri
 		TargetID:       organizationID,
 		Metadata:       md,
 	})
+}
+
+// overrideExpiredMetadata is the per-override ownership.override_expired
+// audit shape, emitted when the recompute auto-clears an expired
+// override. Low cardinality (operator pins), so no rollup.
+type overrideExpiredMetadata struct {
+	Severity   string `json:"severity"`
+	RunID      string `json:"run_id"`
+	OverrideID string `json:"override_id"`
+	ServiceID  string `json:"service_id"`
+	Reason     string `json:"reason"`
+}
+
+func (s *Service) emitExpiredOverrides(ctx context.Context, organizationID, actor string, actorKind governance.RecomputeActorKind, runID string, now time.Time, out *recomputeOutcome) error {
+	at := string(actorKind)
+	for _, e := range out.expiredOverrides {
+		md, _ := json.Marshal(overrideExpiredMetadata{
+			Severity: "security", RunID: runID, OverrideID: e.overrideID, ServiceID: e.serviceID, Reason: "auto-expired",
+		})
+		if err := s.audit.Record(ctx, audit.Event{
+			OrganizationID: organizationID,
+			OccurredAt:     now,
+			Actor:          actor,
+			ActorType:      at,
+			Action:         "ownership.override_expired",
+			TargetType:     "certificate",
+			TargetID:       e.certID,
+			Metadata:       md,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // ruleCompileFailedMetadata is the per-failed-rule audit shape.

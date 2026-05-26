@@ -260,6 +260,95 @@ func indexOf(s, sub string) int {
 	return -1
 }
 
+func TestOwnershipSameOwnerReclassificationRefreshesMetadata(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	seedService(t, db, ctx, "svc-shared")
+	seedCertMeta(t, db, ctx, "anchorix", "cert-recl", "CN=a.example", "CN=ca", []string{"a.example"})
+	// Pass 1: only a fallback rule (→ svc-shared, low confidence).
+	seedOwnershipRule(t, db, ctx, "rule-recl-fb", "svc-shared", governance.PrecedenceFallback, governance.MatchFallback, "", 1000)
+	svc := ownershipService(t, db, 0)
+	repo := postgres.NewOwnershipRepository(db)
+
+	if _, err := svc.Recompute(ctx, "anchorix", "op"); err != nil {
+		t.Fatalf("run1: %v", err)
+	}
+	co1, _ := repo.GetCertificateOwnership(ctx, "anchorix", "cert-recl")
+	if co1.WinningRuleID == nil || *co1.WinningRuleID != "rule-recl-fb" || co1.Confidence != governance.ConfidenceLow {
+		t.Fatalf("pass1 ownership = %+v; want fallback/low", co1)
+	}
+	assignedBefore := auditCount(t, db, ctx, "anchorix", "ownership.assigned")
+
+	// Pass 2: add a higher-precedence SAN rule ALSO pointing at the
+	// SAME service. Owner does not change; the basis does.
+	seedOwnershipRule(t, db, ctx, "rule-recl-san", "svc-shared", governance.PrecedenceSANPattern, governance.MatchSANGlob, "*.example", 100)
+	res, err := svc.Recompute(ctx, "anchorix", "op")
+	if err != nil {
+		t.Fatalf("run2: %v", err)
+	}
+	if res.Reclassified != 1 || res.BecameOwned != 0 || res.FlippedOwner != 0 {
+		t.Fatalf("run2 = %+v; want reclassified=1, becameOwned=0, flippedOwner=0", res)
+	}
+
+	co2, _ := repo.GetCertificateOwnership(ctx, "anchorix", "cert-recl")
+	if co2.ServiceID == nil || *co2.ServiceID != "svc-shared" {
+		t.Fatalf("owner must stay svc-shared: %+v", co2)
+	}
+	if co2.WinningRuleID == nil || *co2.WinningRuleID != "rule-recl-san" {
+		t.Fatalf("winning_rule_id not refreshed: %+v; want rule-recl-san", co2)
+	}
+	if co2.Confidence != governance.ConfidenceMedium {
+		t.Fatalf("confidence not refreshed: %s; want medium", co2.Confidence)
+	}
+	if co2.ExplanationID == co1.ExplanationID {
+		t.Fatalf("explanation_id not refreshed on reclassification")
+	}
+	if !co2.LastChangedAt.Equal(co1.LastChangedAt) {
+		t.Fatalf("last_changed_at must be preserved (owner unchanged): %s → %s", co1.LastChangedAt, co2.LastChangedAt)
+	}
+	if !co2.LastEvaluatedAt.After(co1.LastEvaluatedAt) {
+		t.Fatalf("last_evaluated_at must advance: %s → %s", co1.LastEvaluatedAt, co2.LastEvaluatedAt)
+	}
+	// No transition audit spam: pass 2 emits no new assigned/flipped.
+	if got := auditCount(t, db, ctx, "anchorix", "ownership.assigned"); got != assignedBefore {
+		t.Fatalf("reclassification emitted ownership.assigned: %d → %d", assignedBefore, got)
+	}
+	if got := auditCount(t, db, ctx, "anchorix", "ownership.flipped"); got != 0 {
+		t.Fatalf("reclassification emitted ownership.flipped = %d; want 0", got)
+	}
+}
+
+func TestOwnershipServiceMemberTierIsInert(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	seedService(t, db, ctx, "svc-member")
+	seedService(t, db, ctx, "svc-fb")
+	seedCertMeta(t, db, ctx, "anchorix", "cert-sm", "CN=a.example", "CN=ca", []string{"a.example"})
+	// A reserved service_member rule (ordinal 2, outranks fallback) +
+	// a fallback. The CHECK constraint permits the value, but the
+	// engine must treat it as inert: the fallback must win.
+	seedOwnershipRule(t, db, ctx, "rule-sm", "svc-member", governance.PrecedenceServiceMember, governance.MatchFallback, "", 1)
+	seedOwnershipRule(t, db, ctx, "rule-sm-fb", "svc-fb", governance.PrecedenceFallback, governance.MatchFallback, "", 1000)
+	svc := ownershipService(t, db, 0)
+	if _, err := svc.Recompute(ctx, "anchorix", "op"); err != nil {
+		t.Fatalf("Recompute: %v", err)
+	}
+	co, err := postgres.NewOwnershipRepository(db).GetCertificateOwnership(ctx, "anchorix", "cert-sm")
+	if err != nil {
+		t.Fatalf("get ownership: %v", err)
+	}
+	if co.ServiceID == nil || *co.ServiceID != "svc-fb" {
+		t.Fatalf("service_member rule must be inert; owner = %+v, want svc-fb", co)
+	}
+	if co.WinningRuleID == nil || *co.WinningRuleID != "rule-sm-fb" {
+		t.Fatalf("winner = %v; want rule-sm-fb (service_member skipped)", co.WinningRuleID)
+	}
+}
+
 func TestOwnershipAmbiguityDetected(t *testing.T) {
 	db := testDB(t)
 	freshDatabase(t, db)
@@ -331,6 +420,92 @@ func TestOwnershipOverridePrecedence(t *testing.T) {
 	}
 	if co.OverrideID == nil || *co.OverrideID != "ovr-1" || co.WinningRuleID != nil {
 		t.Fatalf("override metadata wrong: %+v", co)
+	}
+}
+
+func TestOwnershipExpiredOverrideAutoCleared(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	seedService(t, db, ctx, "svc-exp-rule")
+	seedService(t, db, ctx, "svc-exp-pin")
+	seedCertMeta(t, db, ctx, "anchorix", "cert-exp", "CN=a.example", "CN=ca", []string{"a.example"})
+	seedOwnershipRule(t, db, ctx, "rule-exp", "svc-exp-rule", governance.PrecedenceSANPattern, governance.MatchSANGlob, "*.example", 100)
+	repo := postgres.NewOwnershipRepository(db)
+	past := time.Now().UTC().Add(-time.Hour)
+	if err := repo.CreateOwnershipOverride(ctx, &governance.CertificateOwnershipOverride{
+		ID: "ovr-exp", OrganizationID: "anchorix", CertificateID: "cert-exp", ServiceID: "svc-exp-pin",
+		Reason: "pin", SetBy: "op", SetAt: time.Now().UTC().Add(-2 * time.Hour), ExpiresAt: &past,
+	}); err != nil {
+		t.Fatalf("create override: %v", err)
+	}
+	svc := ownershipService(t, db, 0)
+
+	res, err := svc.Recompute(ctx, "anchorix", "op")
+	if err != nil {
+		t.Fatalf("Recompute: %v", err)
+	}
+	if res.ExpiredOverrides != 1 {
+		t.Fatalf("expired overrides = %d; want 1", res.ExpiredOverrides)
+	}
+	// The override row is now cleared (slot freed).
+	if got, _ := repo.GetActiveOwnershipOverride(ctx, "anchorix", "cert-exp"); got != nil {
+		t.Fatalf("expired override still active: %+v", got)
+	}
+	cleared, err := repo.GetOwnershipOverride(ctx, "anchorix", "ovr-exp")
+	if err != nil {
+		t.Fatalf("get override: %v", err)
+	}
+	if cleared.ClearedAt == nil || cleared.ClearedBy == nil || *cleared.ClearedBy != "system" {
+		t.Fatalf("override not auto-cleared by system: %+v", cleared)
+	}
+	if n := auditCount(t, db, ctx, "anchorix", "ownership.override_expired"); n != 1 {
+		t.Fatalf("override_expired audit = %d; want 1", n)
+	}
+	// Decision re-derived from the rule (override gone).
+	co, _ := repo.GetCertificateOwnership(ctx, "anchorix", "cert-exp")
+	if co.Decision != governance.DecisionMatched || co.ServiceID == nil || *co.ServiceID != "svc-exp-rule" {
+		t.Fatalf("cert should re-derive to the rule's service: %+v", co)
+	}
+	// The freed slot accepts a replacement override (no conflict).
+	if err := repo.CreateOwnershipOverride(ctx, &governance.CertificateOwnershipOverride{
+		ID: "ovr-exp-2", OrganizationID: "anchorix", CertificateID: "cert-exp", ServiceID: "svc-exp-pin",
+		Reason: "re-pin", SetBy: "op", SetAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatalf("replacement override should be creatable after auto-clear: %v", err)
+	}
+}
+
+func TestOwnershipFirstAssignedAtResetOnFirstOwnership(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	seedService(t, db, ctx, "svc-fa")
+	seedCertMeta(t, db, ctx, "anchorix", "cert-fa", "CN=a.example", "CN=ca", []string{"a.example"})
+	svc := ownershipService(t, db, 0)
+	repo := postgres.NewOwnershipRepository(db)
+
+	// Pass 1: no rules → unowned. first_assigned_at = materialization.
+	if _, err := svc.Recompute(ctx, "anchorix", "op"); err != nil {
+		t.Fatalf("run1: %v", err)
+	}
+	co1, _ := repo.GetCertificateOwnership(ctx, "anchorix", "cert-fa")
+	unownedAt := co1.FirstAssignedAt
+
+	time.Sleep(10 * time.Millisecond)
+	// Pass 2: add a rule → cert becomes owned for the FIRST time.
+	seedOwnershipRule(t, db, ctx, "rule-fa", "svc-fa", governance.PrecedenceSANPattern, governance.MatchSANGlob, "*.example", 100)
+	if _, err := svc.Recompute(ctx, "anchorix", "op"); err != nil {
+		t.Fatalf("run2: %v", err)
+	}
+	co2, _ := repo.GetCertificateOwnership(ctx, "anchorix", "cert-fa")
+	if co2.ServiceID == nil {
+		t.Fatalf("cert not owned after rule added: %+v", co2)
+	}
+	if !co2.FirstAssignedAt.After(unownedAt) {
+		t.Fatalf("first_assigned_at not reset on first ownership: unowned=%s owned=%s", unownedAt, co2.FirstAssignedAt)
 	}
 }
 

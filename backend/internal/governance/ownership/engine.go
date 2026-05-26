@@ -55,6 +55,16 @@ func compileRules(rules []governance.OwnershipRule) ([]compiledRule, []ruleCompi
 	compiled := make([]compiledRule, 0, len(rules))
 	var failures []ruleCompileFailure
 	for _, r := range rules {
+		// service_member is a RESERVED tier in H-026B (governance plan
+		// §5.4 / OQ-1): no operator rule may carry it yet. The B3
+		// rule-create validator rejects it at creation; here — defense
+		// in depth — the engine treats any service_member rule that
+		// reached the DB (the migration 0010 CHECK still permits the
+		// value) as INERT: skipped from the compiled set so it can
+		// never win. Fail closed, no abort, no audit spam.
+		if r.PrecedenceTier == governance.PrecedenceServiceMember {
+			continue
+		}
 		ord, ok := ordinalOf(r.PrecedenceTier)
 		if !ok {
 			return nil, nil, fmt.Errorf("%w: rule %s tier %q", ErrUnknownPrecedenceTier, r.ID, r.PrecedenceTier)

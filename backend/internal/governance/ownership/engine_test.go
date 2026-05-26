@@ -78,6 +78,26 @@ func TestCompileRulesSortsToLadderOrder(t *testing.T) {
 	}
 }
 
+func TestCompileRulesServiceMemberIsInert(t *testing.T) {
+	// service_member is reserved in H-026B: a rule carrying it must be
+	// skipped (never enters the compiled set) so it can never win,
+	// even though its ladder ordinal (2) outranks the fallback.
+	compiled, _, err := compileRules([]governance.OwnershipRule{
+		rule("rsm", governance.PrecedenceServiceMember, governance.MatchFallback, "", 1, baseTime),
+		rule("rfb", governance.PrecedenceFallback, governance.MatchFallback, "", 1, baseTime),
+	})
+	if err != nil {
+		t.Fatalf("service_member must not abort the pass: %v", err)
+	}
+	if len(compiled) != 1 || compiled[0].rule.ID != "rfb" {
+		t.Fatalf("compiled = %d rules; want only the fallback (service_member skipped)", len(compiled))
+	}
+	d := decideOwnership(sigWithSAN("a.example"), nil, compiled, baseTime)
+	if d.decision != governance.DecisionMatched || *d.winningRuleID != "rfb" {
+		t.Fatalf("service_member rule must not win; got %+v", d)
+	}
+}
+
 func TestGlobMatchCaseInsensitiveAnchored(t *testing.T) {
 	re := compileGlob("*.corp.example")
 	if !re.MatchString("a.CORP.example") {
