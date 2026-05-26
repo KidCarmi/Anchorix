@@ -241,6 +241,7 @@ func (r *OwnershipRepository) UpsertCertificateOwnership(
 		       override_id        = EXCLUDED.override_id,
 		       explanation_id     = EXCLUDED.explanation_id,
 		       confidence         = EXCLUDED.confidence,
+		       first_assigned_at  = EXCLUDED.first_assigned_at,
 		       last_evaluated_at  = EXCLUDED.last_evaluated_at,
 		       last_changed_at    = EXCLUDED.last_changed_at`
 	if _, err := r.db.querierFor(ctx).Exec(ctx, q,
