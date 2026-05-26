@@ -207,6 +207,17 @@ func (s *Service) loadActiveOverrides(ctx context.Context, organizationID string
 // prior-ownership stream — both ordered by certificate_id ASC under
 // the same REPEATABLE READ snapshot — and decides each cert. Memory
 // is bounded to one page of each stream (no fleet in memory).
+//
+// Ordering invariant: the merge advances the ownership cursor using a
+// Go string comparison (ownCur.CertificateID < sig.CertificateID),
+// which must agree with the SQL ORDER BY certificate_id of both
+// streams. It does, because every certificate_id is server-minted by
+// ids.New() — a fixed-length lowercase-hex string ([0-9a-f]{32}) —
+// for which byte order equals collation order under any PostgreSQL
+// collation (C, en_US.UTF-8, …). Cert ids are never operator-supplied,
+// so a punctuation/case/length collation surprise cannot occur. If
+// that ever changes (non-hex cert ids), this merge must switch to a
+// collation-independent pairing (see HARDENING_BACKLOG H-030).
 func (s *Service) streamAndDecide(
 	ctx context.Context,
 	organizationID string,

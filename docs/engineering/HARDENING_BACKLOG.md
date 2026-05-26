@@ -99,6 +99,39 @@ this file and CLAUDE.md disagree, CLAUDE.md wins.
   `docs/engineering/H026B_OWNERSHIP_ENGINE_PLAN.md` §3.4;
   `docs/engineering/H026_TRUST_GOVERNANCE_PLAN.md` §3.9.
 
+### H-030 — Ownership recompute: collation-independent stream merge
+
+- **Title:** `hardening(governance): collation-independent ownership stream merge`
+- **Risk:** low and currently unreachable. The H-026B2 ownership
+  recompute streams certificates and prior ownership in two paginated
+  streams, both `ORDER BY certificate_id`, and merges them in Go with a
+  `<` string comparison (`streamAndDecide`). Correctness requires Go
+  byte order to agree with the PostgreSQL collation used by the SQL
+  `ORDER BY` / cursor `>`. It does today because every `certificate_id`
+  is server-minted by `ids.New()` — a fixed-length lowercase-hex string
+  `[0-9a-f]{32}` — for which byte order equals collation order under any
+  PostgreSQL collation. Cert ids are never operator-supplied, so the
+  punctuation/case/length cases where glibc `en_US.UTF-8` diverges from
+  byte order cannot occur.
+- **Scope:** if a future change ever makes `certificate_id` (or another
+  merge key) non-hex or operator-influenced, the merge must stop relying
+  on the implicit ordering agreement. Two clean options: (a) fetch
+  prior ownership per signal-page via a set lookup
+  (`WHERE certificate_id = ANY($ids)`), which is order-independent; or
+  (b) order both streams `COLLATE "C"` with matching `COLLATE "C"`
+  indexes so SQL order is byte order. Option (a) is preferred (no index
+  churn, no full-fleet sort).
+- **Reason not fixed now:** there is no reachable defect — the invariant
+  holds for all server-minted ids, and is asserted by
+  `TestOwnershipMergeHandlesNewCertInterleavedAmongOwned`
+  (new-cert-interleaved-among-owned, which exercises the skip-loop) and
+  documented inline on `streamAndDecide`. Restructuring would add a repo
+  method or a perf-regressing `COLLATE "C"` sort for a non-reachable
+  case.
+- **References:**
+  `backend/internal/governance/ownership/recompute.go` (`streamAndDecide`);
+  `docs/engineering/H026B_OWNERSHIP_ENGINE_PLAN.md` §3.3.
+
 ### H-025 — Findings scheduler: per-recompute timeout
 
 - **Title:** `feat(findings): per-org recompute timeout in scheduler`

@@ -661,6 +661,62 @@ func TestOwnershipPageBoundaryCompleteness(t *testing.T) {
 	}
 }
 
+// TestOwnershipMergeHandlesNewCertInterleavedAmongOwned exercises the
+// streaming merge's skip-loop, which existing tests never hit (first
+// run has an empty ownership stream; idempotent re-runs have perfectly
+// aligned streams). Here pass 2 sees signals for {1,2,3,4,5} but prior
+// ownership only for {1,3,5}; the merge must pair 1/3/5 with their
+// prior rows and treat 2/4 as new — never skipping or duplicating an
+// already-owned cert when an unowned-prior cert interleaves between
+// page boundaries.
+func TestOwnershipMergeHandlesNewCertInterleavedAmongOwned(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	seedService(t, db, ctx, "svc-merge")
+	seedOwnershipRule(t, db, ctx, "rule-merge-fb", "svc-merge", governance.PrecedenceFallback, governance.MatchFallback, "", 1)
+	svc := ownershipService(t, db, 0)
+	svc.SetPageSizeForTest(2) // force multi-page walks on both streams
+
+	// Phase 1: only the odd certs exist → owned after pass 1.
+	for _, n := range []string{"1", "3", "5"} {
+		seedCertMeta(t, db, ctx, "anchorix", "cert-merge-"+n, "CN=x", "CN=ca", nil)
+	}
+	if _, err := svc.Recompute(ctx, "anchorix", "op"); err != nil {
+		t.Fatalf("pass1: %v", err)
+	}
+
+	// Phase 2: add the even certs whose ids sort BETWEEN the owned
+	// ones. They have no prior ownership row; the owned ones do.
+	for _, n := range []string{"2", "4"} {
+		seedCertMeta(t, db, ctx, "anchorix", "cert-merge-"+n, "CN=x", "CN=ca", nil)
+	}
+	res, err := svc.Recompute(ctx, "anchorix", "op")
+	if err != nil {
+		t.Fatalf("pass2: %v", err)
+	}
+	if res.EvaluatedCertificates != 5 {
+		t.Fatalf("evaluated = %d; want 5 (no cert skipped/duplicated)", res.EvaluatedCertificates)
+	}
+	if res.BecameOwned != 2 {
+		t.Fatalf("becameOwned = %d; want 2 (certs 2 and 4)", res.BecameOwned)
+	}
+	if res.UnchangedCertificates != 3 {
+		t.Fatalf("unchanged = %d; want 3 (certs 1,3,5 paired with prior — not re-assigned)", res.UnchangedCertificates)
+	}
+	if res.ChangedCertificates != 2 {
+		t.Fatalf("changed = %d; want 2", res.ChangedCertificates)
+	}
+	// Every cert owned exactly once.
+	if got := scalarInt(t, db, ctx, `SELECT count(*) FROM certificate_ownership WHERE organization_id='anchorix'`); got != 5 {
+		t.Fatalf("ownership rows = %d; want 5", got)
+	}
+	if got := scalarInt(t, db, ctx, `SELECT count(*) FROM certificate_ownership WHERE organization_id='anchorix' AND service_id='svc-merge'`); got != 5 {
+		t.Fatalf("owned-by-svc-merge rows = %d; want 5", got)
+	}
+}
+
 func TestOwnershipStaleLastEvaluatedBumped(t *testing.T) {
 	db := testDB(t)
 	freshDatabase(t, db)
