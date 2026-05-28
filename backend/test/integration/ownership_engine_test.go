@@ -662,13 +662,14 @@ func TestOwnershipPageBoundaryCompleteness(t *testing.T) {
 }
 
 // TestOwnershipMergeHandlesNewCertInterleavedAmongOwned exercises the
-// streaming merge's skip-loop, which existing tests never hit (first
-// run has an empty ownership stream; idempotent re-runs have perfectly
-// aligned streams). Here pass 2 sees signals for {1,2,3,4,5} but prior
-// ownership only for {1,3,5}; the merge must pair 1/3/5 with their
-// prior rows and treat 2/4 as new — never skipping or duplicating an
-// already-owned cert when an unowned-prior cert interleaves between
-// page boundaries.
+// merge's interleaved-pairing path: pass 2 sees signals for {1,2,3,4,5}
+// but prior ownership only for {1,3,5}, so 1/3/5 must pair with their
+// prior rows via the `ownCur == sig` exact match and 2/4 must be
+// treated as new (no prior) without disturbing the alignment. This
+// test does NOT hit the `ownCur < sig` skip-loop (every ownership
+// cert here has a matching signal, so ownCur is never strictly less
+// than sig). Skip-loop coverage lives in
+// TestOwnershipMergeSkipLoopHandlesOrphanOwnershipRows.
 func TestOwnershipMergeHandlesNewCertInterleavedAmongOwned(t *testing.T) {
 	db := testDB(t)
 	freshDatabase(t, db)
@@ -714,6 +715,95 @@ func TestOwnershipMergeHandlesNewCertInterleavedAmongOwned(t *testing.T) {
 	}
 	if got := scalarInt(t, db, ctx, `SELECT count(*) FROM certificate_ownership WHERE organization_id='anchorix' AND service_id='svc-merge'`); got != 5 {
 		t.Fatalf("owned-by-svc-merge rows = %d; want 5", got)
+	}
+}
+
+// TestOwnershipMergeSkipLoopHandlesOrphanOwnershipRows exercises the
+// `for ownHas && ownCur.CertificateID < sig.CertificateID` skip-loop
+// in streamAndDecide — the defensive path where an ownership row has
+// no matching signal and must be skipped without consuming a signal
+// or wrongly pairing it with a later one.
+//
+// To make the skip-loop reachable we have to inject orphan ownership
+// rows, which the (ON DELETE CASCADE) FK normally prevents. We delete
+// the parent cert rows inside one transaction with
+// SET LOCAL session_replication_role = 'replica', which makes
+// PostgreSQL bypass FK-cascade triggers (and the LOCAL scope reverts
+// the role on commit so the connection returns to the pool clean).
+// The orphans (certificate_ownership + ownership_match_explanations
+// rows whose cert is gone) survive until the next test's
+// freshDatabase truncates them.
+//
+// Two services + a SAN rule per service make mis-pairing detectable:
+// if a buggy merge paired sig=cert-orph-2 (svc-even) with the orphan
+// prior for cert-orph-1 (svc-odd), the diff would report a flip;
+// correctly skipping the orphan yields all-unchanged.
+func TestOwnershipMergeSkipLoopHandlesOrphanOwnershipRows(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	seedService(t, db, ctx, "svc-odd")
+	seedService(t, db, ctx, "svc-even")
+	seedCertMeta(t, db, ctx, "anchorix", "cert-orph-1", "CN=x", "CN=ca", []string{"h1.odd.x"})
+	seedCertMeta(t, db, ctx, "anchorix", "cert-orph-2", "CN=x", "CN=ca", []string{"h2.even.x"})
+	seedCertMeta(t, db, ctx, "anchorix", "cert-orph-3", "CN=x", "CN=ca", []string{"h3.odd.x"})
+	seedCertMeta(t, db, ctx, "anchorix", "cert-orph-4", "CN=x", "CN=ca", []string{"h4.even.x"})
+	seedCertMeta(t, db, ctx, "anchorix", "cert-orph-5", "CN=x", "CN=ca", []string{"h5.even.x"})
+	seedOwnershipRule(t, db, ctx, "rule-orph-odd", "svc-odd", governance.PrecedenceSANPattern, governance.MatchSANGlob, "*.odd.x", 100)
+	seedOwnershipRule(t, db, ctx, "rule-orph-even", "svc-even", governance.PrecedenceSANPattern, governance.MatchSANGlob, "*.even.x", 100)
+	svc := ownershipService(t, db, 0)
+	svc.SetPageSizeForTest(2)
+	repo := postgres.NewOwnershipRepository(db)
+
+	if _, err := svc.Recompute(ctx, "anchorix", "op"); err != nil {
+		t.Fatalf("pass1: %v", err)
+	}
+
+	// Bypass FK cascade so DELETE cert leaves the ownership row
+	// behind as an orphan. SET LOCAL is tx-scoped.
+	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx, "SET LOCAL session_replication_role = 'replica'"); err != nil {
+			return err
+		}
+		_, err := tx.Exec(ctx,
+			`DELETE FROM certificates WHERE organization_id='anchorix' AND id = ANY($1)`,
+			[]string{"cert-orph-1", "cert-orph-3"})
+		return err
+	}); err != nil {
+		t.Fatalf("orphan delete: %v", err)
+	}
+	if got := scalarInt(t, db, ctx, `SELECT count(*) FROM certificates WHERE organization_id='anchorix'`); got != 3 {
+		t.Fatalf("live certs = %d; want 3", got)
+	}
+	if got := scalarInt(t, db, ctx, `SELECT count(*) FROM certificate_ownership WHERE organization_id='anchorix'`); got != 5 {
+		t.Fatalf("ownership rows = %d; want 5 (2 orphans + 3 live)", got)
+	}
+
+	// Pass 2: signals = {2,4,5}; ownership stream = {1,2,3,4,5}.
+	// The merge MUST advance ownCur=1 past sig=2 (skip-loop), pair
+	// sig=2 with its own prior, then advance ownCur=3 past sig=4
+	// (skip-loop again), pair sig=4 and sig=5 with their own priors.
+	res, err := svc.Recompute(ctx, "anchorix", "op")
+	if err != nil {
+		t.Fatalf("pass2: %v", err)
+	}
+	if res.EvaluatedCertificates != 3 {
+		t.Fatalf("evaluated = %d; want 3 (orphan ownership rows must not become signals)", res.EvaluatedCertificates)
+	}
+	if res.UnchangedCertificates != 3 || res.ChangedCertificates != 0 || res.FlippedOwner != 0 {
+		t.Fatalf("res = %+v; want unchanged=3 changed=0 flipped=0 — a non-zero flip count would indicate the skip-loop mis-paired a live signal with an orphan prior", res)
+	}
+	for _, c := range []struct{ id, svc string }{
+		{"cert-orph-2", "svc-even"}, {"cert-orph-4", "svc-even"}, {"cert-orph-5", "svc-even"},
+	} {
+		co, err := repo.GetCertificateOwnership(ctx, "anchorix", c.id)
+		if err != nil {
+			t.Fatalf("get ownership %s: %v", c.id, err)
+		}
+		if co.ServiceID == nil || *co.ServiceID != c.svc {
+			t.Fatalf("%s owner = %v; want %s", c.id, co.ServiceID, c.svc)
+		}
 	}
 }
 
