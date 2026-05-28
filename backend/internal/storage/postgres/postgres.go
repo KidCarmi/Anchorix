@@ -433,6 +433,77 @@ func (db *DB) WithTxLockedOwnershipRepeatableRead(ctx context.Context, organizat
 	return nil
 }
 
+// TryWithTxLockedOwnershipRepeatableRead is the non-blocking variant
+// of WithTxLockedOwnershipRepeatableRead, used by the H-026B3A
+// `POST /ownership/recompute?nowait=true` path. It tries the session
+// advisory lock via `pg_try_advisory_lock`; if the lock is already
+// held by another holder the function returns (acquired=false, nil)
+// without calling fn and without opening the REPEATABLE READ
+// transaction. When the lock IS acquired the function proceeds
+// identically to WithTxLockedOwnershipRepeatableRead — same RR
+// snapshot, same unlock-or-hijack cleanup — and returns
+// (acquired=true, fn's error).
+//
+// The two helpers share namespace `'ownership-recompute'` so a
+// concurrent blocking recompute and a try-acquire contend on the same
+// lock key.
+func (db *DB) TryWithTxLockedOwnershipRepeatableRead(ctx context.Context, organizationID string, fn func(ctx context.Context) error) (bool, error) {
+	conn, err := db.pool.Acquire(ctx)
+	if err != nil {
+		return false, fmt.Errorf("postgres: acquire connection for ownership recompute try-lock: %w", err)
+	}
+	connReleased := false
+	defer func() {
+		if !connReleased {
+			conn.Release()
+		}
+	}()
+
+	var acquired bool
+	if err := conn.QueryRow(ctx,
+		`SELECT pg_try_advisory_lock(hashtext('ownership-recompute'), hashtext($1))`,
+		organizationID).Scan(&acquired); err != nil {
+		return false, fmt.Errorf("postgres: try advisory lock ownership org %s: %w", organizationID, err)
+	}
+	if !acquired {
+		return false, nil
+	}
+	defer func() {
+		unlockCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, err := conn.Exec(unlockCtx,
+			`SELECT pg_advisory_unlock(hashtext('ownership-recompute'), hashtext($1))`,
+			organizationID); err != nil {
+			if hijacked := conn.Hijack(); hijacked != nil {
+				closeCtx, cancelClose := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancelClose()
+				_ = hijacked.Close(closeCtx)
+			}
+			connReleased = true
+		}
+	}()
+
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead})
+	if err != nil {
+		return true, fmt.Errorf("postgres: begin repeatable-read tx for ownership org %s (try): %w", organizationID, err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	if err := fn(contextWithTx(ctx, tx)); err != nil {
+		return true, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return true, fmt.Errorf("postgres: commit ownership recompute (try) tx: %w", err)
+	}
+	committed = true
+	return true, nil
+}
+
 // WithTxRaw exposes the underlying pgx.Tx for callers inside this
 // package (migrations.go) and for integration tests that need to
 // exercise raw SQL (audit-events-are-append-only). Production

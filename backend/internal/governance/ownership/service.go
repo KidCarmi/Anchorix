@@ -36,8 +36,14 @@ const schedulerActorID = "scheduler"
 // surface the engine needs. The concrete *postgres.DB satisfies it.
 // Defining it here (not importing postgres) keeps the boundary in
 // doc.go intact: ownership never imports storage/postgres.
+//
+// TryWithTxLockedOwnershipRepeatableRead is the non-blocking variant
+// used by the H-026B3A `?nowait=true` recompute trigger; it returns
+// (acquired=false, nil) when the lock is already held by another
+// holder so the handler can map to 409 without enqueuing.
 type Transactor interface {
 	WithTxLockedOwnershipRepeatableRead(ctx context.Context, organizationID string, fn func(ctx context.Context) error) error
+	TryWithTxLockedOwnershipRepeatableRead(ctx context.Context, organizationID string, fn func(ctx context.Context) error) (bool, error)
 }
 
 // ServiceConfig carries the operator-tunable knobs. Zero values fall
@@ -162,6 +168,40 @@ func (s *Service) recompute(ctx context.Context, organizationID, actor string, a
 	})
 	if err != nil {
 		return nil, err
+	}
+	return result, nil
+}
+
+// RecomputeNoWait is the non-blocking entry point used by the
+// H-026B3A `POST /ownership/recompute?nowait=true` path. It returns
+// ErrRecomputeInProgress when another recompute is already holding
+// the per-org advisory lock; the handler maps this to 409
+// `ownership_recompute_in_progress`. Otherwise it runs the same
+// pass as Recompute under the same RR snapshot.
+func (s *Service) RecomputeNoWait(ctx context.Context, organizationID, actorUserID string) (*RecomputeResult, error) {
+	if strings.TrimSpace(organizationID) == "" {
+		return nil, fmt.Errorf("ownership: organization id required")
+	}
+	actor := strings.TrimSpace(actorUserID)
+	actorKind := governance.RecomputeActorUser
+	if actor == "" {
+		actor, actorKind = "system", governance.RecomputeActorSystem
+	}
+	now := s.clock.Now()
+	var result *RecomputeResult
+	acquired, err := s.tx.TryWithTxLockedOwnershipRepeatableRead(ctx, organizationID, func(txCtx context.Context) error {
+		r, err := s.runRecomputeTx(txCtx, organizationID, actor, actorKind, now)
+		if err != nil {
+			return err
+		}
+		result = r
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !acquired {
+		return nil, ErrRecomputeInProgress
 	}
 	return result, nil
 }

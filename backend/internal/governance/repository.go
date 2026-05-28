@@ -42,6 +42,18 @@ type OwnershipRepository interface {
 	// serviceID, regardless of enabled / disabled state.
 	ListOwnershipRulesByService(ctx context.Context, organizationID, serviceID string) ([]OwnershipRule, error)
 
+	// ListOwnershipRulesPaged is the cursor-paged variant of
+	// ListOwnershipRules, used by the H-026B3A operator
+	// /ownership-rules view. Ordered by id ASC for repeatable
+	// pagination. When enabledOnly is true, disabled rules are
+	// excluded.
+	ListOwnershipRulesPaged(
+		ctx context.Context,
+		organizationID, cursorRuleID string,
+		pageSize int,
+		enabledOnly bool,
+	) ([]OwnershipRule, error)
+
 	// ListOwnershipRulesForEngine returns the org's ENABLED rules in
 	// the engine's deterministic walk order:
 	// (precedence_tier ladder ordinal ASC, priority ASC,
@@ -101,6 +113,19 @@ type OwnershipRepository interface {
 		ctx context.Context,
 		organizationID string,
 		decision Decision,
+	) ([]CertificateOwnership, error)
+
+	// ListCertificateOwnershipByDecisionPaged is the cursor-paged
+	// variant of ListCertificateOwnershipByDecision, used by the
+	// H-026B3A operator views /ownership/unowned and /ownership/ambiguous
+	// where the result set can exceed the in-memory budget on a
+	// large fleet.
+	ListCertificateOwnershipByDecisionPaged(
+		ctx context.Context,
+		organizationID string,
+		decision Decision,
+		cursorCertID string,
+		pageSize int,
 	) ([]CertificateOwnership, error)
 
 	// ListCertificateOwnershipPaged returns one page of the org's

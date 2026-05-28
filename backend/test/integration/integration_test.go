@@ -27,6 +27,8 @@ import (
 	"github.com/kidcarmi/anchorix/backend/internal/config"
 	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
 	"github.com/kidcarmi/anchorix/backend/internal/findings"
+	"github.com/kidcarmi/anchorix/backend/internal/governance"
+	"github.com/kidcarmi/anchorix/backend/internal/governance/ownership"
 	"github.com/kidcarmi/anchorix/backend/internal/httpapi"
 	"github.com/kidcarmi/anchorix/backend/internal/identity"
 	"github.com/kidcarmi/anchorix/backend/internal/inventory"
@@ -168,7 +170,14 @@ func testServer(t *testing.T, db *postgres.DB) (*httptest.Server, *auth.Service)
 // router skips registering the H-026A2 routes. Used by the
 // feature-gate regression test (TestFeatureGateOffReturns404).
 type testServerOpts struct {
-	IdentityEnabled bool
+	IdentityEnabled  bool
+	OwnershipEnabled bool
+	// OwnershipStaleAfter overrides the default stale threshold for
+	// `/ownership/stale`. Zero falls back to 168h.
+	OwnershipStaleAfter time.Duration
+	// OwnershipBulkAuditThreshold tunes the bulk-rollup threshold
+	// passed to the ownership engine. Zero falls back to 500.
+	OwnershipBulkAuditThreshold int
 }
 
 // testServerWithOptions is the parameterized variant of
@@ -247,6 +256,30 @@ func testServerWithOptions(t *testing.T, db *postgres.DB, opts testServerOpts) (
 		}
 	}
 
+	// H-026B3A ownership engine. Wired when opts.OwnershipEnabled is
+	// true. Mirrors the production composition root which gates on
+	// ANCHORIX_GOVERNANCE_API_ENABLED; setting OwnershipEnabled to
+	// false from a test exercises the route-not-registered path.
+	var ownershipSvc *ownership.Service
+	if opts.OwnershipEnabled {
+		govRepo := &governance.Repo{
+			Ownership:     postgres.NewOwnershipRepository(db),
+			Policy:        postgres.NewPolicyRepository(db),
+			RecomputeRuns: postgres.NewGovernanceRecomputeRunsRepository(db),
+		}
+		ownershipSvc, err = ownership.NewService(
+			govRepo, db, auditRecorder, clock.System{},
+			ownership.ServiceConfig{BulkAuditThreshold: opts.OwnershipBulkAuditThreshold},
+		)
+		if err != nil {
+			t.Fatalf("ownership.NewService: %v", err)
+		}
+	}
+	staleAfter := opts.OwnershipStaleAfter
+	if staleAfter <= 0 {
+		staleAfter = 168 * time.Hour
+	}
+
 	srv, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{
 		AuthService:           svc,
 		CookieSigner:          signer,
@@ -255,6 +288,8 @@ func testServerWithOptions(t *testing.T, db *postgres.DB, opts testServerOpts) (
 		InventoryService:      certSvc,
 		FindingsService:       findingsSvc,
 		IdentityService:       identitySvc,
+		OwnershipService:      ownershipSvc,
+		OwnershipStaleAfter:   staleAfter,
 	})
 	if err != nil {
 		t.Fatalf("httpapi.NewServer: %v", err)

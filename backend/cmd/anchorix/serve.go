@@ -13,6 +13,7 @@ import (
 	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
 	"github.com/kidcarmi/anchorix/backend/internal/findings"
 	"github.com/kidcarmi/anchorix/backend/internal/governance"
+	"github.com/kidcarmi/anchorix/backend/internal/governance/ownership"
 	"github.com/kidcarmi/anchorix/backend/internal/httpapi"
 	"github.com/kidcarmi/anchorix/backend/internal/identity"
 	"github.com/kidcarmi/anchorix/backend/internal/inventory"
@@ -172,7 +173,24 @@ func cmdServe(ctx context.Context, cfg *config.Config, log *logger.Logger) error
 	if err := governanceRepo.Validate(); err != nil {
 		return fmt.Errorf("governance repo: %w", err)
 	}
-	_ = governanceRepo
+
+	// H-026B3A: ownership engine. Constructed only when
+	// ANCHORIX_GOVERNANCE_API_ENABLED is true so the feature gate
+	// is a true off-switch — when disabled, ownershipService is
+	// nil and the router does not register any /ownership/*,
+	// /certificates/{id}/ownership/*, /ownership-rules, or
+	// /governance/recompute-runs routes. The scheduler is NOT
+	// constructed here (B4 work).
+	var ownershipService *ownership.Service
+	if cfg.GovernanceAPIEnabled {
+		ownershipService, err = ownership.NewService(
+			governanceRepo, db, auditRecorder, clock.System{},
+			ownership.ServiceConfig{BulkAuditThreshold: cfg.OwnershipBulkAuditThreshold},
+		)
+		if err != nil {
+			return fmt.Errorf("ownership service: %w", err)
+		}
+	}
 
 	// HTTP layer.
 	srv, err := httpapi.NewServer(cfg, log, httpapi.Dependencies{
@@ -183,6 +201,8 @@ func cmdServe(ctx context.Context, cfg *config.Config, log *logger.Logger) error
 		InventoryService:      inventoryService,
 		FindingsService:       findingsService,
 		IdentityService:       identityService,
+		OwnershipService:      ownershipService,
+		OwnershipStaleAfter:   cfg.OwnershipStaleThreshold,
 	})
 	if err != nil {
 		return fmt.Errorf("init server: %w", err)

@@ -95,6 +95,33 @@ func (r *OwnershipRepository) ListOwnershipRules(
 	return scanOwnershipRuleList(rows)
 }
 
+// ListOwnershipRulesPaged is the cursor-paged variant of
+// ListOwnershipRules, used by the H-026B3A operator
+// /ownership-rules view. Ordered by id ASC.
+func (r *OwnershipRepository) ListOwnershipRulesPaged(
+	ctx context.Context,
+	organizationID, cursorRuleID string,
+	pageSize int,
+	enabledOnly bool,
+) ([]governance.OwnershipRule, error) {
+	q := `
+		SELECT id, organization_id, name, description, service_id,
+		       precedence_tier, priority, match_kind, match_value,
+		       enabled, created_at, updated_at, created_by, disabled_at
+		  FROM ownership_rules
+		 WHERE organization_id = $1 AND id > $2`
+	if enabledOnly {
+		q += ` AND enabled = TRUE`
+	}
+	q += ` ORDER BY id ASC LIMIT $3`
+	rows, err := r.db.querierFor(ctx).Query(ctx, q, organizationID, cursorRuleID, pageSize)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list ownership rules paged: %w", err)
+	}
+	defer rows.Close()
+	return scanOwnershipRuleList(rows)
+}
+
 func (r *OwnershipRepository) ListOwnershipRulesByService(
 	ctx context.Context,
 	organizationID, serviceID string,
@@ -309,6 +336,32 @@ func (r *OwnershipRepository) ListCertificateOwnershipByDecision(
 	rows, err := r.db.querierFor(ctx).Query(ctx, q, organizationID, string(decision))
 	if err != nil {
 		return nil, fmt.Errorf("postgres: list cert ownership by decision: %w", err)
+	}
+	defer rows.Close()
+	return scanCertificateOwnershipList(rows)
+}
+
+// ListCertificateOwnershipByDecisionPaged is the cursor-paged variant
+// of ListCertificateOwnershipByDecision. Drives the
+// /ownership/{unowned,ambiguous} operator views in H-026B3A.
+func (r *OwnershipRepository) ListCertificateOwnershipByDecisionPaged(
+	ctx context.Context,
+	organizationID string,
+	decision governance.Decision,
+	cursorCertID string,
+	pageSize int,
+) ([]governance.CertificateOwnership, error) {
+	const q = `
+		SELECT organization_id, certificate_id, service_id, decision,
+		       winning_rule_id, override_id, explanation_id, confidence,
+		       first_assigned_at, last_evaluated_at, last_changed_at
+		  FROM certificate_ownership
+		 WHERE organization_id = $1 AND decision = $2 AND certificate_id > $3
+		 ORDER BY certificate_id ASC
+		 LIMIT $4`
+	rows, err := r.db.querierFor(ctx).Query(ctx, q, organizationID, string(decision), cursorCertID, pageSize)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list cert ownership by decision paged: %w", err)
 	}
 	defer rows.Close()
 	return scanCertificateOwnershipList(rows)

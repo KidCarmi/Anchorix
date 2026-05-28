@@ -96,6 +96,13 @@ type Config struct {
 	// later) are not affected by this flag.
 	GovernanceAPIEnabled bool
 
+	// H-026B3A ownership engine knobs (read by cmd/anchorix/serve.go
+	// when constructing ownership.Service + the /ownership/stale
+	// handler). Defaults match the governance plan: 500-cert rollup
+	// threshold for per-pass transition audit, 7d staleness window.
+	OwnershipBulkAuditThreshold int
+	OwnershipStaleThreshold     time.Duration
+
 	TLSTermination TLSTermination
 	TLSCertFile    string
 	TLSKeyFile     string
@@ -136,6 +143,12 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if cfg.FindingsSchedulerInterval, err = parseDuration("ANCHORIX_FINDINGS_SCHEDULER_INTERVAL", "6h"); err != nil {
+		return nil, err
+	}
+	if cfg.OwnershipBulkAuditThreshold, err = parseInt("ANCHORIX_OWNERSHIP_BULK_AUDIT_THRESHOLD", 500); err != nil {
+		return nil, err
+	}
+	if cfg.OwnershipStaleThreshold, err = parseDuration("ANCHORIX_OWNERSHIP_STALE_THRESHOLD", "168h"); err != nil {
 		return nil, err
 	}
 	if cfg.GovernanceAPIEnabled, err = parseBool("ANCHORIX_GOVERNANCE_API_ENABLED", true); err != nil {
