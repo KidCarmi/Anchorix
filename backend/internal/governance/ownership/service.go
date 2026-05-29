@@ -52,6 +52,15 @@ type Transactor interface {
 	// recompute lock: they are single-row writes whose effect is
 	// applied by the NEXT recompute, not synchronously.
 	WithTx(ctx context.Context, fn func(ctx context.Context) error) error
+
+	// WithTxLockedOwnership runs fn inside a single transaction holding
+	// the per-org ownership advisory lock (xact-scope, READ COMMITTED).
+	// The H-026B3B override mutations use it so the override row write +
+	// the single-cert re-derivation + the security audit commit
+	// atomically AND serialize against any in-flight full recompute
+	// (governance plan §3.9). The lock hold is bounded by the
+	// single-cert work, so it does not stall a sweep meaningfully.
+	WithTxLockedOwnership(ctx context.Context, organizationID string, fn func(ctx context.Context) error) error
 }
 
 // RuleTargetResolver answers the bounded existence questions the

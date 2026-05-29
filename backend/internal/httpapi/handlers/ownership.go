@@ -932,3 +932,131 @@ func ruleEnableDisable(deps OwnershipDeps, enable bool) http.HandlerFunc {
 		envelope.WriteJSON(w, http.StatusOK, ruleToRow(rule))
 	}
 }
+
+// --- H-026B3B override mutations ------------------------------------
+
+// createOverrideRequest is the POST /certificates/{id}/ownership/override
+// body. expires_at is optional (RFC3339); omitted/null means the
+// override never auto-expires.
+type createOverrideRequest struct {
+	ServiceID string  `json:"service_id"`
+	Reason    string  `json:"reason"`
+	ExpiresAt *string `json:"expires_at"`
+}
+
+// clearOverrideRequest is the DELETE /certificates/{id}/ownership/override
+// body. A clear reason is required (audit justification).
+type clearOverrideRequest struct {
+	Reason string `json:"reason"`
+}
+
+// writeOwnershipOverrideError maps the override-mutation sentinels to
+// the canonical envelope. Returns true when handled.
+func writeOwnershipOverrideError(w http.ResponseWriter, err error) bool {
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, ownership.ErrOverrideConflict):
+		envelope.WriteError(w, http.StatusConflict, "ownership_override_conflict",
+			"an active override already exists for this certificate")
+		return true
+	case errors.Is(err, ownership.ErrOverrideCertNotFound):
+		envelope.WriteError(w, http.StatusNotFound, "not_found", "certificate not found")
+		return true
+	case errors.Is(err, ownership.ErrOverrideServiceNotFound):
+		envelope.WriteError(w, http.StatusBadRequest, "ownership_override_service_not_found",
+			"the pinned service does not exist or is disabled")
+		return true
+	case errors.Is(err, ownership.ErrOverrideExpiryInPast):
+		envelope.WriteError(w, http.StatusBadRequest, "ownership_override_expiry_in_past",
+			"expires_at must be in the future")
+		return true
+	case errors.Is(err, ownership.ErrInvalidOverride):
+		envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid ownership override")
+		return true
+	}
+	return false
+}
+
+// CertificateOwnershipOverrideCreate handles
+// POST /api/v1/certificates/{id}/ownership/override.
+func CertificateOwnershipOverrideCreate(deps OwnershipDeps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := middleware.UserFromContext(r.Context())
+		if user == nil {
+			envelope.WriteError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		certID := strings.TrimSpace(r.PathValue("id"))
+		if certID == "" {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "certificate id required")
+			return
+		}
+		var body createOverrideRequest
+		if err := envelope.DecodeStrictOptionalJSON(w, r, &body); err != nil {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+			return
+		}
+		var expiresAt *time.Time
+		if body.ExpiresAt != nil && strings.TrimSpace(*body.ExpiresAt) != "" {
+			t, err := time.Parse(time.RFC3339, *body.ExpiresAt)
+			if err != nil {
+				envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid expires_at (want RFC3339)")
+				return
+			}
+			expiresAt = &t
+		}
+		ov, err := deps.Service.CreateOverride(r.Context(), ownership.CreateOverrideInput{
+			OrganizationID: user.OrganizationID,
+			ActorUserID:    user.ID,
+			CertificateID:  certID,
+			ServiceID:      body.ServiceID,
+			Reason:         body.Reason,
+			ExpiresAt:      expiresAt,
+		})
+		if err != nil {
+			if writeOwnershipOverrideError(w, err) {
+				return
+			}
+			envelope.WriteError(w, http.StatusInternalServerError, "internal_error", "could not create ownership override")
+			return
+		}
+		envelope.WriteJSON(w, http.StatusCreated, overrideToRow(ov))
+	}
+}
+
+// CertificateOwnershipOverrideClear handles
+// DELETE /api/v1/certificates/{id}/ownership/override.
+func CertificateOwnershipOverrideClear(deps OwnershipDeps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := middleware.UserFromContext(r.Context())
+		if user == nil {
+			envelope.WriteError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		certID := strings.TrimSpace(r.PathValue("id"))
+		if certID == "" {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "certificate id required")
+			return
+		}
+		var body clearOverrideRequest
+		if err := envelope.DecodeStrictOptionalJSON(w, r, &body); err != nil {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+			return
+		}
+		ov, err := deps.Service.ClearOverride(r.Context(), ownership.ClearOverrideInput{
+			OrganizationID: user.OrganizationID,
+			ActorUserID:    user.ID,
+			CertificateID:  certID,
+			Reason:         body.Reason,
+		})
+		if err != nil {
+			if writeOwnershipOverrideError(w, err) {
+				return
+			}
+			envelope.WriteError(w, http.StatusInternalServerError, "internal_error", "could not clear ownership override")
+			return
+		}
+		envelope.WriteJSON(w, http.StatusOK, overrideToRow(ov))
+	}
+}

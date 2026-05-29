@@ -61,3 +61,33 @@ var ErrRuleServiceNotFound = errors.New("ownership: rule target service not foun
 // rules, whose value is an agent_group id) names a target that does
 // not exist or is disabled. Handler → 400 ownership_rule_target_not_found.
 var ErrRuleTargetNotFound = errors.New("ownership: rule match target not found")
+
+// --- H-026B3B override-mutation sentinels -----------------------------
+
+// ErrInvalidOverride is returned by the override-mutation validators
+// for any malformed operator input: missing service_id / reason,
+// oversized reason. Handler → 400 bad_request.
+var ErrInvalidOverride = errors.New("ownership: invalid override")
+
+// ErrOverrideCertNotFound is returned when the target certificate does
+// not exist in the organization. A cross-org cert id collapses to the
+// same sentinel — the handler returns 404, indistinguishable from a
+// wholly nonexistent id, so foreign-cert existence cannot be
+// enumerated.
+var ErrOverrideCertNotFound = errors.New("ownership: override certificate not found")
+
+// ErrOverrideServiceNotFound is returned when the override's pinned
+// service does not exist or is disabled. Handler → 400
+// ownership_override_service_not_found (operator-supplied input).
+var ErrOverrideServiceNotFound = errors.New("ownership: override service not found")
+
+// ErrOverrideExpiryInPast is returned when an operator-supplied
+// expires_at is at or before now. Auto-expiry (expires_at <= now) is a
+// recompute-time concept for previously-valid overrides; creating one
+// already expired is rejected. Handler → 400.
+var ErrOverrideExpiryInPast = errors.New("ownership: override expires_at must be in the future")
+
+// ErrOverrideConflict is returned when an active override already
+// exists for the cert (the active partial-unique index). Handler →
+// 409 ownership_override_conflict.
+var ErrOverrideConflict = errors.New("ownership: active override already exists for certificate")
