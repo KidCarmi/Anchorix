@@ -607,6 +607,90 @@ func TestOwnershipRulesEnabledFilterTriState(t *testing.T) {
 // Previously the history was limit-only with no cursor — a cert with
 // many decision flips could only show the most recent N. The cursor
 // path lets operators walk back through the full timeline.
+// TestOwnershipExplanationHistoryLimitBounds pins the B3A contract
+// that include_history is a BOUNDED page: limit defaults to 50,
+// is hard-capped at 200, and no path (including limit=0) can request
+// "all rows". Complements the cursor-walk test below.
+func TestOwnershipExplanationHistoryLimitBounds(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	srvURL, client := ownershipServer(t, db)
+	seedCertMeta(t, db, ctx, "anchorix", "cert-lim", "CN=x", "CN=ca", nil)
+
+	// Seed > default (50) explanation rows so a "default bounded"
+	// response provably truncates and exposes a cursor rather than
+	// dumping everything.
+	repo := postgres.NewOwnershipRepository(db)
+	base := time.Now().UTC().Truncate(time.Millisecond)
+	const seeded = 60
+	for i := 0; i < seeded; i++ {
+		exp := &governance.OwnershipMatchExplanation{
+			ID:              "exp-lim-" + padInt(i),
+			OrganizationID:  "anchorix",
+			CertificateID:   "cert-lim",
+			DecidedAt:       base.Add(time.Duration(i) * time.Second),
+			DecidedDecision: governance.DecisionUnowned,
+			LosingRules:     json.RawMessage(`[]`),
+			SignalsSeen:     json.RawMessage(`{}`),
+			EngineVersion:   1,
+		}
+		if err := repo.CreateOwnershipExplanation(ctx, exp); err != nil {
+			t.Fatalf("seed explanation %d: %v", i, err)
+		}
+	}
+
+	// Default (no limit): bounded to 50 rows total (current + history),
+	// with a next_cursor because more remain.
+	var def struct {
+		Current *struct {
+			ID string `json:"id"`
+		} `json:"current"`
+		History []struct {
+			ID string `json:"id"`
+		} `json:"history"`
+		NextCursor *string `json:"next_cursor"`
+	}
+	httpGetJSON(t, client, srvURL+"/api/v1/certificates/cert-lim/ownership/explanation?include_history=true", &def)
+	total := len(def.History)
+	if def.Current != nil {
+		total++
+	}
+	// Default limit is 50 (ownershipDefaultListLimit in the handler
+	// package; hard-coded here since the const is unexported).
+	const defaultLimit = 50
+	if total != defaultLimit {
+		t.Fatalf("default include_history returned %d rows; want bounded to %d", total, defaultLimit)
+	}
+	if def.NextCursor == nil {
+		t.Fatalf("default include_history next_cursor nil; want a cursor (60 > 50 seeded)")
+	}
+
+	// limit=0 → 400 (must not return all rows).
+	if status, _ := httpGetStatus(t, client, srvURL+"/api/v1/certificates/cert-lim/ownership/explanation?include_history=true&limit=0"); status != http.StatusBadRequest {
+		t.Fatalf("include_history limit=0 status=%d; want 400 (no all-rows path)", status)
+	}
+	// limit over cap → 400.
+	if status, _ := httpGetStatus(t, client, srvURL+"/api/v1/certificates/cert-lim/ownership/explanation?include_history=true&limit=201"); status != http.StatusBadRequest {
+		t.Fatalf("include_history limit=201 status=%d; want 400 (cap is 200)", status)
+	}
+	// limit=200 (the cap) → accepted, all 60 fit, no cursor.
+	var atCap struct {
+		History []struct {
+			ID string `json:"id"`
+		} `json:"history"`
+		NextCursor *string `json:"next_cursor"`
+	}
+	httpGetJSON(t, client, srvURL+"/api/v1/certificates/cert-lim/ownership/explanation?include_history=true&limit=200", &atCap)
+	if atCap.NextCursor != nil {
+		t.Fatalf("limit=200 over 60 rows should not paginate; got cursor %q", *atCap.NextCursor)
+	}
+	if len(atCap.History) != seeded-1 { // current holds the 60th
+		t.Fatalf("limit=200 history = %d; want %d (60 total minus current)", len(atCap.History), seeded-1)
+	}
+}
+
 func TestOwnershipExplanationHistoryCursorWalk(t *testing.T) {
 	db := testDB(t)
 	freshDatabase(t, db)

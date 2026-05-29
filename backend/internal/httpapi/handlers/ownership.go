@@ -481,8 +481,20 @@ func CertificateOwnershipGet(deps OwnershipDeps) http.HandlerFunc {
 }
 
 // CertificateOwnershipExplanation handles GET /api/v1/certificates/{id}/ownership/explanation.
-// `?include_history=true&limit=` returns the per-cert explanation
-// timeline (DESC by decided_at); default returns just the current.
+//
+// Default (no query): returns only the current (most recent)
+// explanation, no history, no cursor.
+//
+// `?include_history=true` returns the per-cert explanation timeline
+// ordered (decided_at DESC, id ASC) as a BOUNDED page:
+//   - `limit` defaults to 50 and is hard-capped at 200; limit=0,
+//     negative, or > 200 is rejected with 400 (no path can request
+//     "all rows").
+//   - the response carries `next_cursor` when more history remains;
+//     `?cursor=` walks back through the full timeline page by page.
+//
+// Each page therefore holds at most `limit` rows in memory; there is
+// no unbounded "full history in one response" path.
 func CertificateOwnershipExplanation(deps OwnershipDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user := middleware.UserFromContext(r.Context())
