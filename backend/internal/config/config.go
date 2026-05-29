@@ -103,6 +103,17 @@ type Config struct {
 	OwnershipBulkAuditThreshold int
 	OwnershipStaleThreshold     time.Duration
 
+	// H-027 ownership explanation retention knobs. They parameterize
+	// the hybrid retention policy (keep the latest N explanations per
+	// certificate OR any newer than the max age; prune only rows that
+	// fall outside both). Loaded once at startup and validated below;
+	// PR-1 wires them to nothing — no prune runs until a later phase
+	// reads them. KeepN must be >= 1 (never "keep nothing") and MaxAge
+	// must be >= a 24h floor so a misconfiguration cannot collapse a
+	// certificate's history aggressively.
+	OwnershipExplanationKeepN  int
+	OwnershipExplanationMaxAge time.Duration
+
 	TLSTermination TLSTermination
 	TLSCertFile    string
 	TLSKeyFile     string
@@ -149,6 +160,12 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if cfg.OwnershipStaleThreshold, err = parseDuration("ANCHORIX_OWNERSHIP_STALE_THRESHOLD", "168h"); err != nil {
+		return nil, err
+	}
+	if cfg.OwnershipExplanationKeepN, err = parseInt("ANCHORIX_OWNERSHIP_EXPLANATION_KEEP_N", 10); err != nil {
+		return nil, err
+	}
+	if cfg.OwnershipExplanationMaxAge, err = parseDuration("ANCHORIX_OWNERSHIP_EXPLANATION_MAX_AGE", "2160h"); err != nil {
 		return nil, err
 	}
 	if cfg.GovernanceAPIEnabled, err = parseBool("ANCHORIX_GOVERNANCE_API_ENABLED", true); err != nil {
@@ -206,6 +223,34 @@ func (c *Config) validate() error {
 	}
 	if err := c.validateFindingsScheduler(); err != nil {
 		return err
+	}
+	if err := c.validateOwnershipRetention(); err != nil {
+		return err
+	}
+	return nil
+}
+
+// validateOwnershipRetention enforces the H-027 explanation-retention
+// bounds at startup so a misconfigured deployment fails closed before
+// any prune phase is wired. KeepN must keep at least one explanation
+// per certificate; MaxAge must not drop below a 24h floor (a tighter
+// window risks collapsing a certificate's recent history during active
+// classification rollout). The current explanation is FK-pinned and
+// never prunable regardless of these values — these bounds protect the
+// non-current history.
+func (c *Config) validateOwnershipRetention() error {
+	if c.OwnershipExplanationKeepN < 1 {
+		return fmt.Errorf(
+			"ANCHORIX_OWNERSHIP_EXPLANATION_KEEP_N=%d must be >= 1",
+			c.OwnershipExplanationKeepN,
+		)
+	}
+	const minMaxAge = 24 * time.Hour
+	if c.OwnershipExplanationMaxAge < minMaxAge {
+		return fmt.Errorf(
+			"ANCHORIX_OWNERSHIP_EXPLANATION_MAX_AGE=%s below minimum %s",
+			c.OwnershipExplanationMaxAge, minMaxAge,
+		)
 	}
 	return nil
 }

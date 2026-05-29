@@ -3,6 +3,7 @@ package config
 import (
 	"strings"
 	"testing"
+	"time"
 )
 
 // validKey is a base64 string that decodes to >= 32 bytes — the minimum
@@ -138,5 +139,54 @@ func TestLoadRejectsMissingDatabaseURL(t *testing.T) {
 	_, err := Load()
 	if err == nil {
 		t.Fatal("Load: want error for missing DATABASE_URL")
+	}
+}
+
+func TestLoadOwnershipExplanationRetentionDefaults(t *testing.T) {
+	baseEnv(t, EnvDevelopment)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.OwnershipExplanationKeepN != 10 {
+		t.Fatalf("KeepN default = %d, want 10", cfg.OwnershipExplanationKeepN)
+	}
+	if cfg.OwnershipExplanationMaxAge != 2160*time.Hour {
+		t.Fatalf("MaxAge default = %s, want 2160h (90d)", cfg.OwnershipExplanationMaxAge)
+	}
+}
+
+func TestLoadRejectsExplanationKeepNBelowOne(t *testing.T) {
+	for _, v := range []string{"0", "-3"} {
+		baseEnv(t, EnvDevelopment)
+		t.Setenv("ANCHORIX_OWNERSHIP_EXPLANATION_KEEP_N", v)
+		_, err := Load()
+		if err == nil {
+			t.Fatalf("Load: want error for KEEP_N=%s", v)
+		}
+		if !strings.Contains(err.Error(), "ANCHORIX_OWNERSHIP_EXPLANATION_KEEP_N") {
+			t.Fatalf("error should mention the var, got: %v", err)
+		}
+	}
+}
+
+func TestLoadRejectsExplanationMaxAgeBelowFloor(t *testing.T) {
+	baseEnv(t, EnvDevelopment)
+	t.Setenv("ANCHORIX_OWNERSHIP_EXPLANATION_MAX_AGE", "1h")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load: want error for MAX_AGE below 24h floor")
+	}
+	if !strings.Contains(err.Error(), "ANCHORIX_OWNERSHIP_EXPLANATION_MAX_AGE") {
+		t.Fatalf("error should mention the var, got: %v", err)
+	}
+}
+
+func TestLoadRejectsExplanationMaxAgeUnparseable(t *testing.T) {
+	baseEnv(t, EnvDevelopment)
+	t.Setenv("ANCHORIX_OWNERSHIP_EXPLANATION_MAX_AGE", "ninety-days")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load: want error for unparseable MAX_AGE")
 	}
 }
