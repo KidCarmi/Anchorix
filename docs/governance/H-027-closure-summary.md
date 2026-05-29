@@ -193,10 +193,29 @@ multi-layer regression.
 - **Actor attribution**: an empty/whitespace `actorUserID` is recorded
   as `(actor=system, actor_type=system)`; a non-empty value is recorded
   as `(actor=<trimmed>, actor_type=user)`.
-- **No deletion from `audit_events`, ever.** Every prior ownership
-  transition (`ownership.assigned/flipped/cleared/...`) remains
-  independently permanent in `audit_events`, so the **decision history**
-  of any pruned explanation snapshot is reconstructable from audit alone.
+- **No deletion from `audit_events`, ever.** But the forensic floor is
+  the **transition rollup that was actually written**, not "any pruned
+  snapshot's full reconstruction". Specifically, what survives in audit
+  after a prune is what the engine wrote there at the time:
+  - **per-cert** `ownership.assigned/cleared/flipped/ambiguous_match`
+    rows for transition groups at or below `bulkAuditThreshold`
+    (default 500);
+  - **one rollup** `ownership.bulk_assigned/cleared/flipped/ambiguous_match`
+    row carrying `{count, from, to, driver_rule_id, sample_cert_ids}`
+    for groups over the threshold — non-sampled certs in that group are
+    represented only by the count, not individually;
+  - **no transition audit at all** for same-owner reclassifications
+    (e.g., a different winning rule that still picks the same owner) —
+    the explanation row is written, but no `ownership.*` row is.
+
+  So pruning an explanation snapshot does **not** in general leave a
+  full per-cert reconstruction path in `audit_events`: a non-sampled
+  cert inside a bulk-rolled group, or any same-owner reclassification,
+  is not individually recoverable from audit alone. What **is**
+  guaranteed independent of pruning is (a) the per-cert FK-pinned
+  current explanation, (b) every per-cert transition audit row written
+  below the bulk threshold, and (c) the rollup row (count + samples +
+  drivers) for every group above it.
 
 ## 10. Hardening coverage (PR #64)
 
