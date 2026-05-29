@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -456,6 +457,12 @@ func (r *OwnershipRepository) CreateOwnershipOverride(
 		o.Reason, o.SetBy, o.SetAt, o.ExpiresAt,
 		o.ClearedAt, o.ClearedBy, o.ClearedReason,
 	); err != nil {
+		// The active partial-unique index (one active override per
+		// cert) surfaces as a typed conflict so the H-026B3B service
+		// maps it to a deterministic 409 rather than a generic 500.
+		if isUniqueViolation(err) {
+			return governance.ErrOwnershipOverrideAlreadyExists
+		}
 		return fmt.Errorf("postgres: create ownership override: %w", err)
 	}
 	return nil
@@ -869,6 +876,44 @@ func (r *OwnershipRepository) ListCertificateSignalsPaged(
 		return nil, fmt.Errorf("postgres: iterate certificate signals: %w", err)
 	}
 	return out, nil
+}
+
+// certificateSignalsByIDQuery is the single-certificate variant of
+// CertificateSignalsPagedQuery. It reuses the exact same SELECT +
+// per-cert LATERAL body (the binding query shape) and only swaps the
+// driving predicate from the `id > cursor … LIMIT n` page scan to a
+// single `c.id = $2` PK lookup. Derived by string replacement so the
+// two queries can never drift in their signal-assembly logic.
+var certificateSignalsByIDQuery = strings.Replace(
+	CertificateSignalsPagedQuery,
+	`WHERE c.organization_id = $1
+		  AND c.id > $2
+		ORDER BY c.id ASC
+		LIMIT $3`,
+	`WHERE c.organization_id = $1
+		  AND c.id = $2`,
+	1,
+)
+
+// GetCertificateSignals returns the signal bundle for ONE certificate,
+// or ErrCertificateNotFound-style nil when the cert does not exist in
+// the org. Used by the H-026B3B single-cert override re-derivation —
+// a bounded PK lookup, never a fleet scan. Returns (nil, nil) when no
+// cert row matches (the override service treats that as "cert not
+// found" and rejects the mutation).
+func (r *OwnershipRepository) GetCertificateSignals(
+	ctx context.Context,
+	organizationID, certificateID string,
+) (*governance.CertificateSignals, error) {
+	row := r.db.querierFor(ctx).QueryRow(ctx, certificateSignalsByIDQuery, organizationID, certificateID)
+	s, err := scanCertificateSignals(row)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("postgres: get certificate signals: %w", err)
+	}
+	return s, nil
 }
 
 // ----- scan helpers -----

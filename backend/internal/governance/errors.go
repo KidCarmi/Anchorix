@@ -31,6 +31,14 @@ var ErrCertificateOwnershipNotFound = errors.New("governance: certificate owners
 // for the by-id lookup.
 var ErrOwnershipOverrideNotFound = errors.New("governance: ownership override not found")
 
+// ErrOwnershipOverrideAlreadyExists is returned by
+// CreateOwnershipOverride when the active partial-unique index
+// (one active override per cert) is violated. The storage layer maps
+// the SQLSTATE 23505 unique-violation to this sentinel so the H-026B3B
+// override service + handler surface a deterministic
+// 409 ownership_override_conflict instead of a raw 500.
+var ErrOwnershipOverrideAlreadyExists = errors.New("governance: ownership override already exists")
+
 // ErrOwnershipExplanationNotFound surfaces a missing
 // ownership_match_explanations row.
 var ErrOwnershipExplanationNotFound = errors.New("governance: ownership explanation not found")

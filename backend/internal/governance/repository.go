@@ -223,6 +223,15 @@ type OwnershipRepository interface {
 		pageSize int,
 	) ([]CertificateSignals, error)
 
+	// GetCertificateSignals returns the signal bundle for ONE
+	// certificate via a bounded PK lookup (never a fleet scan), or
+	// (nil, nil) when no cert row matches in the org. Used by the
+	// H-026B3B single-cert override re-derivation.
+	GetCertificateSignals(
+		ctx context.Context,
+		organizationID, certificateID string,
+	) (*CertificateSignals, error)
+
 	// ----- explanations -----
 
 	CreateOwnershipExplanation(ctx context.Context, e *OwnershipMatchExplanation) error

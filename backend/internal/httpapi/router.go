@@ -238,6 +238,12 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 		mux.Handle("GET /certificates/{id}/ownership", resolver(mw.RequireAuth(handlers.CertificateOwnershipGet(ownershipDeps))))
 		mux.Handle("GET /certificates/{id}/ownership/explanation", resolver(mw.RequireAuth(handlers.CertificateOwnershipExplanation(ownershipDeps))))
 		mux.Handle("GET /certificates/{id}/ownership/override", resolver(mw.RequireAuth(handlers.CertificateOwnershipOverrideGet(ownershipDeps))))
+		// H-026B3B override mutations. Operator-only; agent bearer not
+		// honored. Create/clear write a severity:"security" audit row +
+		// re-derive the single target certificate in the same tx under
+		// the ownership advisory lock.
+		mux.Handle("POST /certificates/{id}/ownership/override", resolver(mw.RequireAuth(handlers.CertificateOwnershipOverrideCreate(ownershipDeps))))
+		mux.Handle("DELETE /certificates/{id}/ownership/override", resolver(mw.RequireAuth(handlers.CertificateOwnershipOverrideClear(ownershipDeps))))
 		mux.Handle("GET /ownership-rules", resolver(mw.RequireAuth(handlers.OwnershipRulesList(ownershipDeps))))
 		mux.Handle("GET /ownership-rules/{id}", resolver(mw.RequireAuth(handlers.OwnershipRulesGet(ownershipDeps))))
 		mux.Handle("GET /governance/recompute-runs", resolver(mw.RequireAuth(handlers.GovernanceRecomputeRunsList(ownershipDeps))))
