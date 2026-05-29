@@ -186,7 +186,13 @@ func cmdServe(ctx context.Context, cfg *config.Config, log *logger.Logger) error
 		ruleTargetResolver := postgres.NewOwnershipRuleTargetResolver(db)
 		ownershipService, err = ownership.NewService(
 			governanceRepo, db, auditRecorder, clock.System{}, ruleTargetResolver,
-			ownership.ServiceConfig{BulkAuditThreshold: cfg.OwnershipBulkAuditThreshold},
+			ownership.ServiceConfig{
+				BulkAuditThreshold: cfg.OwnershipBulkAuditThreshold,
+				Retention: ownership.RetentionPolicy{
+					KeepN:  cfg.OwnershipExplanationKeepN,
+					MaxAge: cfg.OwnershipExplanationMaxAge,
+				},
+			},
 		)
 		if err != nil {
 			return fmt.Errorf("ownership service: %w", err)

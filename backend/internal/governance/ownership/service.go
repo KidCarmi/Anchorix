@@ -77,6 +77,13 @@ type RuleTargetResolver interface {
 // back to the package defaults so callers can pass an empty struct.
 type ServiceConfig struct {
 	BulkAuditThreshold int
+
+	// Retention is the H-027 explanation-retention policy used by the
+	// PruneExplanationsPage primitive. A zero-valued field (or any
+	// sub-field) falls back to the Default* consts. No background loop
+	// or endpoint invokes the prune in this phase; the policy is wired
+	// (serve.go → config) but dormant.
+	Retention RetentionPolicy
 }
 
 // Service is the ownership engine entry point. It owns recompute
@@ -92,8 +99,10 @@ type Service struct {
 	clock    clock.Clock
 	resolver RuleTargetResolver
 
-	bulkAuditThreshold int
-	pageOverride       int // test-only; 0 = production page size
+	bulkAuditThreshold   int
+	retention            RetentionPolicy
+	pageOverride         int // test-only; 0 = production page size
+	prunePerCertOverride int // test-only; 0 = production per-cert prune cap
 }
 
 // NewService wires the engine. Constructor DI (CLAUDE.md §8.8). Fails
@@ -112,6 +121,13 @@ func NewService(repo *governance.Repo, tx Transactor, auditRec audit.Recorder, c
 	if threshold <= 0 {
 		threshold = DefaultBulkAuditThreshold
 	}
+	retention := cfg.Retention
+	if retention.KeepN <= 0 {
+		retention.KeepN = DefaultExplanationKeepN
+	}
+	if retention.MaxAge <= 0 {
+		retention.MaxAge = DefaultExplanationMaxAge
+	}
 	return &Service{
 		repo:               repo,
 		tx:                 tx,
@@ -119,6 +135,7 @@ func NewService(repo *governance.Repo, tx Transactor, auditRec audit.Recorder, c
 		clock:              clk,
 		resolver:           resolver,
 		bulkAuditThreshold: threshold,
+		retention:          retention,
 	}, nil
 }
 
@@ -127,6 +144,12 @@ func NewService(repo *governance.Repo, tx Transactor, auditRec audit.Recorder, c
 // snapshot isolation) against small fixtures. Production code MUST NOT
 // call it — operators tune memory via fixture scale, not page size.
 func (s *Service) SetPageSizeForTest(size int) { s.pageOverride = size }
+
+// SetPrunePerCertLimitForTest forces the per-certificate prune candidate
+// cap so integration tests can prove a deep-history cert's per-page work
+// stays bounded (and drains across passes) against small fixtures.
+// Production code MUST NOT call it.
+func (s *Service) SetPrunePerCertLimitForTest(limit int) { s.prunePerCertOverride = limit }
 
 func (s *Service) pageSize() int {
 	if s.pageOverride > 0 {
