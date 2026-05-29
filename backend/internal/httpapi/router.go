@@ -241,6 +241,13 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 		mux.Handle("GET /ownership-rules", resolver(mw.RequireAuth(handlers.OwnershipRulesList(ownershipDeps))))
 		mux.Handle("GET /ownership-rules/{id}", resolver(mw.RequireAuth(handlers.OwnershipRulesGet(ownershipDeps))))
 		mux.Handle("GET /governance/recompute-runs", resolver(mw.RequireAuth(handlers.GovernanceRecomputeRunsList(ownershipDeps))))
+		// H-026B3B rule mutations. Operator-only; agent bearer not
+		// honored. Every mutation writes a severity:"security" audit
+		// row in the same tx as the state change.
+		mux.Handle("POST /ownership-rules", resolver(mw.RequireAuth(handlers.OwnershipRulesCreate(ownershipDeps))))
+		mux.Handle("PATCH /ownership-rules/{id}", resolver(mw.RequireAuth(handlers.OwnershipRulesUpdate(ownershipDeps))))
+		mux.Handle("POST /ownership-rules/{id}/enable", resolver(mw.RequireAuth(handlers.OwnershipRulesEnable(ownershipDeps))))
+		mux.Handle("POST /ownership-rules/{id}/disable", resolver(mw.RequireAuth(handlers.OwnershipRulesDisable(ownershipDeps))))
 	}
 
 	// --- audit ---

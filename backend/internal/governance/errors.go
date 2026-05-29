@@ -11,6 +11,13 @@ import "errors"
 // id lookups collapse to this sentinel.
 var ErrOwnershipRuleNotFound = errors.New("governance: ownership rule not found")
 
+// ErrOwnershipRuleAlreadyExists is returned by CreateOwnershipRule
+// when the (organization_id, name) unique constraint is violated.
+// The storage layer maps the SQLSTATE 23505 unique-violation to this
+// sentinel so the H-026B3B service + handler layers can surface a
+// deterministic 409 ownership_rule_conflict instead of a raw 500.
+var ErrOwnershipRuleAlreadyExists = errors.New("governance: ownership rule already exists")
+
 // ErrCertificateOwnershipNotFound surfaces a missing
 // certificate_ownership row. Engine paths call this distinct
 // from "cert has decision=unowned" — the latter is a row that

@@ -756,3 +756,179 @@ func GovernanceRecomputeRunsList(deps OwnershipDeps) http.HandlerFunc {
 		envelope.WriteJSON(w, http.StatusOK, out)
 	}
 }
+
+// --- H-026B3B rule mutations ----------------------------------------
+
+// createOwnershipRuleRequest is the POST /ownership-rules body.
+// precedence_tier is optional — when omitted it is derived from
+// match_kind's canonical tier.
+type createOwnershipRuleRequest struct {
+	Name           string `json:"name"`
+	Description    string `json:"description"`
+	ServiceID      string `json:"service_id"`
+	MatchKind      string `json:"match_kind"`
+	PrecedenceTier string `json:"precedence_tier"`
+	MatchValue     string `json:"match_value"`
+	Priority       int    `json:"priority"`
+}
+
+// updateOwnershipRuleRequest is the PATCH /ownership-rules/{id} body.
+// Only the mutable fields are accepted; identity-shaping fields
+// (name, match_kind, service_id, tier) are immutable after creation.
+//
+// Fields are pointers so an omitted key is distinguished from an
+// explicit value: a nil field is preserved from the stored row by the
+// service (PATCH semantics), so `{"description":"x"}` does not blank
+// match_value or reset priority to 0.
+type updateOwnershipRuleRequest struct {
+	Description *string `json:"description"`
+	MatchValue  *string `json:"match_value"`
+	Priority    *int    `json:"priority"`
+}
+
+// writeOwnershipRuleError maps the rule-mutation sentinels to the
+// canonical envelope. Returns true when handled. Order matters:
+// specific sentinels before the generic ErrInvalidRule.
+func writeOwnershipRuleError(w http.ResponseWriter, err error) bool {
+	switch {
+	case err == nil:
+		return false
+	case errors.Is(err, governance.ErrOwnershipRuleNotFound):
+		envelope.WriteError(w, http.StatusNotFound, "not_found", "ownership rule not found")
+		return true
+	case errors.Is(err, governance.ErrOwnershipRuleAlreadyExists):
+		envelope.WriteError(w, http.StatusConflict, "ownership_rule_conflict",
+			"an ownership rule with this name already exists")
+		return true
+	case errors.Is(err, ownership.ErrServiceMemberReserved):
+		envelope.WriteError(w, http.StatusBadRequest, "ownership_rule_tier_reserved",
+			"the service_member precedence tier is reserved and cannot be used")
+		return true
+	case errors.Is(err, ownership.ErrRuleServiceNotFound):
+		envelope.WriteError(w, http.StatusBadRequest, "ownership_rule_service_not_found",
+			"the target service does not exist or is disabled")
+		return true
+	case errors.Is(err, ownership.ErrRuleTargetNotFound):
+		envelope.WriteError(w, http.StatusBadRequest, "ownership_rule_target_not_found",
+			"the rule match target does not exist or is disabled")
+		return true
+	case errors.Is(err, ownership.ErrInvalidRule):
+		envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid ownership rule")
+		return true
+	}
+	return false
+}
+
+// OwnershipRulesCreate handles POST /api/v1/ownership-rules.
+func OwnershipRulesCreate(deps OwnershipDeps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := middleware.UserFromContext(r.Context())
+		if user == nil {
+			envelope.WriteError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		var body createOwnershipRuleRequest
+		if err := envelope.DecodeStrictOptionalJSON(w, r, &body); err != nil {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+			return
+		}
+		rule, err := deps.Service.CreateRule(r.Context(), ownership.CreateRuleInput{
+			OrganizationID: user.OrganizationID,
+			ActorUserID:    user.ID,
+			Name:           body.Name,
+			Description:    body.Description,
+			ServiceID:      body.ServiceID,
+			MatchKind:      governance.MatchKind(body.MatchKind),
+			PrecedenceTier: governance.PrecedenceTier(body.PrecedenceTier),
+			MatchValue:     body.MatchValue,
+			Priority:       body.Priority,
+		})
+		if err != nil {
+			if writeOwnershipRuleError(w, err) {
+				return
+			}
+			envelope.WriteError(w, http.StatusInternalServerError, "internal_error", "could not create ownership rule")
+			return
+		}
+		envelope.WriteJSON(w, http.StatusCreated, ruleToRow(rule))
+	}
+}
+
+// OwnershipRulesUpdate handles PATCH /api/v1/ownership-rules/{id}.
+func OwnershipRulesUpdate(deps OwnershipDeps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := middleware.UserFromContext(r.Context())
+		if user == nil {
+			envelope.WriteError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		ruleID := strings.TrimSpace(r.PathValue("id"))
+		if ruleID == "" {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "rule id required")
+			return
+		}
+		var body updateOwnershipRuleRequest
+		if err := envelope.DecodeStrictOptionalJSON(w, r, &body); err != nil {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid request body")
+			return
+		}
+		rule, err := deps.Service.UpdateRule(r.Context(), ownership.UpdateRuleInput{
+			OrganizationID: user.OrganizationID,
+			ActorUserID:    user.ID,
+			RuleID:         ruleID,
+			Description:    body.Description,
+			MatchValue:     body.MatchValue,
+			Priority:       body.Priority,
+		})
+		if err != nil {
+			if writeOwnershipRuleError(w, err) {
+				return
+			}
+			envelope.WriteError(w, http.StatusInternalServerError, "internal_error", "could not update ownership rule")
+			return
+		}
+		envelope.WriteJSON(w, http.StatusOK, ruleToRow(rule))
+	}
+}
+
+// OwnershipRulesEnable handles POST /api/v1/ownership-rules/{id}/enable.
+func OwnershipRulesEnable(deps OwnershipDeps) http.HandlerFunc {
+	return ruleEnableDisable(deps, true)
+}
+
+// OwnershipRulesDisable handles POST /api/v1/ownership-rules/{id}/disable.
+func OwnershipRulesDisable(deps OwnershipDeps) http.HandlerFunc {
+	return ruleEnableDisable(deps, false)
+}
+
+func ruleEnableDisable(deps OwnershipDeps, enable bool) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		user := middleware.UserFromContext(r.Context())
+		if user == nil {
+			envelope.WriteError(w, http.StatusUnauthorized, "unauthorized", "authentication required")
+			return
+		}
+		ruleID := strings.TrimSpace(r.PathValue("id"))
+		if ruleID == "" {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "rule id required")
+			return
+		}
+		var (
+			rule *governance.OwnershipRule
+			err  error
+		)
+		if enable {
+			rule, err = deps.Service.EnableRule(r.Context(), user.OrganizationID, user.ID, ruleID)
+		} else {
+			rule, err = deps.Service.DisableRule(r.Context(), user.OrganizationID, user.ID, ruleID)
+		}
+		if err != nil {
+			if writeOwnershipRuleError(w, err) {
+				return
+			}
+			envelope.WriteError(w, http.StatusInternalServerError, "internal_error", "could not change ownership rule state")
+			return
+		}
+		envelope.WriteJSON(w, http.StatusOK, ruleToRow(rule))
+	}
+}
