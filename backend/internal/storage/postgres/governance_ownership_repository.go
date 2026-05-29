@@ -46,6 +46,12 @@ func (r *OwnershipRepository) CreateOwnershipRule(ctx context.Context, rule *gov
 		string(rule.PrecedenceTier), rule.Priority, string(rule.MatchKind), rule.MatchValue,
 		rule.Enabled, rule.CreatedAt, rule.UpdatedAt, rule.CreatedBy, rule.DisabledAt,
 	); err != nil {
+		// The (organization_id, name) UNIQUE constraint surfaces as a
+		// typed conflict so the H-026B3B service maps it to a
+		// deterministic 409 rather than a generic 500.
+		if isUniqueViolation(err) {
+			return governance.ErrOwnershipRuleAlreadyExists
+		}
 		return fmt.Errorf("postgres: create ownership rule: %w", err)
 	}
 	return nil

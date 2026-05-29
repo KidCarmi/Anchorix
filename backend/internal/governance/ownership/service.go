@@ -44,6 +44,24 @@ const schedulerActorID = "scheduler"
 type Transactor interface {
 	WithTxLockedOwnershipRepeatableRead(ctx context.Context, organizationID string, fn func(ctx context.Context) error) error
 	TryWithTxLockedOwnershipRepeatableRead(ctx context.Context, organizationID string, fn func(ctx context.Context) error) (bool, error)
+
+	// WithTx runs fn in a single plain transaction (no advisory lock,
+	// READ COMMITTED). The H-026B3B rule mutations use it so the repo
+	// write and the security audit row commit atomically — an audit
+	// failure rolls the mutation back. Rule mutations do not touch the
+	// recompute lock: they are single-row writes whose effect is
+	// applied by the NEXT recompute, not synchronously.
+	WithTx(ctx context.Context, fn func(ctx context.Context) error) error
+}
+
+// RuleTargetResolver answers the bounded existence questions the
+// rule-mutation validator asks. Consumer-owned (CLAUDE.md §8.8); the
+// concrete postgres.OwnershipRuleTargetResolver satisfies it. Both
+// methods return (true,nil) when the active row exists, (false,nil)
+// when it does not, and an error only for repository failures.
+type RuleTargetResolver interface {
+	ActiveServiceExists(ctx context.Context, organizationID, serviceID string) (bool, error)
+	ActiveAgentGroupExists(ctx context.Context, organizationID, agentGroupID string) (bool, error)
 }
 
 // ServiceConfig carries the operator-tunable knobs. Zero values fall
@@ -59,10 +77,11 @@ type ServiceConfig struct {
 // HTTP handlers (H-026B3) will depend on this struct, never on the
 // repository / transactor directly (CLAUDE.md §8.6, §8.8).
 type Service struct {
-	repo  *governance.Repo
-	tx    Transactor
-	audit audit.Recorder
-	clock clock.Clock
+	repo     *governance.Repo
+	tx       Transactor
+	audit    audit.Recorder
+	clock    clock.Clock
+	resolver RuleTargetResolver
 
 	bulkAuditThreshold int
 	pageOverride       int // test-only; 0 = production page size
@@ -70,9 +89,11 @@ type Service struct {
 
 // NewService wires the engine. Constructor DI (CLAUDE.md §8.8). Fails
 // closed on a missing dependency or a partially-wired Repo (the
-// typed-nil trap is caught by Repo.Validate).
-func NewService(repo *governance.Repo, tx Transactor, auditRec audit.Recorder, clk clock.Clock, cfg ServiceConfig) (*Service, error) {
-	if repo == nil || tx == nil || auditRec == nil || clk == nil {
+// typed-nil trap is caught by Repo.Validate). The resolver validates
+// rule-mutation targets (H-026B3B); it is required because rule
+// creation must reject nonexistent services / agent groups.
+func NewService(repo *governance.Repo, tx Transactor, auditRec audit.Recorder, clk clock.Clock, resolver RuleTargetResolver, cfg ServiceConfig) (*Service, error) {
+	if repo == nil || tx == nil || auditRec == nil || clk == nil || resolver == nil {
 		return nil, ErrIncompleteService
 	}
 	if err := repo.Validate(); err != nil {
@@ -87,6 +108,7 @@ func NewService(repo *governance.Repo, tx Transactor, auditRec audit.Recorder, c
 		tx:                 tx,
 		audit:              auditRec,
 		clock:              clk,
+		resolver:           resolver,
 		bulkAuditThreshold: threshold,
 	}, nil
 }

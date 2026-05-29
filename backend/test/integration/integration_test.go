@@ -269,6 +269,7 @@ func testServerWithOptions(t *testing.T, db *postgres.DB, opts testServerOpts) (
 		}
 		ownershipSvc, err = ownership.NewService(
 			govRepo, db, auditRecorder, clock.System{},
+			postgres.NewOwnershipRuleTargetResolver(db),
 			ownership.ServiceConfig{BulkAuditThreshold: opts.OwnershipBulkAuditThreshold},
 		)
 		if err != nil {

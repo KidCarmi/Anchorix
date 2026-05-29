@@ -28,6 +28,7 @@ func ownershipService(t *testing.T, db *postgres.DB, bulkThreshold int) *ownersh
 		RecomputeRuns: postgres.NewGovernanceRecomputeRunsRepository(db),
 	}
 	svc, err := ownership.NewService(repo, db, postgres.NewAuditRecorder(db, clock.System{}), clock.System{},
+		postgres.NewOwnershipRuleTargetResolver(db),
 		ownership.ServiceConfig{BulkAuditThreshold: bulkThreshold})
 	if err != nil {
 		t.Fatalf("ownership.NewService: %v", err)
