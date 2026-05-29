@@ -775,10 +775,15 @@ type createOwnershipRuleRequest struct {
 // updateOwnershipRuleRequest is the PATCH /ownership-rules/{id} body.
 // Only the mutable fields are accepted; identity-shaping fields
 // (name, match_kind, service_id, tier) are immutable after creation.
+//
+// Fields are pointers so an omitted key is distinguished from an
+// explicit value: a nil field is preserved from the stored row by the
+// service (PATCH semantics), so `{"description":"x"}` does not blank
+// match_value or reset priority to 0.
 type updateOwnershipRuleRequest struct {
-	Description string `json:"description"`
-	MatchValue  string `json:"match_value"`
-	Priority    int    `json:"priority"`
+	Description *string `json:"description"`
+	MatchValue  *string `json:"match_value"`
+	Priority    *int    `json:"priority"`
 }
 
 // writeOwnershipRuleError maps the rule-mutation sentinels to the

@@ -263,6 +263,70 @@ func TestOwnershipRuleUpdateLifecycle(t *testing.T) {
 	}
 }
 
+// TestOwnershipRulePatchPreservesOmittedFields pins PATCH-merge
+// semantics: a partial body updates only the supplied fields and
+// preserves the stored values of omitted ones. Without merge,
+// {"description":...} would send match_value="" + priority=0,
+// rejecting the (non-fallback) rule and zeroing its priority.
+func TestOwnershipRulePatchPreservesOmittedFields(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	srvURL, client := ownershipServer(t, db)
+	seedService(t, db, ctx, "svc-patch")
+
+	_, body := httpJSONWithBody(t, client, http.MethodPost, srvURL+"/api/v1/ownership-rules",
+		`{"name":"patch-rule","service_id":"svc-patch","match_kind":"san_glob","match_value":"*.keep.example","priority":77}`)
+	ruleID := ruleIDFromBody(t, body)
+
+	// PATCH only description: match_value + priority must survive.
+	status, ubody := httpJSONWithBody(t, client, http.MethodPatch, srvURL+"/api/v1/ownership-rules/"+ruleID,
+		`{"description":"desc only"}`)
+	if status != http.StatusOK {
+		t.Fatalf("description-only PATCH status=%d body=%s; want 200", status, ubody)
+	}
+	var row struct {
+		Description string `json:"description"`
+		MatchValue  string `json:"match_value"`
+		Priority    int    `json:"priority"`
+	}
+	if err := json.Unmarshal(ubody, &row); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if row.Description != "desc only" {
+		t.Fatalf("description = %q; want updated", row.Description)
+	}
+	if row.MatchValue != "*.keep.example" {
+		t.Fatalf("match_value = %q; want preserved *.keep.example (omitted field must not blank)", row.MatchValue)
+	}
+	if row.Priority != 77 {
+		t.Fatalf("priority = %d; want preserved 77 (omitted field must not reset to 0)", row.Priority)
+	}
+
+	// PATCH only priority: description + match_value must survive.
+	status, pbody := httpJSONWithBody(t, client, http.MethodPatch, srvURL+"/api/v1/ownership-rules/"+ruleID,
+		`{"priority":5}`)
+	if status != http.StatusOK {
+		t.Fatalf("priority-only PATCH status=%d body=%s; want 200", status, pbody)
+	}
+	json.Unmarshal(pbody, &row)
+	if row.Priority != 5 || row.MatchValue != "*.keep.example" || row.Description != "desc only" {
+		t.Fatalf("priority-only PATCH did not merge correctly: %+v", row)
+	}
+
+	// Explicit priority:0 IS honored (distinct from omitted).
+	status, zbody := httpJSONWithBody(t, client, http.MethodPatch, srvURL+"/api/v1/ownership-rules/"+ruleID,
+		`{"priority":0}`)
+	if status != http.StatusOK {
+		t.Fatalf("priority=0 PATCH status=%d; want 200", status)
+	}
+	json.Unmarshal(zbody, &row)
+	if row.Priority != 0 {
+		t.Fatalf("explicit priority=0 not honored: priority=%d", row.Priority)
+	}
+}
+
 func TestOwnershipRuleEnableDisableLifecycle(t *testing.T) {
 	db := testDB(t)
 	freshDatabase(t, db)

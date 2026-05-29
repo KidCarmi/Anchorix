@@ -43,16 +43,19 @@ type CreateRuleInput struct {
 	Priority       int
 }
 
-// UpdateRuleInput is the validated input to UpdateRule. Only the
-// mutable fields are present. MatchValue is re-validated against the
-// rule's (immutable) MatchKind.
+// UpdateRuleInput is the validated input to UpdateRule. The mutable
+// fields are pointers so an omitted field (nil) is preserved from the
+// stored row, distinguishing "not supplied" from an explicit value —
+// a PATCH of {"description":"x"} must not blank match_value or reset
+// priority to 0. MatchValue is re-validated against the rule's
+// (immutable) MatchKind.
 type UpdateRuleInput struct {
 	OrganizationID string
 	ActorUserID    string
 	RuleID         string
-	Description    string
-	MatchValue     string
-	Priority       int
+	Description    *string
+	MatchValue     *string
+	Priority       *int
 }
 
 // ruleAuditEventNow builds the severity:"security" audit.Event for a
@@ -173,44 +176,60 @@ func (s *Service) CreateRule(ctx context.Context, in CreateRuleInput) (*governan
 // ErrOwnershipRuleNotFound.
 func (s *Service) UpdateRule(ctx context.Context, in UpdateRuleInput) (*governance.OwnershipRule, error) {
 	in.RuleID = strings.TrimSpace(in.RuleID)
-	in.Description = strings.TrimSpace(in.Description)
 	if err := requireRuleOrgActor(in.OrganizationID, in.ActorUserID); err != nil {
 		return nil, err
 	}
 	if in.RuleID == "" {
 		return nil, fmt.Errorf("%w: rule id required", ErrInvalidRule)
 	}
-	if err := validateRuleDescription(in.Description); err != nil {
-		return nil, err
-	}
-	if err := validateRulePriority(in.Priority); err != nil {
-		return nil, err
-	}
 
-	// Load the existing rule to learn its immutable match_kind (and to
-	// produce a clean 404 for a cross-org / missing id before any write).
+	// Load the existing rule to learn its immutable match_kind, to
+	// produce a clean 404 for a cross-org / missing id before any
+	// write, and to MERGE omitted PATCH fields: a nil field is
+	// preserved from the stored row, so PATCH {"description":"x"} does
+	// not blank match_value or reset priority to 0.
 	existing, err := s.repo.Ownership.GetOwnershipRule(ctx, in.OrganizationID, in.RuleID)
 	if err != nil {
 		return nil, err // ErrOwnershipRuleNotFound on miss / cross-org
 	}
-	isAgentGroup, err := validateMatchValue(existing.MatchKind, in.MatchValue)
+
+	description := existing.Description
+	if in.Description != nil {
+		description = strings.TrimSpace(*in.Description)
+	}
+	matchValue := existing.MatchValue
+	if in.MatchValue != nil {
+		matchValue = *in.MatchValue
+	}
+	priority := existing.Priority
+	if in.Priority != nil {
+		priority = *in.Priority
+	}
+
+	if err := validateRuleDescription(description); err != nil {
+		return nil, err
+	}
+	if err := validateRulePriority(priority); err != nil {
+		return nil, err
+	}
+	isAgentGroup, err := validateMatchValue(existing.MatchKind, matchValue)
 	if err != nil {
 		return nil, err
 	}
 	if isAgentGroup {
-		ok, err := s.resolver.ActiveAgentGroupExists(ctx, in.OrganizationID, in.MatchValue)
+		ok, err := s.resolver.ActiveAgentGroupExists(ctx, in.OrganizationID, matchValue)
 		if err != nil {
 			return nil, fmt.Errorf("ownership: resolve agent group: %w", err)
 		}
 		if !ok {
-			return nil, fmt.Errorf("%w: agent_group %q", ErrRuleTargetNotFound, in.MatchValue)
+			return nil, fmt.Errorf("%w: agent_group %q", ErrRuleTargetNotFound, matchValue)
 		}
 	}
 
 	now := s.clock.Now()
 	var updated *governance.OwnershipRule
 	if err := s.tx.WithTx(ctx, func(ctx context.Context) error {
-		if err := s.repo.Ownership.UpdateOwnershipRuleMutable(ctx, in.OrganizationID, in.RuleID, in.Priority, in.MatchValue, in.Description); err != nil {
+		if err := s.repo.Ownership.UpdateOwnershipRuleMutable(ctx, in.OrganizationID, in.RuleID, priority, matchValue, description); err != nil {
 			return err
 		}
 		got, err := s.repo.Ownership.GetOwnershipRule(ctx, in.OrganizationID, in.RuleID)
@@ -219,7 +238,7 @@ func (s *Service) UpdateRule(ctx context.Context, in UpdateRuleInput) (*governan
 		}
 		updated = got
 		return s.recordRuleAudit(ctx, s.ruleAuditEventNow(in.OrganizationID, in.ActorUserID, "ownership.rule_updated", in.RuleID, now, map[string]any{
-			"priority": in.Priority,
+			"priority": priority,
 		}))
 	}); err != nil {
 		return nil, err
