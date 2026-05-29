@@ -71,8 +71,19 @@ func TestOwnershipManualRecomputeAuditAttributedToOperator(t *testing.T) {
 	if want := adminUserID(t, db, ctx); actor != want {
 		t.Fatalf("actor = %q; want signed-in admin id %q", actor, want)
 	}
-	// nowait path must be attributed identically.
-	httpPostJSON(t, client, srvURL+"/api/v1/ownership/recompute?nowait=true", &recomputeTriggerDTO{})
+	// nowait path must be attributed identically. Assert the POST
+	// itself returns 200 AND that it produced a NEW governance.recomputed
+	// row before checking attribution — otherwise a regression where
+	// ?nowait=true returns non-200 without writing an audit row would
+	// silently re-read the previous blocking recompute's row and pass.
+	before := auditCount(t, db, ctx, "anchorix", "governance.recomputed")
+	if status, body := httpPostJSON(t, client, srvURL+"/api/v1/ownership/recompute?nowait=true", &recomputeTriggerDTO{}); status != http.StatusOK {
+		t.Fatalf("nowait recompute status=%d body=%s; want 200", status, body)
+	}
+	after := auditCount(t, db, ctx, "anchorix", "governance.recomputed")
+	if after != before+1 {
+		t.Fatalf("governance.recomputed count = %d; want %d (nowait must write a new audit row)", after, before+1)
+	}
 	actor2, type2 := latestRecomputedActor(t, db, ctx, "anchorix")
 	if type2 != "user" || actor2 != adminUserID(t, db, ctx) {
 		t.Fatalf("nowait recompute actor=%q type=%q; want operator/user", actor2, type2)
@@ -146,21 +157,25 @@ func TestOwnershipOverrideReadCrossOrgNoLeak(t *testing.T) {
 		t.Fatalf("seed foreign override: %v", err)
 	}
 
-	// As anchorix operator: foreign cert → {"active":null}.
-	var foreign struct {
-		Active any `json:"active"`
+	// Compare the COMPLETE raw response bodies, not just the `active`
+	// field: a regression that added an enumeration side-channel (e.g.
+	// {"active":null,"exists":true} for the foreign cert vs
+	// {"active":null} for a nonexistent id) would be invisible to a
+	// struct decode that only captures `active`. Byte-equal bodies +
+	// equal status is the real "indistinguishable" assertion.
+	foreignStatus, foreignBody := httpGetStatus(t, client, srvURL+"/api/v1/certificates/cert-foreign-ovr/ownership/override")
+	bogusStatus, bogusBody := httpGetStatus(t, client, srvURL+"/api/v1/certificates/no-such-cert-xyz/ownership/override")
+	if foreignStatus != http.StatusOK || bogusStatus != http.StatusOK {
+		t.Fatalf("override read status: foreign=%d bogus=%d; want both 200", foreignStatus, bogusStatus)
 	}
-	httpGetJSON(t, client, srvURL+"/api/v1/certificates/cert-foreign-ovr/ownership/override", &foreign)
-	if foreign.Active != nil {
-		t.Fatalf("foreign cert override leaked: active=%v; want null", foreign.Active)
+	if string(foreignBody) != string(bogusBody) {
+		t.Fatalf("override responses distinguishable — foreign-cert existence leaks:\n foreign=%s\n bogus=%s", foreignBody, bogusBody)
 	}
-	// A wholly nonexistent id returns the SAME shape — indistinguishable.
-	var bogus struct {
-		Active any `json:"active"`
-	}
-	httpGetJSON(t, client, srvURL+"/api/v1/certificates/no-such-cert-xyz/ownership/override", &bogus)
-	if bogus.Active != nil {
-		t.Fatalf("bogus cert override = %v; want null (must match foreign-cert shape)", bogus.Active)
+	// Defensive: confirm the shared shape is in fact the no-override one
+	// (so the test fails loudly if both ever started leaking the same
+	// non-null payload).
+	if string(foreignBody) != `{"active":null}` && string(foreignBody) != "{\"active\":null}\n" {
+		t.Fatalf("override read body = %q; want {\"active\":null}", foreignBody)
 	}
 }
 
