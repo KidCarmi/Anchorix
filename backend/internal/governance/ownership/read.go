@@ -64,14 +64,16 @@ func (s *Service) GetOwnershipRule(ctx context.Context, organizationID, ruleID s
 
 // ListOwnershipRulesPaged drives the /ownership-rules operator view.
 // Ordered by id ASC for repeatable pagination — distinct from the
-// engine walk order (compileRules sorts by ladder ordinal).
+// engine walk order (compileRules sorts by ladder ordinal). The
+// enabledFilter is tri-state: nil = all, &true = enabled only,
+// &false = disabled only.
 func (s *Service) ListOwnershipRulesPaged(
 	ctx context.Context,
 	organizationID, cursorRuleID string,
 	limit int,
-	enabledOnly bool,
+	enabledFilter *bool,
 ) ([]governance.OwnershipRule, error) {
-	return s.repo.Ownership.ListOwnershipRulesPaged(ctx, organizationID, cursorRuleID, limit, enabledOnly)
+	return s.repo.Ownership.ListOwnershipRulesPaged(ctx, organizationID, cursorRuleID, limit, enabledFilter)
 }
 
 // ListOwnershipExplanationsForCertificate returns the per-cert
@@ -84,6 +86,22 @@ func (s *Service) ListOwnershipExplanationsForCertificate(
 	limit int,
 ) ([]governance.OwnershipMatchExplanation, error) {
 	return s.repo.Ownership.ListOwnershipExplanationsForCertificate(ctx, organizationID, certificateID, limit)
+}
+
+// ListOwnershipExplanationsForCertificatePaged is the cursor-paged
+// variant used by the /certificates/{id}/ownership/explanation
+// endpoint when `?include_history=true&cursor=…`. Empty cursor
+// (zero time + empty id) yields the first page.
+func (s *Service) ListOwnershipExplanationsForCertificatePaged(
+	ctx context.Context,
+	organizationID, certificateID string,
+	cursorDecidedAt time.Time,
+	cursorExplanationID string,
+	limit int,
+) ([]governance.OwnershipMatchExplanation, error) {
+	return s.repo.Ownership.ListOwnershipExplanationsForCertificatePaged(
+		ctx, organizationID, certificateID, cursorDecidedAt, cursorExplanationID, limit,
+	)
 }
 
 // ListRecentRecomputeRuns drives /governance/recompute-runs.

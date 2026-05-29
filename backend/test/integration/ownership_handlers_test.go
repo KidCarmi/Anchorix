@@ -560,6 +560,144 @@ func TestOwnershipRoutesAbsentWhenGovernanceDisabled(t *testing.T) {
 	resp.Body.Close()
 }
 
+// TestOwnershipRulesEnabledFilterTriState pins the operator-visible
+// behavior of `?enabled=` on /ownership-rules: absent = all,
+// true = enabled only, false = DISABLED only, anything else = 400.
+// Prior to the B3A review fix, ?enabled=false collapsed to "all"
+// and the disabled-rule view was polluted with active rules.
+func TestOwnershipRulesEnabledFilterTriState(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	srvURL, client := ownershipServer(t, db)
+	seedService(t, db, ctx, "svc-flt")
+	seedOwnershipRule(t, db, ctx, "rule-flt-on", "svc-flt", governance.PrecedenceFallback, governance.MatchFallback, "", 1)
+	seedOwnershipRule(t, db, ctx, "rule-flt-off", "svc-flt", governance.PrecedenceSANPattern, governance.MatchSANGlob, "*.x", 100)
+	// Disable one rule via the repo (B3B exposes this as HTTP).
+	if err := postgres.NewOwnershipRepository(db).DisableOwnershipRule(ctx, "anchorix", "rule-flt-off"); err != nil {
+		t.Fatalf("disable rule: %v", err)
+	}
+
+	var listAll, listOn, listOff struct {
+		Items []struct {
+			ID      string `json:"id"`
+			Enabled bool   `json:"enabled"`
+		} `json:"items"`
+	}
+	httpGetJSON(t, client, srvURL+"/api/v1/ownership-rules", &listAll)
+	if len(listAll.Items) != 2 {
+		t.Fatalf("absent enabled = %d items; want 2 (both)", len(listAll.Items))
+	}
+	httpGetJSON(t, client, srvURL+"/api/v1/ownership-rules?enabled=true", &listOn)
+	if len(listOn.Items) != 1 || listOn.Items[0].ID != "rule-flt-on" || !listOn.Items[0].Enabled {
+		t.Fatalf("enabled=true = %+v; want only rule-flt-on (enabled)", listOn.Items)
+	}
+	httpGetJSON(t, client, srvURL+"/api/v1/ownership-rules?enabled=false", &listOff)
+	if len(listOff.Items) != 1 || listOff.Items[0].ID != "rule-flt-off" || listOff.Items[0].Enabled {
+		t.Fatalf("enabled=false = %+v; want only rule-flt-off (disabled)", listOff.Items)
+	}
+	if status, _ := httpGetStatus(t, client, srvURL+"/api/v1/ownership-rules?enabled=yes"); status != http.StatusBadRequest {
+		t.Fatalf("enabled=yes status=%d; want 400 (unknown value must not silently collapse)", status)
+	}
+}
+
+// TestOwnershipExplanationHistoryCursorWalk pins the cursor-paged
+// /certificates/{id}/ownership/explanation?include_history walk.
+// Previously the history was limit-only with no cursor — a cert with
+// many decision flips could only show the most recent N. The cursor
+// path lets operators walk back through the full timeline.
+func TestOwnershipExplanationHistoryCursorWalk(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	srvURL, client := ownershipServer(t, db)
+	seedCertMeta(t, db, ctx, "anchorix", "cert-hist", "CN=x", "CN=ca", nil)
+
+	// Seed 5 explanation rows directly via the repo (each recompute
+	// only writes an explanation on a real change; manual seeding is
+	// the deterministic way to get N rows for a cursor-walk test).
+	repo := postgres.NewOwnershipRepository(db)
+	base := time.Now().UTC().Truncate(time.Millisecond)
+	for i := 0; i < 5; i++ {
+		exp := &governance.OwnershipMatchExplanation{
+			ID:              "exp-h-" + string(rune('a'+i)),
+			OrganizationID:  "anchorix",
+			CertificateID:   "cert-hist",
+			DecidedAt:       base.Add(time.Duration(i) * time.Second),
+			DecidedDecision: governance.DecisionUnowned,
+			LosingRules:     json.RawMessage(`[]`),
+			SignalsSeen:     json.RawMessage(`{}`),
+			EngineVersion:   1,
+		}
+		if err := repo.CreateOwnershipExplanation(ctx, exp); err != nil {
+			t.Fatalf("seed explanation %d: %v", i, err)
+		}
+	}
+
+	// Page 1: include_history=true, limit=2 → current = newest, history
+	// has 1 row, next_cursor set.
+	var p1 struct {
+		Current *struct {
+			ID string `json:"id"`
+		} `json:"current"`
+		History []struct {
+			ID string `json:"id"`
+		} `json:"history"`
+		NextCursor *string `json:"next_cursor"`
+	}
+	httpGetJSON(t, client, srvURL+"/api/v1/certificates/cert-hist/ownership/explanation?include_history=true&limit=2", &p1)
+	if p1.Current == nil || p1.Current.ID != "exp-h-e" {
+		t.Fatalf("page1 current = %+v; want exp-h-e (newest)", p1.Current)
+	}
+	if len(p1.History) != 1 || p1.History[0].ID != "exp-h-d" {
+		t.Fatalf("page1 history = %+v; want [exp-h-d]", p1.History)
+	}
+	if p1.NextCursor == nil {
+		t.Fatalf("page1 next_cursor nil; want a cursor (more pages remain)")
+	}
+
+	// Page 2: cursor advance, limit=2.
+	var p2 struct {
+		Current any `json:"current"`
+		History []struct {
+			ID string `json:"id"`
+		} `json:"history"`
+		NextCursor *string `json:"next_cursor"`
+	}
+	httpGetJSON(t, client, srvURL+"/api/v1/certificates/cert-hist/ownership/explanation?include_history=true&limit=2&cursor="+*p1.NextCursor, &p2)
+	if p2.Current != nil {
+		t.Fatalf("page2 current = %v; want nil (operator already has it from page 1)", p2.Current)
+	}
+	if len(p2.History) != 2 || p2.History[0].ID != "exp-h-c" || p2.History[1].ID != "exp-h-b" {
+		t.Fatalf("page2 history = %+v; want [exp-h-c, exp-h-b]", p2.History)
+	}
+	if p2.NextCursor == nil {
+		t.Fatalf("page2 next_cursor nil; want a cursor (one more row)")
+	}
+
+	// Page 3: last row, no next_cursor.
+	var p3 struct {
+		History []struct {
+			ID string `json:"id"`
+		} `json:"history"`
+		NextCursor *string `json:"next_cursor"`
+	}
+	httpGetJSON(t, client, srvURL+"/api/v1/certificates/cert-hist/ownership/explanation?include_history=true&limit=2&cursor="+*p2.NextCursor, &p3)
+	if len(p3.History) != 1 || p3.History[0].ID != "exp-h-a" {
+		t.Fatalf("page3 history = %+v; want [exp-h-a]", p3.History)
+	}
+	if p3.NextCursor != nil {
+		t.Fatalf("page3 next_cursor = %v; want nil (no more pages)", *p3.NextCursor)
+	}
+
+	// Invalid cursor → 400.
+	if status, _ := httpGetStatus(t, client, srvURL+"/api/v1/certificates/cert-hist/ownership/explanation?include_history=true&cursor=!!notbase64!!"); status != http.StatusBadRequest {
+		t.Fatalf("bad cursor status=%d; want 400", status)
+	}
+}
+
 func TestOwnershipCertificateCrossOrgIsolation(t *testing.T) {
 	db := testDB(t)
 	freshDatabase(t, db)

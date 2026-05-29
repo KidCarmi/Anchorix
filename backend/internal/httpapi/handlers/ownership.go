@@ -102,6 +102,7 @@ type explanationResponse struct {
 	CertificateID string           `json:"certificate_id"`
 	Current       *explanationRow  `json:"current"`
 	History       []explanationRow `json:"history,omitempty"`
+	NextCursor    *string          `json:"next_cursor,omitempty"`
 }
 
 type overrideRow struct {
@@ -495,35 +496,108 @@ func CertificateOwnershipExplanation(deps OwnershipDeps) http.HandlerFunc {
 			return
 		}
 		includeHistory := r.URL.Query().Get("include_history") == "true"
-		limit := 1
-		if includeHistory {
-			n, ok := parseListLimit(r.URL.Query().Get("limit"))
-			if !ok {
-				envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid limit")
+
+		// Default path (history not requested): return the most recent
+		// explanation only, no cursor.
+		if !includeHistory {
+			exps, err := deps.Service.ListOwnershipExplanationsForCertificate(r.Context(), user.OrganizationID, certID, 1)
+			if err != nil {
+				envelope.WriteError(w, http.StatusInternalServerError, "internal_error", "could not load explanations")
 				return
 			}
-			limit = n
+			if len(exps) == 0 {
+				envelope.WriteError(w, http.StatusNotFound, "not_found", "no explanation for this certificate")
+				return
+			}
+			current := explanationToRow(&exps[0])
+			envelope.WriteJSON(w, http.StatusOK, explanationResponse{
+				CertificateID: certID,
+				Current:       &current,
+			})
+			return
 		}
-		exps, err := deps.Service.ListOwnershipExplanationsForCertificate(r.Context(), user.OrganizationID, certID, limit)
+
+		// History path: cursor-paged walk back through time. The
+		// over-fetch detects more pages without an extra round trip;
+		// memory stays bounded by limit (≤ 200).
+		limit, ok := parseListLimit(r.URL.Query().Get("limit"))
+		if !ok {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid limit")
+			return
+		}
+		cursorAt, cursorID, ok := decodeExplanationCursor(r.URL.Query().Get("cursor"))
+		if !ok {
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid cursor")
+			return
+		}
+		exps, err := deps.Service.ListOwnershipExplanationsForCertificatePaged(
+			r.Context(), user.OrganizationID, certID, cursorAt, cursorID, limit+1,
+		)
 		if err != nil {
 			envelope.WriteError(w, http.StatusInternalServerError, "internal_error", "could not load explanations")
 			return
 		}
-		if len(exps) == 0 {
+		// First page (no cursor) AND empty result → no explanation row exists.
+		if cursorID == "" && len(exps) == 0 {
 			envelope.WriteError(w, http.StatusNotFound, "not_found", "no explanation for this certificate")
 			return
 		}
-		resp := explanationResponse{CertificateID: certID}
-		current := explanationToRow(&exps[0])
-		resp.Current = &current
-		if includeHistory && len(exps) > 1 {
-			resp.History = make([]explanationRow, 0, len(exps)-1)
+		resp := explanationResponse{CertificateID: certID, History: []explanationRow{}}
+		if len(exps) > limit {
+			// More pages remain — drop the over-fetch and encode the
+			// cursor from the LAST row of THIS page.
+			last := exps[limit-1]
+			next := encodeExplanationCursor(last.DecidedAt, last.ID)
+			resp.NextCursor = &next
+			exps = exps[:limit]
+		}
+		// On the first page (no incoming cursor), the most recent row
+		// is the current explanation; history walks back from there.
+		// On subsequent pages, omit `current` — the operator already
+		// has it from page 1 — and just stream history.
+		if cursorID == "" && len(exps) > 0 {
+			current := explanationToRow(&exps[0])
+			resp.Current = &current
 			for i := 1; i < len(exps); i++ {
+				resp.History = append(resp.History, explanationToRow(&exps[i]))
+			}
+		} else {
+			for i := range exps {
 				resp.History = append(resp.History, explanationToRow(&exps[i]))
 			}
 		}
 		envelope.WriteJSON(w, http.StatusOK, resp)
 	}
+}
+
+// encodeExplanationCursor builds the opaque cursor token for the
+// per-cert explanation timeline (decided_at DESC, id ASC ordering).
+// Format inside the base64 wrap: `<RFC3339Nano>|<id>`.
+func encodeExplanationCursor(decidedAt time.Time, id string) string {
+	raw := decidedAt.UTC().Format(time.RFC3339Nano) + "|" + id
+	return base64.RawURLEncoding.EncodeToString([]byte(raw))
+}
+
+// decodeExplanationCursor inverts encodeExplanationCursor. Empty
+// input is the "from the beginning" sentinel and yields a zero time
+// + empty id, which the storage layer treats as "no cursor filter."
+func decodeExplanationCursor(raw string) (time.Time, string, bool) {
+	if raw == "" {
+		return time.Time{}, "", true
+	}
+	b, err := base64.RawURLEncoding.DecodeString(raw)
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	parts := strings.SplitN(string(b), "|", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		return time.Time{}, "", false
+	}
+	t, err := time.Parse(time.RFC3339Nano, parts[0])
+	if err != nil {
+		return time.Time{}, "", false
+	}
+	return t, parts[1], true
 }
 
 // CertificateOwnershipOverrideGet handles GET /api/v1/certificates/{id}/ownership/override.
@@ -573,8 +647,24 @@ func OwnershipRulesList(deps OwnershipDeps) http.HandlerFunc {
 			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid cursor")
 			return
 		}
-		enabledOnly := r.URL.Query().Get("enabled") == "true"
-		rules, err := deps.Service.ListOwnershipRulesPaged(r.Context(), user.OrganizationID, cursor, limit+1, enabledOnly)
+		// enabled is tri-state: absent = all, "true" = enabled only,
+		// "false" = disabled only. An unrecognized value is 400 so a
+		// typo (e.g. ?enabled=yes) cannot silently collapse to "all".
+		var enabledFilter *bool
+		switch r.URL.Query().Get("enabled") {
+		case "":
+			enabledFilter = nil
+		case "true":
+			t := true
+			enabledFilter = &t
+		case "false":
+			f := false
+			enabledFilter = &f
+		default:
+			envelope.WriteError(w, http.StatusBadRequest, "bad_request", "invalid enabled (want true|false)")
+			return
+		}
+		rules, err := deps.Service.ListOwnershipRulesPaged(r.Context(), user.OrganizationID, cursor, limit+1, enabledFilter)
 		if err != nil {
 			envelope.WriteError(w, http.StatusInternalServerError, "internal_error", "could not list ownership rules")
 			return

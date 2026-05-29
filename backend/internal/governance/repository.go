@@ -45,13 +45,14 @@ type OwnershipRepository interface {
 	// ListOwnershipRulesPaged is the cursor-paged variant of
 	// ListOwnershipRules, used by the H-026B3A operator
 	// /ownership-rules view. Ordered by id ASC for repeatable
-	// pagination. When enabledOnly is true, disabled rules are
-	// excluded.
+	// pagination. The enabledFilter is tri-state: nil returns all
+	// rules, a pointer to true returns only enabled, and a pointer
+	// to false returns only disabled.
 	ListOwnershipRulesPaged(
 		ctx context.Context,
 		organizationID, cursorRuleID string,
 		pageSize int,
-		enabledOnly bool,
+		enabledFilter *bool,
 	) ([]OwnershipRule, error)
 
 	// ListOwnershipRulesForEngine returns the org's ENABLED rules in
@@ -233,6 +234,19 @@ type OwnershipRepository interface {
 	ListOwnershipExplanationsForCertificate(
 		ctx context.Context,
 		organizationID, certificateID string,
+		limit int,
+	) ([]OwnershipMatchExplanation, error)
+
+	// ListOwnershipExplanationsForCertificatePaged is the cursor-paged
+	// variant. Ordering is `(decided_at DESC, id ASC)`; the cursor is
+	// the (decided_at, id) of the LAST row of the previous page.
+	// A cursor with a zero-value time and empty id is the "from the
+	// beginning" sentinel and yields the unfiltered first page.
+	ListOwnershipExplanationsForCertificatePaged(
+		ctx context.Context,
+		organizationID, certificateID string,
+		cursorDecidedAt time.Time,
+		cursorExplanationID string,
 		limit int,
 	) ([]OwnershipMatchExplanation, error)
 }
