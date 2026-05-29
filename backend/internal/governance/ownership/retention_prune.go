@@ -61,12 +61,16 @@ type ExplanationPruneResult struct {
 // certificate_ids that have explanation history (certificate_id ASC,
 // exclusive of cursorCertID), and for each cert:
 //
-//   - loads its explanation timeline (decided_at DESC, id ASC);
-//   - resolves its current (FK-pinned) explanation id;
-//   - selects prunable rows via SelectExplanationsToPrune (not current,
-//     beyond latest-N, older than MaxAge);
+//   - selects up to prunePerCertLimit candidate ids via the bounded
+//     ListPrunableExplanationIDs SQL primitive (oldest-first; older than
+//     cutoff; not in the latest-N keep set; not the FK-pinned current);
 //   - deletes them with an org+cert scope AND a NOT EXISTS guard against
 //     the current explanation.
+//
+// SelectExplanationsToPrune (PR-1) remains the canonical, unit-tested
+// SPEC of the rule; the SQL primitive implements the same rule, bounded.
+// A deep-history cert drains across passes (idempotent, eventually
+// consistent) instead of doing an unbounded read in one transaction.
 //
 // A single rollup governance.explanation_pruned audit row (severity
 // "security") is written in the SAME transaction, but ONLY when the
