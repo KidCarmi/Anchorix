@@ -24,3 +24,9 @@ var ErrUnknownMatchKind = errors.New("ownership: unknown match kind")
 // ErrIncompleteService is returned by NewService when a required
 // dependency is missing.
 var ErrIncompleteService = errors.New("ownership: incomplete service dependencies")
+
+// ErrRecomputeInProgress is returned by RecomputeNoWait when the
+// per-org advisory lock is already held by another recompute. The
+// H-026B3A handler maps this to `409 ownership_recompute_in_progress`
+// when the operator passed `?nowait=true`.
+var ErrRecomputeInProgress = errors.New("ownership: recompute already in progress")

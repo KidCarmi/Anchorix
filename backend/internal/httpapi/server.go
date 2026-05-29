@@ -17,6 +17,7 @@ import (
 	"github.com/kidcarmi/anchorix/backend/internal/config"
 	"github.com/kidcarmi/anchorix/backend/internal/enrollment"
 	"github.com/kidcarmi/anchorix/backend/internal/findings"
+	"github.com/kidcarmi/anchorix/backend/internal/governance/ownership"
 	"github.com/kidcarmi/anchorix/backend/internal/identity"
 	"github.com/kidcarmi/anchorix/backend/internal/inventory"
 	"github.com/kidcarmi/anchorix/backend/internal/logger"
@@ -39,6 +40,17 @@ type Dependencies struct {
 	// is false — in that case the router skips registering the
 	// identity routes and they return 404.
 	IdentityService *identity.Service
+
+	// OwnershipService is the H-026B3A ownership engine surface
+	// (recompute trigger + operator visibility views). May be nil
+	// when ANCHORIX_GOVERNANCE_API_ENABLED is false — in that case
+	// the router does not register any ownership routes.
+	OwnershipService *ownership.Service
+
+	// OwnershipStaleAfter is the threshold used by
+	// `GET /ownership/stale` when no `?older_than=` override is
+	// supplied. Comes from ANCHORIX_OWNERSHIP_STALE_THRESHOLD.
+	OwnershipStaleAfter time.Duration
 }
 
 // Server owns the HTTP listener and graceful shutdown lifecycle.

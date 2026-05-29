@@ -218,6 +218,31 @@ func apiV1Router(cfg *config.Config, deps Dependencies) http.Handler {
 		mux.Handle("GET /agents/{id}/groups", resolver(mw.RequireAuth(handlers.AgentsListGroups(identityDeps))))
 	}
 
+	// --- ownership engine (H-026B3A) ---
+	// Operator-only visibility + recompute trigger. Routes are
+	// registered only when ANCHORIX_GOVERNANCE_API_ENABLED is true
+	// and the OwnershipService dependency is wired. When the
+	// feature gate is off, every path below returns 404. Cross-org
+	// ids surface as 404 not_found (CLAUDE.md §6 deterministic
+	// auth) — never 403, so the existence of a foreign-org cert /
+	// rule cannot be enumerated.
+	if deps.OwnershipService != nil {
+		ownershipDeps := handlers.OwnershipDeps{
+			Service:    deps.OwnershipService,
+			StaleAfter: deps.OwnershipStaleAfter,
+		}
+		mux.Handle("POST /ownership/recompute", resolver(mw.RequireAuth(handlers.OwnershipRecompute(ownershipDeps))))
+		mux.Handle("GET /ownership/unowned", resolver(mw.RequireAuth(handlers.OwnershipUnowned(ownershipDeps))))
+		mux.Handle("GET /ownership/ambiguous", resolver(mw.RequireAuth(handlers.OwnershipAmbiguous(ownershipDeps))))
+		mux.Handle("GET /ownership/stale", resolver(mw.RequireAuth(handlers.OwnershipStale(ownershipDeps))))
+		mux.Handle("GET /certificates/{id}/ownership", resolver(mw.RequireAuth(handlers.CertificateOwnershipGet(ownershipDeps))))
+		mux.Handle("GET /certificates/{id}/ownership/explanation", resolver(mw.RequireAuth(handlers.CertificateOwnershipExplanation(ownershipDeps))))
+		mux.Handle("GET /certificates/{id}/ownership/override", resolver(mw.RequireAuth(handlers.CertificateOwnershipOverrideGet(ownershipDeps))))
+		mux.Handle("GET /ownership-rules", resolver(mw.RequireAuth(handlers.OwnershipRulesList(ownershipDeps))))
+		mux.Handle("GET /ownership-rules/{id}", resolver(mw.RequireAuth(handlers.OwnershipRulesGet(ownershipDeps))))
+		mux.Handle("GET /governance/recompute-runs", resolver(mw.RequireAuth(handlers.GovernanceRecomputeRunsList(ownershipDeps))))
+	}
+
 	// --- audit ---
 	mux.HandleFunc("GET /audit/events", handlers.AuditList)
 
