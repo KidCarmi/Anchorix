@@ -3,13 +3,11 @@ package ownership
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/kidcarmi/anchorix/backend/internal/audit"
-	"github.com/kidcarmi/anchorix/backend/internal/governance"
 )
 
 const (
@@ -23,6 +21,12 @@ const (
 	// request an unbounded transaction. A larger request is clamped
 	// down, not rejected.
 	maxExplanationPrunePageSize = 1000
+	// defaultExplanationPrunePerCertLimit caps how many explanation rows
+	// a single page may delete for ONE certificate, so a churny cert with
+	// deep history cannot turn a page into an unbounded read/delete. The
+	// remainder is reclaimed on subsequent passes (idempotent, eventually
+	// consistent). Overridable in tests via SetPrunePerCertLimitForTest.
+	defaultExplanationPrunePerCertLimit = 256
 )
 
 // ExplanationPruneResult summarizes one bounded prune page. The caller
@@ -128,26 +132,22 @@ func (s *Service) PruneExplanationsPage(ctx context.Context, organizationID, act
 }
 
 // pruneCertificateExplanations prunes one certificate's eligible
-// explanation rows and returns how many were deleted. It short-circuits
-// before any delete when the timeline is already within latest-N or the
-// selector finds nothing eligible.
+// explanation rows and returns how many were deleted.
+//
+// Eligibility (the same rule as the pure SelectExplanationsToPrune
+// spec — not current, beyond latest-N by decided_at DESC/id ASC, older
+// than the cutoff) is evaluated by a BOUNDED SQL primitive that returns
+// at most prunePerCertLimit candidate ids, oldest-first. This keeps the
+// per-cert read bounded for a deep-history cert: the latest-N keep set
+// and the candidate batch are both LIMIT-capped, and any remainder is
+// reclaimed on a later pass. The DELETE re-applies the org+cert+current
+// guard so the FK-pinned current explanation can never be removed.
 func (s *Service) pruneCertificateExplanations(ctx context.Context, organizationID, certificateID string, policy RetentionPolicy, now time.Time) (int, error) {
-	timeline, err := s.repo.Ownership.ListOwnershipExplanationsForCertificate(ctx, organizationID, certificateID, 0)
+	cutoff := now.Add(-policy.MaxAge)
+	prune, err := s.repo.Ownership.ListPrunableExplanationIDs(ctx, organizationID, certificateID, cutoff, policy.KeepN, s.prunePerCertLimit())
 	if err != nil {
-		return 0, fmt.Errorf("ownership: load explanation timeline: %w", err)
+		return 0, fmt.Errorf("ownership: select prunable explanations: %w", err)
 	}
-	if len(timeline) <= policy.KeepN {
-		return 0, nil
-	}
-	currentID, err := s.currentExplanationID(ctx, organizationID, certificateID)
-	if err != nil {
-		return 0, err
-	}
-	records := make([]ExplanationRecord, 0, len(timeline))
-	for _, e := range timeline {
-		records = append(records, ExplanationRecord{ID: e.ID, DecidedAt: e.DecidedAt})
-	}
-	prune := SelectExplanationsToPrune(records, currentID, policy, now)
 	if len(prune) == 0 {
 		return 0, nil
 	}
@@ -158,19 +158,13 @@ func (s *Service) pruneCertificateExplanations(ctx context.Context, organization
 	return int(deleted), nil
 }
 
-// currentExplanationID returns the certificate's FK-pinned current
-// explanation id, or "" when the cert has no ownership row yet (a state
-// that should not arise once decided, handled defensively — latest-N
-// still protects the recent rows in that case).
-func (s *Service) currentExplanationID(ctx context.Context, organizationID, certificateID string) (string, error) {
-	own, err := s.repo.Ownership.GetCertificateOwnership(ctx, organizationID, certificateID)
-	if err != nil {
-		if errors.Is(err, governance.ErrCertificateOwnershipNotFound) {
-			return "", nil
-		}
-		return "", fmt.Errorf("ownership: load current ownership: %w", err)
+// prunePerCertLimit is the per-certificate candidate cap for one page,
+// honoring the test override when set.
+func (s *Service) prunePerCertLimit() int {
+	if s.prunePerCertOverride > 0 {
+		return s.prunePerCertOverride
 	}
-	return own.ExplanationID, nil
+	return defaultExplanationPrunePerCertLimit
 }
 
 // explanationPrunedMetadata is the governance.explanation_pruned rollup

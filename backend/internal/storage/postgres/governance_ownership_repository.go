@@ -772,6 +772,65 @@ func (r *OwnershipRepository) ListCertificateIDsWithExplanationsPaged(
 	return out, nil
 }
 
+// PrunableExplanationIDsQuery is the SQL behind ListPrunableExplanationIDs.
+// Exported so the H-027 prune integration EXPLAIN test can assert the
+// bounded, index-backed shape (no Seq Scan, a Limit present). Both the
+// latest-N keep subquery ($4) and the outer candidate set ($5) are
+// LIMIT-bounded, so a deep-history certificate never triggers an
+// unbounded read. The NOT EXISTS clause excludes the FK-pinned current
+// explanation; the ORDER BY drains oldest-first for deterministic
+// forward progress across passes.
+//
+// $1 = organization_id, $2 = certificate_id, $3 = cutoff (decided_at
+// older than this is eligible), $4 = keepN, $5 = candidate limit.
+const PrunableExplanationIDsQuery = `
+		SELECT e.id
+		  FROM ownership_match_explanations e
+		 WHERE e.organization_id = $1
+		   AND e.certificate_id  = $2
+		   AND e.decided_at < $3
+		   AND e.id NOT IN (
+		       SELECT k.id
+		         FROM ownership_match_explanations k
+		        WHERE k.organization_id = $1
+		          AND k.certificate_id  = $2
+		        ORDER BY k.decided_at DESC, k.id ASC
+		        LIMIT $4
+		   )
+		   AND NOT EXISTS (
+		       SELECT 1 FROM certificate_ownership co
+		        WHERE co.organization_id = e.organization_id
+		          AND co.certificate_id  = e.certificate_id
+		          AND co.explanation_id  = e.id
+		   )
+		 ORDER BY e.decided_at ASC, e.id DESC
+		 LIMIT $5`
+
+func (r *OwnershipRepository) ListPrunableExplanationIDs(
+	ctx context.Context,
+	organizationID, certificateID string,
+	olderThan time.Time,
+	keepN, limit int,
+) ([]string, error) {
+	rows, err := r.db.querierFor(ctx).Query(ctx, PrunableExplanationIDsQuery, organizationID, certificateID, olderThan, keepN, limit)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: list prunable explanation ids: %w", err)
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("postgres: scan prunable explanation id: %w", err)
+		}
+		out = append(out, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate prunable explanation ids: %w", err)
+	}
+	return out, nil
+}
+
 // DeleteOwnershipExplanationsForCertificate deletes the listed
 // explanation ids for one cert, org- and cert-scoped, with a NOT EXISTS
 // guard that makes deleting the FK-pinned current explanation

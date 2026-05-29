@@ -276,6 +276,29 @@ type OwnershipRepository interface {
 		pageSize int,
 	) ([]string, error)
 
+	// ListPrunableExplanationIDs returns a BOUNDED batch of explanation
+	// ids eligible for retention pruning for ONE certificate, implementing
+	// the same rule as ownership.SelectExplanationsToPrune but pushed into
+	// SQL so a churny certificate with deep history never triggers an
+	// unbounded read inside the prune transaction. An id is returned iff:
+	//
+	//   - its decided_at is strictly older than olderThan (the cutoff), AND
+	//   - it is NOT among the latest keepN by (decided_at DESC, id ASC), AND
+	//   - it is NOT the certificate's current (FK-pinned) explanation.
+	//
+	// Results are ordered oldest-first (decided_at ASC, id DESC) and
+	// capped at limit, so repeated passes make deterministic forward
+	// progress and a deep cert drains across passes (idempotent). Both
+	// the latest-N subquery (LIMIT keepN) and the outer result (LIMIT
+	// limit) are bounded; the statement never scans a cert's full
+	// history. Org- and cert-scoped throughout.
+	ListPrunableExplanationIDs(
+		ctx context.Context,
+		organizationID, certificateID string,
+		olderThan time.Time,
+		keepN, limit int,
+	) ([]string, error)
+
 	// DeleteOwnershipExplanationsForCertificate deletes the given
 	// explanation ids for ONE certificate in the org. The DELETE is org-
 	// AND cert-scoped and additionally guards against ever removing the

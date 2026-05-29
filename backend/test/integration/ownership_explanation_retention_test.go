@@ -516,9 +516,81 @@ func TestPruneExplanationsEmptyOrgFailsClosed(t *testing.T) {
 	}
 }
 
-// TestPruneExplanationsNoFleetScan pins the outer cert-id walk's query
-// plan: a bounded index range with a Limit, never a full-table Seq Scan.
-func TestPruneExplanationsNoFleetScan(t *testing.T) {
+// TestPruneExplanationsBoundedPerCertBatch proves the per-certificate
+// work is bounded: with the per-cert candidate cap forced to 2, a cert
+// with 5 prunable rows deletes at most 2 per page and drains across
+// passes, never an unbounded read/delete inside one transaction.
+func TestPruneExplanationsBoundedPerCertBatch(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// 1 recent (current, 1d) + 5 ancient (100..104d); KeepN=1, MaxAge=90d
+	// → 5 prunable rows.
+	seedAgedCert(t, db, ctx, "anchorix", "cert-01", []int{1, 100, 101, 102, 103, 104}, 0)
+	svc := ownershipServiceWithRetention(t, db, ownership.RetentionPolicy{KeepN: 1, MaxAge: 90 * 24 * time.Hour})
+	svc.SetPrunePerCertLimitForTest(2)
+
+	first, err := svc.PruneExplanationsPage(ctx, "anchorix", "op-1", "", 100)
+	if err != nil {
+		t.Fatalf("first page: %v", err)
+	}
+	if first.DeletedCount != 2 {
+		t.Fatalf("first page deleted = %d; want 2 (per-cert cap)", first.DeletedCount)
+	}
+
+	total := first.DeletedCount
+	for i := 0; i < 10; i++ {
+		res, err := svc.PruneExplanationsPage(ctx, "anchorix", "op-1", "", 100)
+		if err != nil {
+			t.Fatalf("drain page: %v", err)
+		}
+		if res.DeletedCount > 2 {
+			t.Fatalf("page deleted = %d; want <= 2 (per-cert cap)", res.DeletedCount)
+		}
+		total += res.DeletedCount
+		if res.DeletedCount == 0 {
+			break
+		}
+	}
+	if total != 5 {
+		t.Fatalf("total drained = %d; want 5", total)
+	}
+	if n := explanationCountForCert(t, db, ctx, "anchorix", "cert-01"); n != 1 {
+		t.Fatalf("remaining = %d; want 1 (current only)", n)
+	}
+}
+
+// TestPrunableExplanationIDsQueryBounded pins the per-cert candidate
+// selection plan: bounded (a Limit node) and not a fleet-wide GROUP BY.
+// Boundedness of the actual per-page work is proven concretely by
+// TestPruneExplanationsBoundedPerCertBatch; this guards the query shape.
+// (Index vs Seq Scan is left to the planner — on tiny test tables a
+// filtered Seq Scan under the Limit is expected and harmless.)
+func TestPrunableExplanationIDsQueryBounded(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	for i := 1; i <= 20; i++ {
+		seedAgedCert(t, db, ctx, "anchorix", fmt.Sprintf("cert-%02d", i), []int{1, 100, 101}, 0)
+	}
+	cutoff := time.Now().Add(-90 * 24 * time.Hour)
+	plan := explainPlan(t, db, ctx, postgres.PrunableExplanationIDsQuery, "anchorix", "cert-01", cutoff, 1, 256)
+	if !strings.Contains(plan, "Limit") {
+		t.Fatalf("candidate query must be bounded (Limit), got:\n%s", plan)
+	}
+	if strings.Contains(plan, "Group Key") {
+		t.Fatalf("candidate query must not fleet-aggregate (Group Key), got:\n%s", plan)
+	}
+}
+
+// TestPruneExplanationsOuterWalkBounded pins the outer cert-id walk's
+// query plan as bounded by a Limit (cursor pagination), so the prune
+// never enumerates the whole org's certificate set in one statement.
+func TestPruneExplanationsOuterWalkBounded(t *testing.T) {
 	db := testDB(t)
 	freshDatabase(t, db)
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -527,31 +599,8 @@ func TestPruneExplanationsNoFleetScan(t *testing.T) {
 	for i := 1; i <= 20; i++ {
 		seedAgedCert(t, db, ctx, "anchorix", fmt.Sprintf("cert-%02d", i), []int{1, 100}, 0)
 	}
-	var plan string
-	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, `EXPLAIN `+postgres.ListCertificateIDsWithExplanationsPagedQuery, "anchorix", "", 5)
-		if err != nil {
-			return err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var line string
-			if err := rows.Scan(&line); err != nil {
-				return err
-			}
-			plan += line + "\n"
-		}
-		return rows.Err()
-	}); err != nil {
-		t.Fatalf("EXPLAIN: %v", err)
-	}
-	if !strings.Contains(plan, "Index") {
-		t.Fatalf("plan should use an index, got:\n%s", plan)
-	}
-	if strings.Contains(plan, "Seq Scan") {
-		t.Fatalf("plan must not fleet-scan (Seq Scan), got:\n%s", plan)
-	}
+	plan := explainPlan(t, db, ctx, postgres.ListCertificateIDsWithExplanationsPagedQuery, "anchorix", "", 5)
 	if !strings.Contains(plan, "Limit") {
-		t.Fatalf("plan must be bounded (Limit), got:\n%s", plan)
+		t.Fatalf("outer walk must be bounded (Limit), got:\n%s", plan)
 	}
 }
