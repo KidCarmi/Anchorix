@@ -231,11 +231,19 @@ func TestOverrideCreateRaceServiceDisabledInWindow(t *testing.T) {
 	}
 }
 
-// TestOverrideCreateRaceCertDeletedInWindow proves rederiveCertificate
-// fails closed when the target cert is deleted in the precheck→tx
-// window: GetCertificateSignals returns nil mid-tx →
-// ErrOverrideCertNotFound, the whole tx rolls back (no override row,
-// no ownership row, no audit).
+// TestOverrideCreateRaceCertDeletedInWindow proves the create path
+// fails closed and rolls back fully when the target cert is deleted in
+// the precheck→tx window. Note the gate that actually fires: because
+// certificate_ownership_overrides has a composite FK to certificates
+// with ON DELETE CASCADE, deleting the cert removes any rows and the
+// subsequent override INSERT fails the FK inside the locked tx — so
+// the mutation aborts BEFORE rederiveCertificate runs. Either way the
+// whole tx rolls back (no override row, no ownership row, no audit),
+// which is the property that matters here. rederiveCertificate's own
+// nil-signal fail-closed branch is covered directly by the white-box
+// unit test TestRederiveCertificateFailsClosedOnMissingSignals in
+// internal/governance/ownership (it is unreachable via the service
+// entry points precisely because of this FK cascade).
 func TestOverrideCreateRaceCertDeletedInWindow(t *testing.T) {
 	db := testDB(t)
 	freshDatabase(t, db)
@@ -245,9 +253,8 @@ func TestOverrideCreateRaceCertDeletedInWindow(t *testing.T) {
 	seedCertMeta(t, db, ctx, "anchorix", "cert-del", "CN=x", "CN=ca", nil)
 
 	svc := ownershipServiceHooked(t, db, func() {
-		// Delete observations (none) then the cert. No FK from overrides
-		// to certificates blocks the insert, but rederive's signal read
-		// will find nothing.
+		// Deleting the cert cascades to any override rows; the
+		// in-tx override INSERT then fails its composite FK.
 		if err := execRawSQL(ctx, db, rawStmt{`DELETE FROM certificates WHERE id='cert-del'`, nil}); err != nil {
 			t.Errorf("hook delete cert: %v", err)
 		}
@@ -260,7 +267,9 @@ func TestOverrideCreateRaceCertDeletedInWindow(t *testing.T) {
 	if err == nil {
 		t.Fatalf("CreateOverride succeeded despite cert deletion mid-tx; want failure")
 	}
-	// Everything rolled back: no override, no ownership, no audit.
+	// Everything rolled back: no override, no ownership, no audit. (The
+	// cert itself is gone — the cascade also removed it from
+	// certificates — so we assert on the override/ownership/audit rows.)
 	if n := scalarInt(t, db, ctx, `SELECT count(*) FROM certificate_ownership_overrides WHERE certificate_id='cert-del'`); n != 0 {
 		t.Fatalf("override row persisted despite rollback: %d", n)
 	}
