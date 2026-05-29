@@ -5,6 +5,18 @@ import (
 	"time"
 )
 
+// Default explanation-retention bounds. They mirror the
+// internal/config defaults (ANCHORIX_OWNERSHIP_EXPLANATION_KEEP_N /
+// _MAX_AGE) and are used as a safety fallback by NewService when the
+// caller leaves ServiceConfig.Retention zero-valued. Config is the
+// source of truth in a wired deployment (serve.go passes the loaded
+// values through); these consts only keep the prune primitive on a sane
+// policy in tests and any not-yet-wired path.
+const (
+	DefaultExplanationKeepN  = 10
+	DefaultExplanationMaxAge = 2160 * time.Hour // 90 days
+)
+
 // RetentionPolicy is the validated H-027 explanation-retention policy.
 //
 // It expresses the hybrid rule from the H-027 design: per certificate,

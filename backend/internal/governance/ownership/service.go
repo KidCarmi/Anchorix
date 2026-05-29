@@ -77,6 +77,13 @@ type RuleTargetResolver interface {
 // back to the package defaults so callers can pass an empty struct.
 type ServiceConfig struct {
 	BulkAuditThreshold int
+
+	// Retention is the H-027 explanation-retention policy used by the
+	// PruneExplanationsPage primitive. A zero-valued field (or any
+	// sub-field) falls back to the Default* consts. No background loop
+	// or endpoint invokes the prune in this phase; the policy is wired
+	// (serve.go → config) but dormant.
+	Retention RetentionPolicy
 }
 
 // Service is the ownership engine entry point. It owns recompute
@@ -93,6 +100,7 @@ type Service struct {
 	resolver RuleTargetResolver
 
 	bulkAuditThreshold int
+	retention          RetentionPolicy
 	pageOverride       int // test-only; 0 = production page size
 }
 
@@ -112,6 +120,13 @@ func NewService(repo *governance.Repo, tx Transactor, auditRec audit.Recorder, c
 	if threshold <= 0 {
 		threshold = DefaultBulkAuditThreshold
 	}
+	retention := cfg.Retention
+	if retention.KeepN <= 0 {
+		retention.KeepN = DefaultExplanationKeepN
+	}
+	if retention.MaxAge <= 0 {
+		retention.MaxAge = DefaultExplanationMaxAge
+	}
 	return &Service{
 		repo:               repo,
 		tx:                 tx,
@@ -119,6 +134,7 @@ func NewService(repo *governance.Repo, tx Transactor, auditRec audit.Recorder, c
 		clock:              clk,
 		resolver:           resolver,
 		bulkAuditThreshold: threshold,
+		retention:          retention,
 	}, nil
 }
 

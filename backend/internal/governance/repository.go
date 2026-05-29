@@ -258,6 +258,37 @@ type OwnershipRepository interface {
 		cursorExplanationID string,
 		limit int,
 	) ([]OwnershipMatchExplanation, error)
+
+	// ListCertificateIDsWithExplanationsPaged returns one page of the
+	// DISTINCT certificate_ids that have explanation history in the org,
+	// whose certificate_id is strictly greater than cursorCertID, ordered
+	// certificate_id ASC, capped at pageSize. The empty cursor starts
+	// from the beginning. It is the H-027 retention prune's outer walk.
+	//
+	// It MUST be backed by the (organization_id, certificate_id, ...)
+	// index prefix and MUST NOT fleet-scan. Pruning non-current
+	// explanations never removes a certificate from this list — the
+	// FK-pinned current explanation always survives — so the
+	// certificate_id cursor is stable and complete across prune passes.
+	ListCertificateIDsWithExplanationsPaged(
+		ctx context.Context,
+		organizationID, cursorCertID string,
+		pageSize int,
+	) ([]string, error)
+
+	// DeleteOwnershipExplanationsForCertificate deletes the given
+	// explanation ids for ONE certificate in the org. The DELETE is org-
+	// AND cert-scoped and additionally guards against ever removing the
+	// certificate's CURRENT (FK-pinned) explanation via a NOT EXISTS
+	// check on certificate_ownership.explanation_id — belt-and-suspenders
+	// with the ON DELETE RESTRICT FK and the caller's selection
+	// exclusion. A zero-id slice or a no-match set is a safe no-op
+	// returning 0. Returns the number of rows actually deleted.
+	DeleteOwnershipExplanationsForCertificate(
+		ctx context.Context,
+		organizationID, certificateID string,
+		explanationIDs []string,
+	) (int64, error)
 }
 
 // PolicyRepository is the storage contract for the policy
