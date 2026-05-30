@@ -186,6 +186,45 @@ and is released between ticks.
 
 ---
 
+### 3.4 Precedent: `findings.Scheduler` (H-022)
+
+This design is **not** greenfield. The codebase already ships one
+background scheduler — `findings.Scheduler` in
+`backend/internal/findings/scheduler.go` — and `ownership/doc.go`
+explicitly anticipates a sibling (`scheduler.go — sibling of
+findings.Scheduler; one goroutine per process, per-org sweep, ctx-cancel
+honored`). B4 follows that precedent so the two schedulers are
+recognizably the same shape:
+
+```go
+// findings.Scheduler (existing, the model to mirror)
+type Scheduler struct {
+    service ScheduledService
+    orgs    OrganizationLister
+    log     *logger.Logger
+    clock   clock.Clock
+    cfg     SchedulerConfig
+}
+type SchedulerConfig struct { Enabled bool; Interval time.Duration }
+func (s *Scheduler) Run(ctx context.Context) error // no-op if !Enabled; exits on ctx.Done
+```
+
+Wired in `cmd/anchorix/serve.go` as a single
+`go findingsScheduler.Run(ctx)` with graceful shutdown on `ctx.Done()`.
+The B4 governance scheduler reuses this exact ownership/cancellation/
+feature-gate posture and the `OrganizationLister` dependency for org
+enumeration (the dormant primitives take a single `organizationID`, so
+the scheduler — not the primitive — owns the org loop).
+
+**Where B4 deliberately diverges from `findings.Scheduler`:** the
+findings scheduler is **stateless per tick** — each tick recomputes
+per org under the advisory lock and keeps no cursor, because a recompute
+is a single bounded pass. The H-027/H-029 primitives are **paged and
+resumable** (`cursorCertID` → `NextCursor`, `Done`), so draining an org
+spans many pages across many ticks. That makes a **persisted cursor**
+(§7) necessary here where the findings scheduler needed none. This is
+the one structural addition over the precedent, and §7/§10 justify it.
+
 ## 4. Scheduler Architecture
 
 ### 4.1 The tick loop (designed, not built)
@@ -279,6 +318,40 @@ type PageResult struct {
   never selected as due. Disabling is the safe default for new jobs.
 
 ---
+
+### 5.1 Exact primitives each job wraps
+
+The job adapters are thin: they translate the generic `RunPage` contract
+into the existing, dormant service signatures verbatim. No new
+primitive is introduced by B4.
+
+```go
+// H-029 sweep job -> backend/internal/governance/ownership/expiring_overrides_sweep.go
+func (s *Service) SweepExpiringOverridesPage(
+    ctx context.Context, organizationID, cursorCertID string, pageSize int,
+) (*ExpiringOverridesSweepResult, error)
+// result: {OrganizationID, StartCursor, NextCursor, SweepID, CertsScanned, ClearedCount, Done}
+
+// H-027 prune job -> backend/internal/governance/ownership/retention_prune.go
+func (s *Service) PruneExplanationsPage(
+    ctx context.Context, organizationID, actorUserID, cursorCertID string, pageSize int,
+) (*ExplanationPruneResult, error)
+// result: {OrganizationID, StartCursor, NextCursor, CertsScanned, DeletedCount, Done}
+```
+
+Notes that shape the adapters:
+
+- Both take a single `organizationID`; the **scheduler** owns org
+  enumeration (via `OrganizationLister`, §3.4), never the primitive.
+- The cursor is `cursorCertID` (a certificate id) and the terminal
+  signal is `Done` — these map directly onto `PageCursor` and
+  `PageResult.HasMore` (`HasMore == !Done`).
+- The prune takes an `actorUserID`; the scheduler passes empty, which
+  the primitive records as `actor = "system", actor_type = "system"`
+  (§12.1) — correct, since a scheduled run has no operator identity.
+- Page size is clamped inside the primitives (default 500, max 1000 for
+  both); the scheduler's `PAGE_LIMIT` (§9) must validate `<=` those
+  documented maxima at startup rather than relying on the clamp.
 
 ## 6. Job Execution Model
 
