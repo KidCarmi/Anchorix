@@ -163,8 +163,10 @@ cmd/anchorix/main.go                      (composition root: wires + starts/stop
 
 1. Scheduler wakes on its interval (a single owned loop — see §4.1).
 2. It asks `SchedulerState` for **due** `(org, job)` work items, bounded
-   by a per-tick fan-out cap and ordered deterministically
-   (`org_id ASC, job_name ASC`).
+   by a per-tick fan-out cap and ordered deterministically by
+   `next_due_at ASC` with `(org_id ASC, job_name ASC)` as the tiebreaker
+   (the fairness order from §4.3 — oldest-due first, so a re-armed
+   `partial` item sorts behind not-yet-served due items).
 3. For each due item, the `JobRunner`:
    a. attempts a **non-blocking** per-`(org, job)` advisory lock (§8);
       if not acquired, it **skips** (another replica/tick owns it) and
@@ -250,9 +252,10 @@ the one structural addition over the precedent, and §7/§10 justify it.
 
 - All "now" reads go through the injected clock (`internal/clock`),
   never `time.Now()` in the loop body (`CLAUDE.md §8.2`).
-- Due-selection ordering is total and stable (`org_id ASC, job_name
-  ASC`), so two replicas (or a replay) make the same decisions given the
-  same DB state; the advisory lock resolves which one actually runs.
+- Due-selection ordering is total and stable (`next_due_at ASC`, then
+  `org_id ASC, job_name ASC` as tiebreaker — §4.3), so two replicas (or
+  a replay) make the same decisions given the same DB state; the advisory
+  lock resolves which one actually runs.
 
 ### 4.3 Backpressure / rate limiting
 
@@ -261,8 +264,30 @@ validation:
 
 1. **Per-tick fan-out cap** (`max_items_per_tick`): max number of
    `(org, job)` items processed in one tick. Excess items remain "due"
-   and are picked up next tick in deterministic order — natural
-   round-robin fairness across orgs.
+   and are picked up on a subsequent tick.
+
+   **Fairness is explicit, not incidental.** A naive `ORDER BY org_id
+   ASC, job_name ASC` + `LIMIT max_items_per_tick` selection does **not**
+   round-robin: if the first `max_items_per_tick` items keep ending
+   `partial` and are immediately re-armed (`next_due_at = now`, §6.5),
+   the same prefix is reselected every tick and later orgs/jobs starve
+   indefinitely. B4 therefore requires a real fairness mechanism, chosen
+   at PR-1:
+   - **Primary order is `next_due_at ASC`** (oldest-due first), with
+     `(org_id, job_name)` as the deterministic tiebreaker only. A
+     `partial` run is re-armed **behind the current tick's window**
+     (`next_due_at = clock.Now() + page_pause`, or a small fixed
+     `partial_requeue_delay`, never strictly `now`), so already-served
+     items sort *after* not-yet-served due items on the next tick.
+   - Equivalently/additionally, the scheduler may persist a **due-selection
+     cursor** (last `(next_due_at, org_id, job_name)` served) and resume
+     selection past it within a tick window, so a single tick cannot
+     re-serve the same prefix.
+
+   Either way the invariant is: **every due item is served before any
+   item is served twice.** This is asserted by a starvation test (§14.1):
+   N+1 due items with `max_items_per_tick = N`, all returning `partial`,
+   must all be served within two ticks — none starved.
 2. **Per-run page cap** (`max_pages_per_tick`): max primitive pages per
    `(org, job)` per tick. Bounds DB pressure from any single org.
 3. **Per-run duration cap** (`max_run_duration`): wall-clock budget per
@@ -435,9 +460,13 @@ Key invariants:
 
 - On `completed`, the job's `next_due_at` is set to
   `clock.Now() + job_interval` and the cursor is reset to the start
-  sentinel. On `partial`, `next_due_at` is set to `clock.Now()` (resume
-  ASAP, subject to fan-out fairness). On `error`, `next_due_at` uses the
-  retry backoff schedule (§10.3).
+  sentinel. On `partial`, `next_due_at` is set to
+  `clock.Now() + partial_requeue_delay` (a small, config-bounded
+  non-zero delay, **never strictly `now`**) so the just-served item
+  re-arms *behind* not-yet-served due items in the `next_due_at ASC`
+  selection order — this is the fairness mechanism from §4.3 that
+  prevents the partial-prefix starvation case. On `error`, `next_due_at`
+  uses the retry backoff schedule (§10.3).
 
 ---
 
@@ -535,6 +564,29 @@ takes a **PostgreSQL session-level advisory lock** keyed by a hash of
   cancellation). Because it is **session-level**, an unexpected process
   death drops the lock automatically when the DB session closes — no
   stuck locks across crashes.
+
+> **Binding implementation constraint (PR-1) — pin the connection.**
+> A session advisory lock is scoped to the *physical* PostgreSQL
+> session, not to a logical pool handle. `pg_try_advisory_lock` and the
+> matching `pg_advisory_unlock` (and the entire page loop in between)
+> **MUST run on one dedicated, explicitly-acquired connection** that the
+> `SchedulerState` helper holds for the full run and releases only after
+> unlock. This is the exact pattern the existing storage helpers
+> `WithTxLockedOwnershipRepeatableRead` /
+> `TryWithTxLockedOwnershipRepeatableRead` already use to pin and clean
+> up a single connection for the per-org ownership lock — the scheduler
+> lock helper follows it verbatim. **It MUST NOT** acquire and release
+> the advisory lock through ordinary `*sql.DB`/pool queries: on a pooled
+> driver the unlock can land on a *different* physical session, leaving
+> the lock stranded on an idle pooled connection and causing every later
+> run of that `(org, job)` to `skip` indefinitely (or inherit stale lock
+> state). PR-1's `SchedulerState` advisory-lock acquire/release helper is
+> therefore specified as: `Conn`-scoped (e.g. `*sql.Conn` /
+> `pgxpool.Conn` checked out for the run), lock-on-entry,
+> unlock-and-return-the-connection-on-exit, with a `defer` that
+> guarantees unlock + connection release on every path including panic.
+> A unit/integration test MUST assert acquire and release observe the
+> same backend PID (`pg_backend_pid()`).
 - The advisory lock is **not** held inside the primitive transactions; it
   is a coarse "this runner is working this item" guard, orthogonal to the
   ownership data lock. It is released between ticks (held only during an
@@ -584,6 +636,7 @@ startup, immutable after start, fail-closed on invalid input
 | `ANCHORIX_GOVERNANCE_SCHEDULER_MAX_RUN_DURATION` | `30s` | `>= 1s` | Per-run wall-clock budget. |
 | `ANCHORIX_GOVERNANCE_SCHEDULER_PAGE_LIMIT` | `200` | `>= 1`, `<=` primitive max | Page size passed to primitives. |
 | `ANCHORIX_GOVERNANCE_SCHEDULER_PAGE_PAUSE` | `0s` | `>= 0` | Optional inter-page delay. |
+| `ANCHORIX_GOVERNANCE_SCHEDULER_PARTIAL_REQUEUE_DELAY` | `1s` | `> 0`, `< interval` | Re-arm delay for a `partial` run so it sorts behind not-yet-served due items (fairness, §4.3 / §6.5). Must be strictly non-zero. |
 | `ANCHORIX_GOVERNANCE_SCHEDULER_RETRY_BASE` | `1m` | `>= 1s` | Backoff base (§10.3). |
 | `ANCHORIX_GOVERNANCE_SCHEDULER_RETRY_MAX` | `1h` | `>= base` | Backoff cap (§10.3). |
 
@@ -696,11 +749,31 @@ primitive to satisfy a scheduler slot.
   rows. The scheduler adds **no** new audit event type for the *effects*
   — doing so would duplicate the audit layer (`§9` "duplicate logging
   layers are forbidden").
-- The scheduler **does** propagate a correlation id into each run so the
-  primitive's audit events and the scheduler's operational logs share an
-  id (`§9` correlation requirement, extended to background work). A
-  server-side-generated `request_id`/run-id stands in for the absent
-  `X-Request-Id` since there is no inbound HTTP request.
+- **Correlation is log-side, not push-side.** §5.1 binds the adapters to
+  call the existing primitive signatures **verbatim**, and the current
+  H-027/H-029 emitters build `audit.Event` *without* a caller-supplied
+  `RequestID` (the field is left empty; the audit repo reads it from the
+  struct, not from `context`). So the scheduler **cannot** inject its own
+  run-id into the primitives' audit rows without a signature or
+  audit-recorder change — which is **out of scope for B4**. Instead:
+  - the scheduler mints a `run_id` for **its own** structured logs
+    (server-side generated, standing in for the absent `X-Request-Id`
+    since there is no inbound HTTP request);
+  - it **captures the correlation id the primitive already returns**
+    into its `run_finished` log so operators can join scheduler logs to
+    audit rows. The H-029 sweep returns a `SweepID` that is stamped on
+    every `ownership.override_expired` row in the page; the scheduler
+    logs that `SweepID` alongside its `run_id`. That join (scheduler log
+    `run_id` ↔ logged `SweepID` ↔ audit-row `sweep_id`) is the
+    correlation path, and it requires **no** primitive change.
+  - **Gap (documented, not papered over):** the H-027 prune does **not**
+    return a distinct per-call id, so for prune the audit↔scheduler join
+    is only as good as `(org_id, action, occurred_at)` plus the
+    scheduler's logged run window. Closing that gap to a first-class id
+    requires either a context-propagated `RequestID` (an `audit.Recorder`
+    + primitive change) or a returned prune-run id — **a separate,
+    explicitly-scoped follow-up**, listed in §19 open questions, not
+    promised by B4.
 - Whether the *act of enabling/disabling a job* is itself a
   security-audited event (`§9` lists provider-config-style changes as
   `severity: "security"`) is a **decision for PR-1/PR-2**: recommended
@@ -715,8 +788,10 @@ Structured logs (JSON, `§9` required fields `timestamp, level, event,
 request_id, actor, component`; `component = "governance_scheduler"`):
 
 - `tick_started` / `tick_finished` (with due-count, items-processed).
-- `run_started` / `run_finished` per `(org, job)` with outcome, pages,
-  rows-affected, duration.
+- `run_started` / `run_finished` per `(org, job)` with `run_id`,
+  outcome, pages, rows-affected, duration, and — where the primitive
+  returns one — the primitive's own correlation id (e.g. the H-029
+  `sweep_id`) so the log joins to the audit rows (§12.1).
 - `skipped_locked` when the advisory lock is not acquired.
 - `run_error` with **redacted** error summary (`§6.9` allow-list) and a
   remediation hint (`§9` requires error logs to carry a hint).
@@ -764,16 +839,24 @@ under `backend/test/integration/`):
 
 ### 14.1 Unit (per implementation PR)
 
-- **Due selection**: deterministic ordering; respects `enabled`,
-  `next_due_at`, `max_items_per_tick`; cross-org isolation (org A's due
-  items never include org B's rows).
+- **Due selection**: deterministic ordering (`next_due_at ASC`, then
+  `org_id, job_name`); respects `enabled`, `next_due_at`,
+  `max_items_per_tick`; cross-org isolation (org A's due items never
+  include org B's rows).
+- **Fairness / no starvation**: with `max_items_per_tick = N` and `N+1`
+  due items all returning `partial`, every item is served within two
+  ticks — the first tick's served prefix re-arms behind the unserved
+  item (`partial_requeue_delay`, §6.5) and does not crowd it out on the
+  next tick. This is the regression guard for the partial-prefix
+  starvation case.
 - **Page loop**: stops at `max_pages_per_tick`; stops at
   `max_run_duration` (via injected clock); advances cursor only on
   success; does **not** advance on error; `completed` vs `partial` vs
   `error` outcomes.
 - **Re-arm policy**: `completed` resets cursor + sets interval;
-  `partial` resumes ASAP; `error` applies capped backoff and increments/
-  resets `consecutive_failures`.
+  `partial` re-arms at `now + partial_requeue_delay` (non-zero, behind
+  unserved due items — §6.5); `error` applies capped backoff and
+  increments/resets `consecutive_failures`.
 - **Cancellation**: `ctx.Done()` mid-loop exits cleanly after the current
   page boundary; no goroutine leak (leak-checker in tests).
 - **Config validation**: every bound fails closed on invalid input;
@@ -883,7 +966,11 @@ there:
 - **Unbounded work / DoS-by-config** → all caps validated fail-closed
   (§9); partial outcome spreads load (§4.3).
 - **Stuck locks after crash** → session-level advisory lock self-releases
-  (§8.2).
+  on session close (§8.2), **provided** the lock is held on one pinned,
+  dedicated connection from acquire through unlock (binding PR-1
+  constraint, §8.2) — an unlock on a different pooled session would
+  strand the lock; the design forbids that path and tests assert
+  same-backend-PID acquire/release.
 - **Audit gaps / duplicates** → audit emitted by primitives only, exactly
   for committed effects; idempotent re-runs emit no duplicates (§10.2,
   §12.1).
@@ -912,6 +999,13 @@ Resolve before PR-1:
    dependency (subject to `CLAUDE.md §11` dependency health gates). (§12.2)
 6. **Recompute primitive**: confirm B4 defers stale-ownership recompute
    until a paged primitive exists. Recommended **defer**. (§11)
+7. **Prune audit correlation id**: the H-027 prune returns no per-call id
+   (unlike the H-029 `sweep_id`), so scheduler-log↔audit-row correlation
+   for prune is window-based only (§12.1). Decide whether to close this
+   with a context-propagated `audit.Recorder` `RequestID` or a returned
+   prune-run id — a **separate follow-up** (it changes a primitive/
+   recorder signature, which B4 forbids), not a B4 deliverable.
+   Recommended **defer**. (§12.1)
 7. **Shared abstraction vs. sibling**: whether B4 extracts a shared
    scheduler core with `findings.Scheduler` or ships as an independent
    sibling that mirrors its shape (§3.4). Recommended **sibling** for
