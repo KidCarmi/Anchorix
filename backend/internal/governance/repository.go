@@ -190,15 +190,28 @@ type OwnershipRepository interface {
 		pageSize int,
 	) ([]CertificateOwnershipOverride, error)
 
-	// ListOverridesExpiringBy returns every ACTIVE override in the org
-	// whose expires_at is non-NULL and <= now, ordered by
-	// certificate_id ASC. The H-026B recompute auto-clears these in
-	// the same pass. The expired set is small at fleet scale, so this
-	// is unpaged by design.
-	ListOverridesExpiringBy(
+	// ListExpiringOverridesPaged returns one page of ACTIVE overrides
+	// (cleared_at IS NULL) whose expires_at is non-NULL and <= now,
+	// keyed by certificate_id > cursorCertID, ordered certificate_id
+	// ASC, capped at pageSize. The empty cursor starts from the
+	// beginning. It is the H-029 paged read primitive a future B4
+	// scheduler / manual operator sweep will drive (design:
+	// docs/governance/H-029-expiring-override-sweep-pagination-design.md).
+	//
+	// The page is index-aligned with the partial-unique active-override
+	// index (`certificate_ownership_overrides_active_idx
+	// (organization_id, certificate_id) WHERE cleared_at IS NULL`) so a
+	// bounded forward walk over expiring overrides never fleet-scans.
+	// pageSize is bounded at the repository level until a service layer
+	// owns clamping: pageSize <= 0 falls back to a documented default,
+	// pageSize > the documented maximum is clamped. Read-only — no lock
+	// required.
+	ListExpiringOverridesPaged(
 		ctx context.Context,
 		organizationID string,
 		now time.Time,
+		cursorCertID string,
+		pageSize int,
 	) ([]CertificateOwnershipOverride, error)
 
 	// ----- engine signal reads -----

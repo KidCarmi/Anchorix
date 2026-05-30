@@ -369,49 +369,8 @@ func TestListActiveOwnershipOverridesPaged(t *testing.T) {
 	}
 }
 
-// TestListOverridesExpiringBy returns only active overrides whose
-// expiry has passed — future, no-expiry, and cleared rows excluded.
-func TestListOverridesExpiringBy(t *testing.T) {
-	db := testDB(t)
-	freshDatabase(t, db)
-	repo := postgres.NewOwnershipRepository(db)
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	now := time.Now().UTC()
-
-	seedService(t, db, ctx, "svc-exp")
-	for _, c := range []string{"cert-exp-a", "cert-exp-b", "cert-exp-c", "cert-exp-d"} {
-		seedCertificate(t, db, ctx, c)
-	}
-	past := now.Add(-time.Hour)
-	future := now.Add(time.Hour)
-	mk := func(id, certID string, expires *time.Time) {
-		if err := repo.CreateOwnershipOverride(ctx, &governance.CertificateOwnershipOverride{
-			ID:             id,
-			OrganizationID: "anchorix",
-			CertificateID:  certID,
-			ServiceID:      "svc-exp",
-			Reason:         "pin",
-			SetBy:          "tester",
-			SetAt:          now.Add(-2 * time.Hour),
-			ExpiresAt:      expires,
-		}); err != nil {
-			t.Fatalf("create override %s: %v", id, err)
-		}
-	}
-	mk("exp-past", "cert-exp-a", &past)     // expired + active → returned
-	mk("exp-future", "cert-exp-b", &future) // future → excluded
-	mk("exp-none", "cert-exp-c", nil)       // no expiry → excluded
-	mk("exp-cleared", "cert-exp-d", &past)  // expired but cleared → excluded
-	if err := repo.ClearOwnershipOverride(ctx, "anchorix", "exp-cleared", "tester", "done", now); err != nil {
-		t.Fatalf("clear: %v", err)
-	}
-
-	expiring, err := repo.ListOverridesExpiringBy(ctx, "anchorix", now)
-	if err != nil {
-		t.Fatalf("ListOverridesExpiringBy: %v", err)
-	}
-	if len(expiring) != 1 || expiring[0].ID != "exp-past" {
-		t.Fatalf("expiring = %+v; want only exp-past", expiring)
-	}
-}
+// TestListOverridesExpiringBy was removed in H-029 PR-1. The unpaged
+// ListOverridesExpiringBy method it exercised is gone; the same filter
+// semantics (active + expired-only, excluding future / no-expiry /
+// cleared rows) plus paging and cross-org isolation are covered by
+// ownership_expiring_overrides_paged_test.go.
