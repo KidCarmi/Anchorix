@@ -563,18 +563,29 @@ func (r *OwnershipRepository) ListActiveOwnershipOverridesPaged(
 	return scanOwnershipOverrideList(rows)
 }
 
-// ListOverridesExpiringBy returns active overrides whose expiry has
-// passed (expires_at non-NULL and <= now), ordered by certificate_id
-// ASC. Unpaged: overrides are low-cardinality operator pins and the
-// B2 recompute auto-clears them each pass, so the expired set stays
-// bounded. Pagination is a documented backlog item (HARDENING_BACKLOG
-// H-029) for the pathological bulk-import + long-outage case.
-func (r *OwnershipRepository) ListOverridesExpiringBy(
-	ctx context.Context,
-	organizationID string,
-	now time.Time,
-) ([]governance.CertificateOwnershipOverride, error) {
-	const q = `
+// H-029 PR-1 page-size constants for the read-only expiring-override
+// pagination. They live on the repository here (not on a service
+// caller) because PR-1 ships the read primitive without a service
+// wrapper; the H-029 design requires the page to be bounded "before"
+// the future B4 scheduler / manual operator caller exists, so the
+// repo itself defaults/clamps rather than trusting a caller that does
+// not yet live anywhere. Exported so the PR-2 sweep service can
+// reuse them or re-validate at its own boundary.
+const (
+	DefaultExpiringOverridesPageSize = 500
+	MaxExpiringOverridesPageSize     = 1000
+)
+
+// ListExpiringOverridesPagedQuery is the SQL behind
+// ListExpiringOverridesPaged. Exported so the H-029 integration EXPLAIN
+// test can assert the bounded, index-backed shape (a Limit present, no
+// fleet-wide Group Key) and so PR-2's sweep service can refer to the
+// exact production statement when reasoning about page work bounds.
+//
+// $1 = organization_id, $2 = now (expires_at <= $2 is the cutoff —
+// inclusive on equality so a row at exactly now is selected),
+// $3 = cursor certificate id (exclusive), $4 = page size.
+const ListExpiringOverridesPagedQuery = `
 		SELECT id, organization_id, certificate_id, service_id,
 		       reason, set_by, set_at, expires_at,
 		       cleared_at, cleared_by, cleared_reason
@@ -583,10 +594,36 @@ func (r *OwnershipRepository) ListOverridesExpiringBy(
 		   AND cleared_at IS NULL
 		   AND expires_at IS NOT NULL
 		   AND expires_at <= $2
-		 ORDER BY certificate_id ASC`
-	rows, err := r.db.querierFor(ctx).Query(ctx, q, organizationID, now)
+		   AND certificate_id > $3
+		 ORDER BY certificate_id ASC
+		 LIMIT $4`
+
+// ListExpiringOverridesPaged returns one bounded page of active
+// overrides whose expiry has passed for the org, in deterministic
+// certificate_id ASC order keyed by the cursor. Read-only: no
+// transaction, no lock, no mutation, no audit.
+//
+// pageSize is clamped at this boundary (see H-029-PR1 design note on
+// the constants above): values <= 0 fall back to
+// DefaultExpiringOverridesPageSize; values > MaxExpiringOverridesPageSize
+// are clamped to the max. A future PR-2 sweep service may re-validate
+// at its own entry point.
+func (r *OwnershipRepository) ListExpiringOverridesPaged(
+	ctx context.Context,
+	organizationID string,
+	now time.Time,
+	cursorCertID string,
+	pageSize int,
+) ([]governance.CertificateOwnershipOverride, error) {
+	if pageSize <= 0 {
+		pageSize = DefaultExpiringOverridesPageSize
+	}
+	if pageSize > MaxExpiringOverridesPageSize {
+		pageSize = MaxExpiringOverridesPageSize
+	}
+	rows, err := r.db.querierFor(ctx).Query(ctx, ListExpiringOverridesPagedQuery, organizationID, now, cursorCertID, pageSize)
 	if err != nil {
-		return nil, fmt.Errorf("postgres: list overrides expiring by: %w", err)
+		return nil, fmt.Errorf("postgres: list expiring overrides paged: %w", err)
 	}
 	defer rows.Close()
 	return scanOwnershipOverrideList(rows)
