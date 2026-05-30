@@ -256,12 +256,24 @@ PRIMARY KEY (organization_id, certificate_id)   -- migration 0010
 ```
 
 A `WHERE organization_id = $1 AND certificate_id = ANY($2)` query plan
-is an index-only scan on the PK with one index lookup per element of
-`$2`. EXPLAIN should show `Index Scan` (or `Bitmap Index Scan` for
-larger batches), bounded by the array size, with no `Group Key` and
-no `Seq Scan`. The H-030 PR-1 implementation MUST pin this with an
-EXPLAIN test on a small fixture, aligned with the existing H-027 /
-H-029 EXPLAIN convention.
+is an **indexed lookup** on the PK — `Index Scan` (with heap fetches
+for the non-key columns) or `Bitmap Index Scan + Bitmap Heap Scan`
+for larger batches, depending on planner choice. **Not** an
+`Index Only Scan`: the query selects the full ownership row
+(decision, service_id, explanation_id, etc.), which the PK does NOT
+cover, so PostgreSQL must visit the heap for the projected columns.
+This is fine and is exactly what is intended — H-030 deliberately does
+NOT add a covering index, because doing so would re-introduce the
+write-amplification cost the design is trying to avoid (§7).
+
+The bounded property comes from `ANY($2)` array size, not from a
+`LIMIT`: at most `pageSize` (500 default) cert ids per call, each
+resolved by one PK probe + one heap fetch. The H-030 PR-1
+implementation MUST pin this with an EXPLAIN test on a small fixture,
+aligned with the existing H-027 / H-029 EXPLAIN convention. The EXPLAIN
+assertion (§11) requires an `Index Scan` or `Bitmap Index Scan`
+present and rules out `Seq Scan` — it deliberately does NOT require
+`Index Only Scan`.
 
 ## 9. Migration impact
 
