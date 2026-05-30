@@ -719,21 +719,29 @@ func TestOwnershipMergeHandlesNewCertInterleavedAmongOwned(t *testing.T) {
 	}
 }
 
-// TestOwnershipMergeSkipLoopHandlesOrphanOwnershipRows exercises the
-// `for ownHas && ownCur.CertificateID < sig.CertificateID` skip-loop
-// in streamAndDecide — the defensive path where an ownership row has
-// no matching signal and must be skipped without consuming a signal
-// or wrongly pairing it with a later one.
+// TestOwnershipMergeSkipLoopHandlesOrphanOwnershipRows pins the
+// recompute's behavior when ownership rows exist for cert ids that
+// have no matching signal — proving orphan prior-ownership rows
+// cannot mis-pair with a live signal's decision.
 //
-// To make the skip-loop reachable we have to inject orphan ownership
-// rows, which the (ON DELETE CASCADE) FK normally prevents. We delete
-// the parent cert rows inside one transaction with
-// SET LOCAL session_replication_role = 'replica', which makes
-// PostgreSQL bypass FK-cascade triggers (and the LOCAL scope reverts
-// the role on commit so the connection returns to the pool clean).
-// The orphans (certificate_ownership + ownership_match_explanations
-// rows whose cert is gone) survive until the next test's
-// freshDatabase truncates them.
+// Mechanism note (H-030): the previous recompute merged two paged
+// streams (signals + prior ownership) and advanced past orphans via
+// a Go-side cert_id comparison (`ownCur.CertificateID < sig.CertificateID`).
+// After the H-030 refactor that comparison is gone — `streamAndDecide`
+// now loads prior ownership via a bounded set-lookup keyed on each
+// signal page's cert ids, so orphan rows (whose cert id is not in
+// any signal page) are simply never queried and therefore cannot
+// perturb any live signal's decision. This test continues to pin
+// the correctness property end-to-end: regardless of which mechanism
+// is in play, an orphan prior must not flip a live signal's owner.
+//
+// To create orphan rows we delete the parent cert rows inside one
+// transaction with SET LOCAL session_replication_role = 'replica',
+// which makes PostgreSQL bypass FK-cascade triggers (and the LOCAL
+// scope reverts the role on commit so the connection returns to the
+// pool clean). The orphans (certificate_ownership +
+// ownership_match_explanations rows whose cert is gone) survive
+// until the next test's freshDatabase truncates them.
 //
 // Two services + a SAN rule per service make mis-pairing detectable:
 // if a buggy merge paired sig=cert-orph-2 (svc-even) with the orphan

@@ -405,6 +405,83 @@ func (r *OwnershipRepository) ListCertificateOwnershipPaged(
 	return scanCertificateOwnershipList(rows)
 }
 
+// MaxOwnershipByIDsBatchSize is the defensive upper bound on the
+// number of certificate ids GetCertificateOwnershipByCertificateIDs
+// will accept in one call. The H-030 recompute caller is bounded by
+// the streaming signal page size (≤ pageSize, default 500), so this
+// is a fail-closed guard against a buggy or hostile caller passing
+// an unbounded batch.
+const MaxOwnershipByIDsBatchSize = 1000
+
+// GetCertificateOwnershipByCertificateIDsQuery is the SQL behind
+// GetCertificateOwnershipByCertificateIDs. Exported so the H-030
+// integration EXPLAIN test can pin the bounded indexed-lookup shape:
+// an Index Scan (or Bitmap Index Scan) over the
+// certificate_ownership PK, no Seq Scan, no fleet-wide Group Key.
+// The query is NOT an Index Only Scan — projected columns exceed the
+// PK — and that is intentional (H-030 design §8). The PK probe +
+// heap fetch per id is the expected cost, exactly aligned with the
+// existing PK on (organization_id, certificate_id) so no covering
+// index is needed.
+//
+// $1 = organization_id, $2 = certificate ids (text[]).
+const GetCertificateOwnershipByCertificateIDsQuery = `
+		SELECT organization_id, certificate_id, service_id, decision,
+		       winning_rule_id, override_id, explanation_id, confidence,
+		       first_assigned_at, last_evaluated_at, last_changed_at
+		  FROM certificate_ownership
+		 WHERE organization_id = $1
+		   AND certificate_id = ANY($2::text[])`
+
+// GetCertificateOwnershipByCertificateIDs returns prior-ownership
+// rows for the given cert ids keyed on certificate_id. The recompute
+// (H-030) uses it to load one signal-page's worth of prior ownership
+// in one bounded round-trip, replacing the previous two-stream merge
+// that depended on a cross-language ordering invariant.
+//
+// Properties:
+//   - Empty / nil certIDs short-circuits to an empty map (no round-trip).
+//   - len(certIDs) > MaxOwnershipByIDsBatchSize fails closed (the
+//     caller must page); the recompute is bounded by signal pageSize.
+//   - Cross-org isolation: the WHERE organization_id = $1 filter is
+//     never optional.
+//   - Duplicate input ids are safe: the SQL ANY filter de-duplicates,
+//     and the result map collapses duplicates by key.
+//   - Foreign-org ids do not match (org filter); missing ids are
+//     silently absent from the result map (recompute treats them as
+//     first-run, matching the prior semantic).
+//   - Plan: Index Scan / Bitmap Index Scan via the certificate_ownership
+//     PK; no new index needed, no fleet-wide scan reachable.
+func (r *OwnershipRepository) GetCertificateOwnershipByCertificateIDs(
+	ctx context.Context,
+	organizationID string,
+	certIDs []string,
+) (map[string]governance.CertificateOwnership, error) {
+	if len(certIDs) == 0 {
+		return map[string]governance.CertificateOwnership{}, nil
+	}
+	if len(certIDs) > MaxOwnershipByIDsBatchSize {
+		return nil, fmt.Errorf("postgres: get certificate ownership by ids: batch size %d exceeds cap %d", len(certIDs), MaxOwnershipByIDsBatchSize)
+	}
+	rows, err := r.db.querierFor(ctx).Query(ctx, GetCertificateOwnershipByCertificateIDsQuery, organizationID, certIDs)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: get certificate ownership by ids: %w", err)
+	}
+	defer rows.Close()
+	out := make(map[string]governance.CertificateOwnership, len(certIDs))
+	for rows.Next() {
+		o, err := scanCertificateOwnership(rows)
+		if err != nil {
+			return nil, fmt.Errorf("postgres: scan certificate ownership by ids: %w", err)
+		}
+		out[o.CertificateID] = *o
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("postgres: iterate certificate ownership by ids: %w", err)
+	}
+	return out, nil
+}
+
 // ListCertificateOwnershipStale returns one page of ownership rows
 // last evaluated before olderThan, keyed by certificate_id > cursor,
 // ordered ASC, capped at limit.
