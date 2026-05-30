@@ -203,21 +203,28 @@ func (s *Service) loadActiveOverrides(ctx context.Context, organizationID string
 	return m, nil
 }
 
-// streamAndDecide merges the certificate-signal stream and the
-// prior-ownership stream — both ordered by certificate_id ASC under
-// the same REPEATABLE READ snapshot — and decides each cert. Memory
-// is bounded to one page of each stream (no fleet in memory).
+// streamAndDecide pages the certificate-signal stream under the
+// REPEATABLE READ snapshot and decides each cert. For every signal
+// page, it loads the matching prior-ownership rows in ONE bounded
+// set-lookup (GetCertificateOwnershipByCertificateIDs) keyed on the
+// page's cert ids, and pairs each signal with its prior via a Go
+// map lookup on certificate_id.
 //
-// Ordering invariant: the merge advances the ownership cursor using a
-// Go string comparison (ownCur.CertificateID < sig.CertificateID),
-// which must agree with the SQL ORDER BY certificate_id of both
-// streams. It does, because every certificate_id is server-minted by
-// ids.New() — a fixed-length lowercase-hex string ([0-9a-f]{32}) —
-// for which byte order equals collation order under any PostgreSQL
-// collation (C, en_US.UTF-8, …). Cert ids are never operator-supplied,
-// so a punctuation/case/length collation surprise cannot occur. If
-// that ever changes (non-hex cert ids), this merge must switch to a
-// collation-independent pairing (see HARDENING_BACKLOG H-030).
+// H-030 collation-independence: the previous shape merged two
+// paginated streams (signals + prior ownership) both `ORDER BY
+// certificate_id ASC` and paired them via a Go string comparison
+// (`ownCur.CertificateID < sig.CertificateID`). That depended on Go
+// byte order agreeing with the PostgreSQL collation used by SQL
+// ORDER BY — a cross-language invariant that held for the production
+// hex cert ids but was fragile to any future change in id semantics.
+// The set-lookup removes the invariant from the codebase entirely:
+// the only string comparison left is PostgreSQL's `= ANY($2::text[])`,
+// which is internally consistent under any collation; Go does
+// `map[certID]` lookups on opaque keys. Cross-org isolation is the
+// repo method's WHERE organization_id = $1 (composite PK probe).
+//
+// Memory is bounded to one signal page plus its prior-ownership map.
+// The recompute walks the signal stream once, never the fleet.
 func (s *Service) streamAndDecide(
 	ctx context.Context,
 	organizationID string,
@@ -227,56 +234,41 @@ func (s *Service) streamAndDecide(
 	out *recomputeOutcome,
 ) error {
 	limit := s.pageSize()
-	sigPager := &pager[governance.CertificateSignals]{
-		fetch: func(ctx context.Context, cursor string, n int) ([]governance.CertificateSignals, error) {
-			return s.repo.Ownership.ListCertificateSignalsPaged(ctx, organizationID, cursor, n)
-		},
-		key:   func(c governance.CertificateSignals) string { return c.CertificateID },
-		limit: limit,
-	}
-	ownPager := &pager[governance.CertificateOwnership]{
-		fetch: func(ctx context.Context, cursor string, n int) ([]governance.CertificateOwnership, error) {
-			return s.repo.Ownership.ListCertificateOwnershipPaged(ctx, organizationID, cursor, n)
-		},
-		key:   func(o governance.CertificateOwnership) string { return o.CertificateID },
-		limit: limit,
-	}
-
-	ownCur, ownHas, err := ownPager.next(ctx)
-	if err != nil {
-		return fmt.Errorf("ownership: read prior ownership: %w", err)
-	}
+	cursor := ""
 	for {
-		sig, ok, err := sigPager.next(ctx)
+		page, err := s.repo.Ownership.ListCertificateSignalsPaged(ctx, organizationID, cursor, limit)
 		if err != nil {
 			return fmt.Errorf("ownership: read signals: %w", err)
 		}
-		if !ok {
-			break
+		if len(page) == 0 {
+			return nil
 		}
-		// Advance the ownership cursor past any cert id below the
-		// current signal (defensive — every ownership row has a
-		// matching cert, so this normally does not fire).
-		for ownHas && ownCur.CertificateID < sig.CertificateID {
+		certIDs := make([]string, 0, len(page))
+		for _, sig := range page {
+			certIDs = append(certIDs, sig.CertificateID)
+		}
+		priorByID, err := s.repo.Ownership.GetCertificateOwnershipByCertificateIDs(ctx, organizationID, certIDs)
+		if err != nil {
+			return fmt.Errorf("ownership: load prior ownership: %w", err)
+		}
+		if len(priorByID) > 0 {
 			out.firstRun = false
-			if ownCur, ownHas, err = ownPager.next(ctx); err != nil {
-				return fmt.Errorf("ownership: advance prior ownership: %w", err)
+		}
+		for _, sig := range page {
+			var prior *governance.CertificateOwnership
+			if p, ok := priorByID[sig.CertificateID]; ok {
+				priorCopy := p
+				prior = &priorCopy
+			}
+			if err := s.processCert(ctx, organizationID, sig, prior, overrides[sig.CertificateID], rules, now, out); err != nil {
+				return err
 			}
 		}
-		var prior *governance.CertificateOwnership
-		if ownHas && ownCur.CertificateID == sig.CertificateID {
-			out.firstRun = false
-			p := ownCur
-			prior = &p
-			if ownCur, ownHas, err = ownPager.next(ctx); err != nil {
-				return fmt.Errorf("ownership: advance prior ownership: %w", err)
-			}
+		if len(page) < limit {
+			return nil
 		}
-		if err := s.processCert(ctx, organizationID, sig, prior, overrides[sig.CertificateID], rules, now, out); err != nil {
-			return err
-		}
+		cursor = page[len(page)-1].CertificateID
 	}
-	return nil
 }
 
 // processCert decides one cert, diffs against its prior ownership row,

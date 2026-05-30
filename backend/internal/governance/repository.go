@@ -142,6 +142,29 @@ type OwnershipRepository interface {
 		pageSize int,
 	) ([]CertificateOwnership, error)
 
+	// GetCertificateOwnershipByCertificateIDs returns the prior-ownership
+	// rows for the given cert ids in one org as a map keyed on
+	// certificate_id. Empty / nil certIDs returns an empty map without a
+	// DB round-trip. Foreign-org cert ids do not match (the WHERE binds
+	// organization_id). An id with no certificate_ownership row is
+	// silently absent from the result map — the caller treats it as
+	// "first-run for that cert", matching the recompute's existing
+	// no-prior-ownership semantic.
+	//
+	// The H-030 recompute set-lookup primitive: the recompute paginates
+	// signals, collects each page's cert ids, and calls this method to
+	// load matching prior ownership in one bounded round-trip. Memory
+	// and per-iteration cost are bounded by len(certIDs) ≤ one signal
+	// page. The query is index-aligned with the certificate_ownership
+	// PK (organization_id, certificate_id) — no new index needed, no
+	// fleet-wide scan reachable. Implementations MAY apply a defensive
+	// upper bound on the batch size to fail closed on a caller bug.
+	GetCertificateOwnershipByCertificateIDs(
+		ctx context.Context,
+		organizationID string,
+		certIDs []string,
+	) (map[string]CertificateOwnership, error)
+
 	// ListCertificateOwnershipStale returns one page of ownership
 	// rows whose last_evaluated_at is strictly before olderThan,
 	// ordered by certificate_id ASC, paged by cursorCertID, capped at
