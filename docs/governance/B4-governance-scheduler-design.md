@@ -377,7 +377,15 @@ retry/backoff state must survive process restarts and be visible to
 operators (`§7.3` transparency, `§18` resumability). A single, small,
 append-friendly table is the minimal footprint. This is the **only**
 schema change B4 contemplates, and it ships in one numbered append-only
-migration (`CLAUDE.md §16`).
+migration (`CLAUDE.md §16`) — the next number after the current latest
+(`0011_governance_policy.sql`), i.e. `0012_*`.
+
+This table is the one place B4 goes beyond the `findings.Scheduler`
+precedent (§3.4): the findings scheduler is stateless per tick because a
+recompute is a single bounded pass, whereas the H-027/H-029 primitives
+are paged and drain an org across many ticks, so the cursor must
+persist. Everything else (enable flag, next-due, outcome) is
+operational metadata that rides along in the same row at no extra cost.
 
 ### 7.2 Proposed table (DDL sketch — lands in PR-1, not in this doc)
 
@@ -496,17 +504,21 @@ startup, immutable after start, fail-closed on invalid input
 
 | Env var | Default | Validation | Meaning |
 |---|---|---|---|
-| `ANCHORIX_GOV_SCHEDULER_ENABLED` | `false` | bool | Global on/off. Off → loop not started. |
-| `ANCHORIX_GOV_SCHEDULER_INTERVAL` | `5m` | `>= 1m` | Tick interval. |
-| `ANCHORIX_GOV_SCHEDULER_MAX_ITEMS_PER_TICK` | `50` | `>= 1` | Per-tick `(org, job)` fan-out cap. |
-| `ANCHORIX_GOV_SCHEDULER_MAX_PAGES_PER_RUN` | `20` | `>= 1` | Per-run page cap. |
-| `ANCHORIX_GOV_SCHEDULER_MAX_RUN_DURATION` | `30s` | `>= 1s` | Per-run wall-clock budget. |
-| `ANCHORIX_GOV_SCHEDULER_PAGE_LIMIT` | `200` | `>= 1`, `<=` primitive max | Page size passed to primitives. |
-| `ANCHORIX_GOV_SCHEDULER_PAGE_PAUSE` | `0s` | `>= 0` | Optional inter-page delay. |
-| `ANCHORIX_GOV_SCHEDULER_RETRY_BASE` | `1m` | `>= 1s` | Backoff base (§10.3). |
-| `ANCHORIX_GOV_SCHEDULER_RETRY_MAX` | `1h` | `>= base` | Backoff cap (§10.3). |
+| `ANCHORIX_GOVERNANCE_SCHEDULER_ENABLED` | `false` | bool | Global on/off. Off → loop not started. |
+| `ANCHORIX_GOVERNANCE_SCHEDULER_INTERVAL` | `5m` | `>= 1m` | Tick interval. |
+| `ANCHORIX_GOVERNANCE_SCHEDULER_MAX_ITEMS_PER_TICK` | `50` | `>= 1` | Per-tick `(org, job)` fan-out cap. |
+| `ANCHORIX_GOVERNANCE_SCHEDULER_MAX_PAGES_PER_RUN` | `20` | `>= 1` | Per-run page cap. |
+| `ANCHORIX_GOVERNANCE_SCHEDULER_MAX_RUN_DURATION` | `30s` | `>= 1s` | Per-run wall-clock budget. |
+| `ANCHORIX_GOVERNANCE_SCHEDULER_PAGE_LIMIT` | `200` | `>= 1`, `<=` primitive max | Page size passed to primitives. |
+| `ANCHORIX_GOVERNANCE_SCHEDULER_PAGE_PAUSE` | `0s` | `>= 0` | Optional inter-page delay. |
+| `ANCHORIX_GOVERNANCE_SCHEDULER_RETRY_BASE` | `1m` | `>= 1s` | Backoff base (§10.3). |
+| `ANCHORIX_GOVERNANCE_SCHEDULER_RETRY_MAX` | `1h` | `>= base` | Backoff cap (§10.3). |
 
-Per-job interval (`job_interval` for re-arm, §6.5) is configured per job;
+Naming and parsing follow the existing `ANCHORIX_FINDINGS_SCHEDULER_*`
+precedent (`parseBool` / `parseInt` / `parseDuration` in
+`internal/config`, validated in a dedicated `validate…` method that
+fails closed). Per-job interval (`job_interval` for re-arm, §6.5) is
+configured per job;
 for B4 the proposed approach is a **per-job typed config struct** in
 `internal/config` (e.g. `ExpiredOverrideSweepInterval`,
 `ExplanationRetentionInterval`), not a `map[string]any` (barred by
@@ -727,7 +739,7 @@ unbounded spawning, no swallowed errors, no `time.Now()` in logic, no
    **disabled**. No tick loop runs in production until explicitly
    enabled.
 2. **Enable in a non-prod environment first.** Turn on
-   `ANCHORIX_GOV_SCHEDULER_ENABLED` with conservative caps; observe
+   `ANCHORIX_GOVERNANCE_SCHEDULER_ENABLED` with conservative caps; observe
    structured logs/metrics; verify audit parity against manual primitive
    runs.
 3. **Per-job, per-org enablement.** Enable one job for one org via the
@@ -827,6 +839,12 @@ Resolve before PR-1:
    dependency (subject to `CLAUDE.md §11` dependency health gates). (§12.2)
 6. **Recompute primitive**: confirm B4 defers stale-ownership recompute
    until a paged primitive exists. Recommended **defer**. (§11)
+7. **Shared abstraction vs. sibling**: whether B4 extracts a shared
+   scheduler core with `findings.Scheduler` or ships as an independent
+   sibling that mirrors its shape (§3.4). Recommended **sibling** for
+   v0.1 — the paged/cursor model differs enough that premature
+   extraction would be a speculative abstraction (`CLAUDE.md §8.5`);
+   revisit extraction only once a third scheduler appears.
 
 ---
 
