@@ -5,7 +5,6 @@ package integration
 import (
 	"context"
 	"fmt"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -17,46 +16,73 @@ import (
 
 // --- helpers ----------------------------------------------------------
 
-// tableSnapshot captures the row id set + total row count for one
-// table in one organization. The id set is what catches a sneaky
-// INSERT/DELETE (counts alone would miss a balanced insert+delete).
+// tableSnapshot captures, per row in one organization's slice of a
+// table, both the primary key and a content hash (md5 of the row's
+// to_jsonb serialization). The content hash is what catches an
+// in-place UPDATE — a row whose mutable columns (e.g. cleared_at,
+// cleared_by, cleared_reason on certificate_ownership_overrides) shift
+// stays in the id set but its hash diverges. An INSERT adds a new
+// key; a DELETE removes one.
 type tableSnapshot struct {
 	count int
-	ids   map[string]struct{}
+	// rows[primary_key] = md5(to_jsonb(row)::text).
+	rows map[string]string
 }
 
+// snapshotTable runs a query that MUST return exactly two text columns:
+// the org-scoped row key (single-column pk or any unique identifier
+// within the org) and a content hash digest of the row. The caller
+// supplies a query like:
+//
+//	SELECT id::text, md5(to_jsonb(t.*)::text)
+//	  FROM <table> t WHERE organization_id = $1
 func snapshotTable(t *testing.T, db *postgres.DB, ctx context.Context, query string, args ...any) tableSnapshot {
 	t.Helper()
-	ids := map[string]struct{}{}
+	rows := map[string]string{}
 	var count int
 	if err := db.WithTxRaw(ctx, func(tx pgx.Tx) error {
-		rows, err := tx.Query(ctx, query, args...)
+		queryRows, err := tx.Query(ctx, query, args...)
 		if err != nil {
 			return err
 		}
-		defer rows.Close()
-		for rows.Next() {
-			var id string
-			if err := rows.Scan(&id); err != nil {
+		defer queryRows.Close()
+		for queryRows.Next() {
+			var key, hash string
+			if err := queryRows.Scan(&key, &hash); err != nil {
 				return err
 			}
-			ids[id] = struct{}{}
+			rows[key] = hash
 			count++
 		}
-		return rows.Err()
+		return queryRows.Err()
 	}); err != nil {
 		t.Fatalf("snapshot %q: %v", query, err)
 	}
-	return tableSnapshot{count: count, ids: ids}
+	return tableSnapshot{count: count, rows: rows}
 }
 
+// assertSnapshotsEqual fails if the row count, primary-key set, or any
+// row's content hash diverges between before and after. Diff is
+// surfaced per-row so a regression message points at the exact rows
+// that changed.
 func assertSnapshotsEqual(t *testing.T, label string, before, after tableSnapshot) {
 	t.Helper()
 	if before.count != after.count {
 		t.Fatalf("%s row count: before=%d after=%d", label, before.count, after.count)
 	}
-	if !reflect.DeepEqual(before.ids, after.ids) {
-		t.Fatalf("%s row id set diverged across the read call (read-only invariant violated)", label)
+	for key, beforeHash := range before.rows {
+		afterHash, ok := after.rows[key]
+		if !ok {
+			t.Fatalf("%s row %q vanished across the read call", label, key)
+		}
+		if beforeHash != afterHash {
+			t.Fatalf("%s row %q content hash diverged across the read call: %s -> %s (in-place UPDATE detected — read is not side-effect-free)", label, key, beforeHash, afterHash)
+		}
+	}
+	for key := range after.rows {
+		if _, ok := before.rows[key]; !ok {
+			t.Fatalf("%s row %q appeared across the read call (INSERT side effect)", label, key)
+		}
 	}
 }
 
@@ -81,14 +107,18 @@ func TestListExpiringOverridesPagedIsReadOnly(t *testing.T) {
 		seedExpiringOverride(t, db, ctx, "anchorix", fmt.Sprintf("ovr-ro-%02d", i), certID, "svc-ro", pastTime(now, 1))
 	}
 
+	// Each query returns (org-scoped pk, md5 of the row's to_jsonb
+	// serialization) so the snapshot catches in-place UPDATE — not
+	// just INSERT/DELETE — across every table the read might plausibly
+	// mutate.
 	tables := map[string]string{
-		"overrides":             `SELECT id FROM certificate_ownership_overrides WHERE organization_id='anchorix'`,
-		"certificates":          `SELECT id FROM certificates WHERE organization_id='anchorix'`,
-		"certificate_ownership": `SELECT certificate_id FROM certificate_ownership WHERE organization_id='anchorix'`,
-		"audit_events":          `SELECT id FROM audit_events WHERE organization_id='anchorix'`,
-		"explanations":          `SELECT id FROM ownership_match_explanations WHERE organization_id='anchorix'`,
-		"services":              `SELECT id FROM services WHERE organization_id='anchorix'`,
-		"ownership_rules":       `SELECT id FROM ownership_rules WHERE organization_id='anchorix'`,
+		"overrides":             `SELECT id::text, md5(to_jsonb(t.*)::text) FROM certificate_ownership_overrides t WHERE organization_id='anchorix'`,
+		"certificates":          `SELECT id::text, md5(to_jsonb(t.*)::text) FROM certificates t WHERE organization_id='anchorix'`,
+		"certificate_ownership": `SELECT certificate_id::text, md5(to_jsonb(t.*)::text) FROM certificate_ownership t WHERE organization_id='anchorix'`,
+		"audit_events":          `SELECT id::text, md5(to_jsonb(t.*)::text) FROM audit_events t WHERE organization_id='anchorix'`,
+		"explanations":          `SELECT id::text, md5(to_jsonb(t.*)::text) FROM ownership_match_explanations t WHERE organization_id='anchorix'`,
+		"services":              `SELECT id::text, md5(to_jsonb(t.*)::text) FROM services t WHERE organization_id='anchorix'`,
+		"ownership_rules":       `SELECT id::text, md5(to_jsonb(t.*)::text) FROM ownership_rules t WHERE organization_id='anchorix'`,
 	}
 	before := map[string]tableSnapshot{}
 	for label, q := range tables {
@@ -115,6 +145,55 @@ func TestListExpiringOverridesPagedIsReadOnly(t *testing.T) {
 	for label, q := range tables {
 		after := snapshotTable(t, db, ctx, q)
 		assertSnapshotsEqual(t, label, before[label], after)
+	}
+}
+
+// TestReadOnlyGuardCatchesInPlaceUpdate is the positive control for
+// TestListExpiringOverridesPagedIsReadOnly: it proves the snapshot
+// mechanism is sensitive to the exact regression the read-only test
+// claims to catch — an in-place UPDATE that mutates cleared_at /
+// cleared_by / cleared_reason on an override row without
+// changing the row's id or the table's row count. Snapshot, perform a
+// real UPDATE via the existing ClearOwnershipOverride API, snapshot
+// again — assertSnapshotsEqual MUST fail.
+//
+// Without this guard, a regression that silently weakened the snapshot
+// query (e.g. dropping the content hash) would let the read-only
+// invariant test pass vacuously.
+func TestReadOnlyGuardCatchesInPlaceUpdate(t *testing.T) {
+	db := testDB(t)
+	freshDatabase(t, db)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	now := time.Now().UTC()
+
+	seedService(t, db, ctx, "svc-pc")
+	seedCertificate(t, db, ctx, "cert-pc")
+	seedExpiringOverride(t, db, ctx, "anchorix", "ovr-pc", "cert-pc", "svc-pc", pastTime(now, 1))
+
+	query := `SELECT id::text, md5(to_jsonb(t.*)::text) FROM certificate_ownership_overrides t WHERE organization_id='anchorix'`
+	before := snapshotTable(t, db, ctx, query)
+
+	// Real UPDATE via the production API — sets cleared_at / cleared_by /
+	// cleared_reason on the existing row. Row id and table count are
+	// unchanged.
+	repo := postgres.NewOwnershipRepository(db)
+	if err := repo.ClearOwnershipOverride(ctx, "anchorix", "ovr-pc", "tester", "positive-control", now); err != nil {
+		t.Fatalf("clear: %v", err)
+	}
+
+	after := snapshotTable(t, db, ctx, query)
+	// Sanity: row count and id set are deliberately unchanged.
+	if before.count != after.count {
+		t.Fatalf("positive-control: row count changed (%d -> %d); the mechanism is testing the wrong thing", before.count, after.count)
+	}
+	if _, ok := after.rows["ovr-pc"]; !ok {
+		t.Fatalf("positive-control: id 'ovr-pc' vanished from the after snapshot; the mechanism is testing the wrong thing")
+	}
+	// THE assertion: the upgraded snapshot mechanism MUST catch the
+	// in-place update — the content hash MUST diverge.
+	if before.rows["ovr-pc"] == after.rows["ovr-pc"] {
+		t.Fatalf("positive-control: content hash did not change across an UPDATE — read-only guard would have missed an in-place mutation regression")
 	}
 }
 
