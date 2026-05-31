@@ -82,6 +82,23 @@ type Config struct {
 	FindingsSchedulerEnabled  bool
 	FindingsSchedulerInterval time.Duration
 
+	// GovernanceScheduler — B4 dormant governance-maintenance loop
+	// state/config foundation (PR-1). These knobs are loaded and
+	// validated at startup but wired to NOTHING in B4 PR-1: there is
+	// no scheduler loop, goroutine, ticker, registry, or runner yet,
+	// and no maintenance primitive is invoked. They exist so PR-2 has
+	// a stable, validated config surface. Disabled by default
+	// (CLAUDE.md §7.1 operator-controlled; B4 design §6.4 / §9).
+	GovernanceSchedulerEnabled             bool
+	GovernanceSchedulerInterval            time.Duration
+	GovernanceSchedulerMaxItemsPerTick     int
+	GovernanceSchedulerMaxPagesPerRun      int
+	GovernanceSchedulerMaxRunDuration      time.Duration
+	GovernanceSchedulerPageLimit           int
+	GovernanceSchedulerPartialRequeueDelay time.Duration
+	GovernanceSchedulerRetryBase           time.Duration
+	GovernanceSchedulerRetryMax            time.Duration
+
 	// GovernanceAPIEnabled controls whether the H-026A2
 	// identity / governance operator API is routed.
 	// Defaults true; an operator can flip it off without code
@@ -156,6 +173,33 @@ func Load() (*Config, error) {
 	if cfg.FindingsSchedulerInterval, err = parseDuration("ANCHORIX_FINDINGS_SCHEDULER_INTERVAL", "6h"); err != nil {
 		return nil, err
 	}
+	if cfg.GovernanceSchedulerEnabled, err = parseBool("ANCHORIX_GOVERNANCE_SCHEDULER_ENABLED", false); err != nil {
+		return nil, err
+	}
+	if cfg.GovernanceSchedulerInterval, err = parseDuration("ANCHORIX_GOVERNANCE_SCHEDULER_INTERVAL", "5m"); err != nil {
+		return nil, err
+	}
+	if cfg.GovernanceSchedulerMaxItemsPerTick, err = parseInt("ANCHORIX_GOVERNANCE_SCHEDULER_MAX_ITEMS_PER_TICK", 50); err != nil {
+		return nil, err
+	}
+	if cfg.GovernanceSchedulerMaxPagesPerRun, err = parseInt("ANCHORIX_GOVERNANCE_SCHEDULER_MAX_PAGES_PER_RUN", 20); err != nil {
+		return nil, err
+	}
+	if cfg.GovernanceSchedulerMaxRunDuration, err = parseDuration("ANCHORIX_GOVERNANCE_SCHEDULER_MAX_RUN_DURATION", "30s"); err != nil {
+		return nil, err
+	}
+	if cfg.GovernanceSchedulerPageLimit, err = parseInt("ANCHORIX_GOVERNANCE_SCHEDULER_PAGE_LIMIT", 200); err != nil {
+		return nil, err
+	}
+	if cfg.GovernanceSchedulerPartialRequeueDelay, err = parseDuration("ANCHORIX_GOVERNANCE_SCHEDULER_PARTIAL_REQUEUE_DELAY", "1s"); err != nil {
+		return nil, err
+	}
+	if cfg.GovernanceSchedulerRetryBase, err = parseDuration("ANCHORIX_GOVERNANCE_SCHEDULER_RETRY_BASE", "1m"); err != nil {
+		return nil, err
+	}
+	if cfg.GovernanceSchedulerRetryMax, err = parseDuration("ANCHORIX_GOVERNANCE_SCHEDULER_RETRY_MAX", "1h"); err != nil {
+		return nil, err
+	}
 	if cfg.OwnershipBulkAuditThreshold, err = parseInt("ANCHORIX_OWNERSHIP_BULK_AUDIT_THRESHOLD", 500); err != nil {
 		return nil, err
 	}
@@ -224,8 +268,105 @@ func (c *Config) validate() error {
 	if err := c.validateFindingsScheduler(); err != nil {
 		return err
 	}
+	if err := c.validateGovernanceScheduler(); err != nil {
+		return err
+	}
 	if err := c.validateOwnershipRetention(); err != nil {
 		return err
+	}
+	return nil
+}
+
+// Governance scheduler bounds (B4 design §9). These are the
+// fail-closed limits the startup validator enforces. They are
+// deliberately conservative for v0.1; raising them is an operator
+// config change, not a code change.
+const (
+	// govSchedulerMinInterval is the floor on tick spacing. Tighter
+	// than this adds DB churn for no operator benefit (the advisory
+	// lock would serialize tick overlap anyway).
+	govSchedulerMinInterval = 30 * time.Second
+	// govSchedulerMinRunDuration is the floor on the per-run
+	// wall-clock budget — at least one page must be able to run.
+	govSchedulerMinRunDuration = time.Second
+	// govSchedulerMaxPageLimit caps the page size the scheduler may
+	// pass to a maintenance primitive. It matches the primitives'
+	// documented hard maximum (H-027 / H-029 clamp at 1000); the
+	// scheduler validates <= this rather than relying on the clamp
+	// (B4 design §6.2 / §5.1).
+	govSchedulerMaxPageLimit = 1000
+)
+
+// validateGovernanceScheduler enforces the B4 scheduler bounds at
+// startup so a misconfigured deployment fails closed before any
+// scheduler is constructed (CLAUDE.md §6.12 / §8.9). When the
+// scheduler is disabled the knobs are not enforced — a disabled
+// scheduler with sloppy values must still boot — EXCEPT this returns
+// nil early in that case, matching the findings-scheduler precedent.
+//
+// partial_requeue_delay is validated STRICTLY > 0 even though it is a
+// fairness knob: a zero delay re-arms a partial run at "now", which
+// reselects the same served prefix every tick and starves later due
+// rows (B4 design §4.3 / §6.5). It must also stay below the tick
+// interval so a re-armed item lands within a later tick window, not
+// beyond the next several ticks.
+func (c *Config) validateGovernanceScheduler() error {
+	if !c.GovernanceSchedulerEnabled {
+		return nil
+	}
+	if c.GovernanceSchedulerInterval < govSchedulerMinInterval {
+		return fmt.Errorf(
+			"ANCHORIX_GOVERNANCE_SCHEDULER_INTERVAL=%s below minimum %s",
+			c.GovernanceSchedulerInterval, govSchedulerMinInterval,
+		)
+	}
+	if c.GovernanceSchedulerMaxItemsPerTick < 1 {
+		return fmt.Errorf(
+			"ANCHORIX_GOVERNANCE_SCHEDULER_MAX_ITEMS_PER_TICK=%d must be >= 1",
+			c.GovernanceSchedulerMaxItemsPerTick,
+		)
+	}
+	if c.GovernanceSchedulerMaxPagesPerRun < 1 {
+		return fmt.Errorf(
+			"ANCHORIX_GOVERNANCE_SCHEDULER_MAX_PAGES_PER_RUN=%d must be >= 1",
+			c.GovernanceSchedulerMaxPagesPerRun,
+		)
+	}
+	if c.GovernanceSchedulerMaxRunDuration < govSchedulerMinRunDuration {
+		return fmt.Errorf(
+			"ANCHORIX_GOVERNANCE_SCHEDULER_MAX_RUN_DURATION=%s below minimum %s",
+			c.GovernanceSchedulerMaxRunDuration, govSchedulerMinRunDuration,
+		)
+	}
+	if c.GovernanceSchedulerPageLimit < 1 || c.GovernanceSchedulerPageLimit > govSchedulerMaxPageLimit {
+		return fmt.Errorf(
+			"ANCHORIX_GOVERNANCE_SCHEDULER_PAGE_LIMIT=%d out of range [1, %d]",
+			c.GovernanceSchedulerPageLimit, govSchedulerMaxPageLimit,
+		)
+	}
+	if c.GovernanceSchedulerPartialRequeueDelay <= 0 {
+		return fmt.Errorf(
+			"ANCHORIX_GOVERNANCE_SCHEDULER_PARTIAL_REQUEUE_DELAY=%s must be strictly positive",
+			c.GovernanceSchedulerPartialRequeueDelay,
+		)
+	}
+	if c.GovernanceSchedulerPartialRequeueDelay >= c.GovernanceSchedulerInterval {
+		return fmt.Errorf(
+			"ANCHORIX_GOVERNANCE_SCHEDULER_PARTIAL_REQUEUE_DELAY=%s must be less than ANCHORIX_GOVERNANCE_SCHEDULER_INTERVAL=%s",
+			c.GovernanceSchedulerPartialRequeueDelay, c.GovernanceSchedulerInterval,
+		)
+	}
+	if c.GovernanceSchedulerRetryBase <= 0 {
+		return fmt.Errorf(
+			"ANCHORIX_GOVERNANCE_SCHEDULER_RETRY_BASE=%s must be strictly positive",
+			c.GovernanceSchedulerRetryBase,
+		)
+	}
+	if c.GovernanceSchedulerRetryMax < c.GovernanceSchedulerRetryBase {
+		return fmt.Errorf(
+			"ANCHORIX_GOVERNANCE_SCHEDULER_RETRY_MAX=%s must be >= ANCHORIX_GOVERNANCE_SCHEDULER_RETRY_BASE=%s",
+			c.GovernanceSchedulerRetryMax, c.GovernanceSchedulerRetryBase,
+		)
 	}
 	return nil
 }
