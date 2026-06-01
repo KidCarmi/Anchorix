@@ -92,6 +92,9 @@ func freshDatabase(t *testing.T, db *postgres.DB) {
 			// mostly ON DELETE RESTRICT, so the explicit per-table
 			// DELETEs are required to bring an org back to a clean
 			// state between integration runs.
+			// B4 governance_scheduler_job (migration 0012) FK-references
+			// organizations ON DELETE RESTRICT — clear it here too.
+			"DELETE FROM governance_scheduler_job",
 			"DELETE FROM governance_recompute_runs",
 			"DELETE FROM policy_waivers",
 			"DELETE FROM policy_assignments",
