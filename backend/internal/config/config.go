@@ -282,13 +282,23 @@ func (c *Config) validate() error {
 // deliberately conservative for v0.1; raising them is an operator
 // config change, not a code change.
 const (
-	// govSchedulerMinInterval is the floor on tick spacing. Tighter
-	// than this adds DB churn for no operator benefit (the advisory
-	// lock would serialize tick overlap anyway).
-	govSchedulerMinInterval = 30 * time.Second
+	// govSchedulerMinInterval is the floor on tick spacing. It matches
+	// the documented B4 config contract (interval >= 1m;
+	// docs/governance/B4-governance-scheduler-design.md §9). A tighter
+	// interval adds DB / advisory-lock churn for no operator benefit
+	// (the advisory lock would serialize tick overlap anyway), so a
+	// sub-1m value fails closed rather than silently doubling the tick
+	// rate once the PR-2 loop is wired.
+	govSchedulerMinInterval = time.Minute
 	// govSchedulerMinRunDuration is the floor on the per-run
 	// wall-clock budget — at least one page must be able to run.
 	govSchedulerMinRunDuration = time.Second
+	// govSchedulerMinRetryBase is the floor on the backoff base. It
+	// matches the documented B4 config contract (retry_base >= 1s;
+	// docs/governance/B4-governance-scheduler-design.md §9). A
+	// sub-second base would re-arm failed jobs on millisecond windows
+	// (tight retry churn) instead of failing closed.
+	govSchedulerMinRetryBase = time.Second
 	// govSchedulerMaxPageLimit caps the page size the scheduler may
 	// pass to a maintenance primitive. It matches the primitives'
 	// documented hard maximum (H-027 / H-029 clamp at 1000); the
@@ -356,10 +366,10 @@ func (c *Config) validateGovernanceScheduler() error {
 			c.GovernanceSchedulerPartialRequeueDelay, c.GovernanceSchedulerInterval,
 		)
 	}
-	if c.GovernanceSchedulerRetryBase <= 0 {
+	if c.GovernanceSchedulerRetryBase < govSchedulerMinRetryBase {
 		return fmt.Errorf(
-			"ANCHORIX_GOVERNANCE_SCHEDULER_RETRY_BASE=%s must be strictly positive",
-			c.GovernanceSchedulerRetryBase,
+			"ANCHORIX_GOVERNANCE_SCHEDULER_RETRY_BASE=%s below minimum %s",
+			c.GovernanceSchedulerRetryBase, govSchedulerMinRetryBase,
 		)
 	}
 	if c.GovernanceSchedulerRetryMax < c.GovernanceSchedulerRetryBase {

@@ -98,12 +98,18 @@ func TestGovernanceSchedulerInvalidConfigFailsClosed(t *testing.T) {
 		{"negative partial requeue delay", "ANCHORIX_GOVERNANCE_SCHEDULER_PARTIAL_REQUEUE_DELAY", "-1s", "PARTIAL_REQUEUE_DELAY"},
 		{"partial requeue delay >= interval", "ANCHORIX_GOVERNANCE_SCHEDULER_PARTIAL_REQUEUE_DELAY", "5m", "less than"},
 		{"interval below minimum", "ANCHORIX_GOVERNANCE_SCHEDULER_INTERVAL", "5s", "INTERVAL"},
+		// 30s is the prior floor; the documented contract is >= 1m, so
+		// it must now fail closed.
+		{"interval below documented 1m floor", "ANCHORIX_GOVERNANCE_SCHEDULER_INTERVAL", "30s", "INTERVAL"},
 		{"zero max items", "ANCHORIX_GOVERNANCE_SCHEDULER_MAX_ITEMS_PER_TICK", "0", "MAX_ITEMS_PER_TICK"},
 		{"zero max pages", "ANCHORIX_GOVERNANCE_SCHEDULER_MAX_PAGES_PER_RUN", "0", "MAX_PAGES_PER_RUN"},
 		{"max run duration below floor", "ANCHORIX_GOVERNANCE_SCHEDULER_MAX_RUN_DURATION", "100ms", "MAX_RUN_DURATION"},
 		{"page limit zero", "ANCHORIX_GOVERNANCE_SCHEDULER_PAGE_LIMIT", "0", "PAGE_LIMIT"},
 		{"page limit over max", "ANCHORIX_GOVERNANCE_SCHEDULER_PAGE_LIMIT", "1001", "PAGE_LIMIT"},
 		{"retry base zero", "ANCHORIX_GOVERNANCE_SCHEDULER_RETRY_BASE", "0s", "RETRY_BASE"},
+		// Sub-second base is positive but below the documented >= 1s
+		// contract, so it must fail closed (no millisecond retry churn).
+		{"retry base below documented 1s floor", "ANCHORIX_GOVERNANCE_SCHEDULER_RETRY_BASE", "1ms", "RETRY_BASE"},
 		{"retry max below base", "ANCHORIX_GOVERNANCE_SCHEDULER_RETRY_MAX", "10s", "RETRY_MAX"},
 	}
 	for _, tc := range cases {
