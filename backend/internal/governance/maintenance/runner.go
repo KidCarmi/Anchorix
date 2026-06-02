@@ -256,7 +256,9 @@ func (r *JobRunner) finishCompleted(ctx context.Context, orgID, jobName, cursor 
 	// On completion the next cycle restarts from the job's start
 	// sentinel; we persist the final cursor as-is (the re-arm policy
 	// resets it conceptually — the next due run begins a fresh drain).
-	if err := r.state.MarkJobCompleted(ctx, orgID, jobName, governance.SchedulerCursorStart, finishedAt, nextDue); err != nil {
+	persistCtx, cancel := r.persistContext(ctx)
+	defer cancel()
+	if err := r.state.MarkJobCompleted(persistCtx, orgID, jobName, governance.SchedulerCursorStart, finishedAt, nextDue); err != nil {
 		return RunReport{Outcome: OutcomeError}, fmt.Errorf("maintenance: mark completed %s/%s: %w", orgID, jobName, err)
 	}
 	report.Outcome = OutcomeCompleted
@@ -269,7 +271,9 @@ func (r *JobRunner) finishPartial(ctx context.Context, orgID, jobName, cursor st
 	// Strictly-non-zero re-arm so the served item sorts behind
 	// not-yet-served due rows (fairness).
 	nextDue := finishedAt.Add(r.cfg.PartialRequeueDelay)
-	if err := r.state.MarkJobPartial(ctx, orgID, jobName, cursor, finishedAt, nextDue); err != nil {
+	persistCtx, cancel := r.persistContext(ctx)
+	defer cancel()
+	if err := r.state.MarkJobPartial(persistCtx, orgID, jobName, cursor, finishedAt, nextDue); err != nil {
 		return RunReport{Outcome: OutcomeError}, fmt.Errorf("maintenance: mark partial %s/%s: %w", orgID, jobName, err)
 	}
 	report.Outcome = OutcomePartial
@@ -286,7 +290,9 @@ func (r *JobRunner) finishFailed(ctx context.Context, orgID, jobName string, pri
 	// (the maintenance primitives' errors are structural, not credential).
 	backoff := r.backoffFor(priorFailures + 1)
 	nextDue := finishedAt.Add(backoff)
-	if err := r.state.MarkJobFailed(ctx, orgID, jobName, runErr.Error(), finishedAt, nextDue); err != nil {
+	persistCtx, cancel := r.persistContext(ctx)
+	defer cancel()
+	if err := r.state.MarkJobFailed(persistCtx, orgID, jobName, runErr.Error(), finishedAt, nextDue); err != nil {
 		return RunReport{Outcome: OutcomeError}, fmt.Errorf("maintenance: mark failed %s/%s: %w", orgID, jobName, err)
 	}
 	report.Outcome = OutcomeError
@@ -300,6 +306,20 @@ func (r *JobRunner) finishFailed(ctx context.Context, orgID, jobName string, pri
 		"remediation", "inspect the job's underlying maintenance primitive; the page will be retried on the backoff schedule",
 	)
 	return report, nil
+}
+
+// persistContext returns a short-lived context for the TERMINAL state
+// write (completed / partial / failed). It is deliberately decoupled
+// from the run context's cancellation: a run that ends because the
+// caller context was cancelled at a page boundary (graceful shutdown or
+// the per-run deadline) must STILL durably record its advanced cursor
+// and next-due time — otherwise the row would be stranded in `running`
+// with stale scheduling state and the run's forward progress would be
+// lost. This mirrors the lock-release path, which uses the same
+// fresh-context discipline so cancellation can never prevent cleanup.
+// The 5s budget is generous for a single-row UPDATE.
+func (r *JobRunner) persistContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 }
 
 // backoffFor computes the capped exponential backoff for the given

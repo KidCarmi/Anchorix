@@ -515,6 +515,77 @@ func TestRunnerCursorAdvancesOnlyAfterSuccessfulPage(t *testing.T) {
 	}
 }
 
+// ctxCheckingState wraps recordingState and fails any Mark* call whose
+// context is already cancelled — simulating a real postgres UPDATE that
+// returns context.Canceled. It proves the runner persists terminal state
+// on a LIVE context even when the run ended due to caller cancellation.
+type ctxCheckingState struct {
+	*recordingState
+}
+
+func (s *ctxCheckingState) MarkJobPartial(ctx context.Context, org, job, cursor string, finishedAt, nextDueAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.recordingState.MarkJobPartial(ctx, org, job, cursor, finishedAt, nextDueAt)
+}
+func (s *ctxCheckingState) MarkJobCompleted(ctx context.Context, org, job, cursor string, finishedAt, nextDueAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.recordingState.MarkJobCompleted(ctx, org, job, cursor, finishedAt, nextDueAt)
+}
+func (s *ctxCheckingState) MarkJobFailed(ctx context.Context, org, job, redactedErr string, finishedAt, nextDueAt time.Time) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.recordingState.MarkJobFailed(ctx, org, job, redactedErr, finishedAt, nextDueAt)
+}
+
+// TestRunnerPersistsPartialEvenWhenCallerContextCancelled is the
+// regression for the cancellation-at-page-boundary bug: a graceful
+// shutdown / per-run timeout cancels the caller context after a
+// successful page. The run must stop cleanly AND durably record the
+// partial outcome (advanced cursor + requeue time) instead of leaving
+// the row stranded in `running`. The state fake rejects cancelled
+// contexts, so this only passes if the runner persists on a live ctx.
+func TestRunnerPersistsPartialEvenWhenCallerContextCancelled(t *testing.T) {
+	locker := &fakeLocker{}
+	state := &ctxCheckingState{newRecordingState("c0", 0)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Page 1 advances the cursor to c-1 and returns "more work". The
+	// probe cancels the caller context right after that first page runs,
+	// so when the loop re-checks ctx.Err() at the next boundary it stops
+	// the run as partial — with the caller context already cancelled.
+	job := &scriptedJob{name: "j", results: []pageStep{
+		{res: PageResult{NextCursor: "c-1", Done: false}},
+	}}
+	// Cancel exactly once, during page 1. Page 1 still returns c-1
+	// successfully (the fake ignores ctx, modeling a page that committed
+	// just before shutdown was signalled); the loop then observes the
+	// cancellation at the next boundary and stops as partial — page 2
+	// never runs, so the persisted cursor is c-1.
+	var once sync.Once
+	job.probe = func() { once.Do(cancel) }
+
+	r := newTestRunner(t, job, state, locker, newFakeClock(time.Unix(1000, 0).UTC(), 0), testRunnerConfig())
+	rep, err := r.RunDueJob(ctx, dueState("o", "j", "c0", 0))
+	if err != nil {
+		t.Fatalf("run returned infra error despite cancellation: %v", err)
+	}
+	if rep.Outcome != OutcomePartial {
+		t.Fatalf("outcome = %s, want partial (clean stop on cancellation)", rep.Outcome)
+	}
+	if state.lastStatus != governance.SchedulerJobPartial {
+		t.Fatalf("row left in %s; cancellation must not strand it in running", state.lastStatus)
+	}
+	if state.cursor != "c-1" {
+		t.Fatalf("partial cursor = %q, want c-1 (forward progress persisted)", state.cursor)
+	}
+}
+
 // ---- runner: bounds ----
 
 func TestRunnerMaxPagesEnforced(t *testing.T) {
