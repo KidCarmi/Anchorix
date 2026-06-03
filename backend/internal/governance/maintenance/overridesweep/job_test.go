@@ -57,6 +57,23 @@ func TestNewJobRejectsNilSweeper(t *testing.T) {
 	}
 }
 
+// TestNewJobRejectsTypedNilSweeper guards the typed-nil trap: a nil
+// concrete pointer boxed into the ExpiredOverrideSweeper interface
+// (e.g. a future composition root passing (*ownership.Service)(nil)) is
+// != nil as an interface value, so the plain nil check would let it
+// through and the first RunPage would panic on the nil receiver. NewJob
+// must fail closed instead.
+func TestNewJobRejectsTypedNilSweeper(t *testing.T) {
+	var typedNil *ownership.Service // nil concrete pointer
+	if _, err := NewJob(typedNil); err == nil {
+		t.Fatal("NewJob((*ownership.Service)(nil)) must fail closed on a typed-nil sweeper")
+	}
+	// A non-nil sweeper still constructs fine.
+	if _, err := NewJob(&fakeSweeper{}); err != nil {
+		t.Fatalf("NewJob with a valid sweeper failed: %v", err)
+	}
+}
+
 func TestRunPageCallsSweeperExactlyOnceWithPassthroughArgs(t *testing.T) {
 	sw := &fakeSweeper{result: &ownership.ExpiringOverridesSweepResult{}}
 	j := newJob(t, sw)

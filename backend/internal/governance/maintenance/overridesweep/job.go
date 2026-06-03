@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 
 	"github.com/kidcarmi/anchorix/backend/internal/governance/maintenance"
 	"github.com/kidcarmi/anchorix/backend/internal/governance/ownership"
@@ -38,10 +39,31 @@ type Job struct {
 // NewJob wires the adapter. Constructor DI (CLAUDE.md §8.8); the sweeper
 // is required.
 func NewJob(sweeper ExpiredOverrideSweeper) (*Job, error) {
-	if sweeper == nil {
+	// Reject both an untyped nil and a typed-nil pointer boxed into the
+	// interface (e.g. (*ownership.Service)(nil) passed by a future
+	// composition root). A typed-nil is != nil as an interface value, so
+	// the plain nil check alone would let it through; the job would then
+	// be registered and the first RunPage would panic on the nil
+	// receiver. The maintenance runner releases the lock on a panic but
+	// deliberately does not recover it, so this would bypass the
+	// fail-closed error path the constructor exists to provide.
+	if sweeper == nil || isNilValue(sweeper) {
 		return nil, errors.New("overridesweep.NewJob: sweeper required")
 	}
 	return &Job{sweeper: sweeper}, nil
+}
+
+// isNilValue reports whether an interface holds a nil pointer / map /
+// chan / func / slice. It lets NewJob fail closed on a typed-nil
+// dependency that a plain `== nil` interface comparison would miss.
+func isNilValue(v any) bool {
+	rv := reflect.ValueOf(v)
+	switch rv.Kind() {
+	case reflect.Ptr, reflect.Map, reflect.Chan, reflect.Func, reflect.Slice, reflect.Interface:
+		return rv.IsNil()
+	default:
+		return false
+	}
 }
 
 // Name returns the stable job key.
