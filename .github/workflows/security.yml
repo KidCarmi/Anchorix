@@ -29,21 +29,37 @@ jobs:
   govulncheck-backend:
     name: govulncheck (backend)
     runs-on: ubuntu-latest
+    # GO-2026-5037 (crypto/x509) and GO-2026-5039 (net/textproto) are Go
+    # stdlib advisories fixed only in go1.26.4. setup-go cannot install
+    # 1.26.4 yet (not in its version manifest, and the direct-download
+    # fallback 403s), so we do NOT pin go-version-input to it. Instead we
+    # let the action install a manifest toolchain and force the analysis
+    # to run under go1.26.4 via GOTOOLCHAIN: the Go module proxy serves
+    # toolchains on demand, so `go` transparently fetches and re-execs
+    # 1.26.4 — and govulncheck then evaluates the patched stdlib.
+    # Revisit (drop GOTOOLCHAIN, pin go-version-input) once 1.26.4 lands
+    # in the setup-go manifest.
+    env:
+      GOTOOLCHAIN: go1.26.4
     steps:
       - uses: actions/checkout@v4
       - uses: golang/govulncheck-action@v1
         with:
-          go-version-input: "stable"
+          go-version-input: "1.26.3"
           work-dir: backend
 
   govulncheck-agent:
     name: govulncheck (agent/windows)
     runs-on: ubuntu-latest
+    # Same patched-toolchain-via-GOTOOLCHAIN approach as the backend job
+    # (see the comment above).
+    env:
+      GOTOOLCHAIN: go1.26.4
     steps:
       - uses: actions/checkout@v4
       - uses: golang/govulncheck-action@v1
         with:
-          go-version-input: "stable"
+          go-version-input: "1.26.3"
           work-dir: agent/windows
 
   # ---------------------------------------------------------------------------
